@@ -1,16 +1,16 @@
 import fs from 'fs';
-import type { Flow, FlowConfig, Session, FlowNode } from './types';
+import type { Flow, FlowConfig, Session, FlowNode, MessageSender } from './types';
 
 export class FlowAssistant {
     private sessions: { [jid: string]: Session } = {};
     private config: FlowConfig = { flows: [], idleEnabled: false };
-    private sock: any;
+    private sender: MessageSender;
     private profileId: string;
     private sessionFile: string;
     private flowFile: string;
 
-    constructor(sock: any, profileId: string = 'default') {
-        this.sock = sock;
+    constructor(sender: MessageSender, profileId: string = 'default') {
+        this.sender = sender;
         this.profileId = profileId;
         this.sessionFile = `./sessions_${profileId}.json`;
         this.flowFile = `./flows_${profileId}.json`;
@@ -127,7 +127,7 @@ export class FlowAssistant {
                             await this.processNode(jid, flow, nextNodeId);
                         } else if (currentNode.nextId || currentNode.connections) {
                             if (currentNode.options && currentNode.options.length > 0) {
-                                await this.sock.sendMessage(jid, { text: "Please select one of the options by typing the number or the text." });
+                                await this.sender.sendText(jid, "Please select one of the options by typing the number or the text.");
                             } else {
                                 await this.endSession(jid);
                             }
@@ -157,7 +157,7 @@ export class FlowAssistant {
 
             // If no match and idle enabled
             if (this.config.idleEnabled && this.config.idleMessage) {
-                await this.sock.sendMessage(jid, { text: this.config.idleMessage });
+                await this.sender.sendText(jid, this.config.idleMessage);
             }
         }
     }
@@ -193,16 +193,13 @@ export class FlowAssistant {
 
         switch (node.type) {
             case 'MESSAGE':
-                await this.sock.sendMessage(jid, { text: node.content || '' });
+                await this.sender.sendText(jid, node.content || '');
                 if (node.nextId) await this.processNode(jid, flow, node.nextId);
                 break;
 
             case 'IMAGE':
                 if (node.imageUrl) {
-                    await this.sock.sendMessage(jid, {
-                        image: { url: node.imageUrl },
-                        caption: node.caption
-                    });
+                    await this.sender.sendImage(jid, node.imageUrl, node.caption);
                 }
                 if (node.nextId) await this.processNode(jid, flow, node.nextId);
                 break;
@@ -212,7 +209,7 @@ export class FlowAssistant {
                 if (node.options && node.options.length > 0) {
                     questionText += '\n\n' + node.options.map((opt, i) => `${i + 1}. ${opt}`).join('\n');
                 }
-                await this.sock.sendMessage(jid, { text: questionText });
+                await this.sender.sendText(jid, questionText);
                 // We stop here and wait for user reply
                 break;
 
@@ -242,7 +239,7 @@ export class FlowAssistant {
 
             case 'END':
                 if (node.content) {
-                    await this.sock.sendMessage(jid, { text: node.content });
+                    await this.sender.sendText(jid, node.content);
                 }
                 await this.endSession(jid);
                 break;
@@ -251,7 +248,7 @@ export class FlowAssistant {
 
     private async endSession(jid: string, timeoutMessage?: string) {
         if (timeoutMessage) {
-            await this.sock.sendMessage(jid, { text: timeoutMessage });
+            await this.sender.sendText(jid, timeoutMessage);
         }
         delete this.sessions[jid];
         this.saveSessions();

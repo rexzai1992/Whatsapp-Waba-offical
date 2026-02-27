@@ -1,8 +1,6 @@
 
 import { createAddonRouter } from './api'
 import { webhookService } from './webhook-service'
-import { store } from '../store'
-
 export { createAddonRouter, webhookService }
 
 export async function handleEvents(profileId: string, events: any) {

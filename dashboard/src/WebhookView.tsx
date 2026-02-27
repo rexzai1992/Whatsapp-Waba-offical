@@ -2,34 +2,145 @@
 import React, { useState, useEffect } from 'react';
 import { Plus, Trash2, Key, Globe, Shield } from 'lucide-react';
 
-const SOCKET_URL = 'http://localhost:3001';
+const SOCKET_URL = import.meta.env.VITE_SOCKET_URL || 'http://localhost:3000';
 const ADMIN_PASS = 'admin123';
 
-export default function WebhookView({ profileId }: { profileId: string }) {
+type QuickReply = {
+    id?: string;
+    shortcut: string;
+    text: string;
+};
+
+type WebhookViewProps = {
+    profileId: string;
+    quickReplies: QuickReply[];
+    quickRepliesLoading: boolean;
+    quickRepliesSaving: boolean;
+    quickRepliesError: string | null;
+    onRefreshQuickReplies: () => void;
+    onSaveQuickReplies: (items: QuickReply[]) => void;
+};
+
+export default function WebhookView({
+    profileId,
+    quickReplies,
+    quickRepliesLoading,
+    quickRepliesSaving,
+    quickRepliesError,
+    onRefreshQuickReplies,
+    onSaveQuickReplies
+}: WebhookViewProps) {
     const [webhooks, setWebhooks] = useState<any[]>([]);
     const [apiKeys, setApiKeys] = useState<any>({});
     const [newUrl, setNewUrl] = useState('');
     const [newEvents, setNewEvents] = useState<string[]>(['message_received']);
     const [loading, setLoading] = useState(false);
+    const [autoConfig, setAutoConfig] = useState<{
+        enable_welcome_message: boolean;
+        prompts: string[];
+        commands: Array<{ command_name: string; command_description: string }>;
+    }>({
+        enable_welcome_message: false,
+        prompts: [],
+        commands: []
+    });
+    const [autoLoading, setAutoLoading] = useState(false);
+    const [autoSaving, setAutoSaving] = useState(false);
+    const [reminderConfig, setReminderConfig] = useState<{
+        enabled: boolean;
+        minutes: number | '';
+        text: string;
+    }>({
+        enabled: false,
+        minutes: 30,
+        text: ''
+    });
+    const [reminderLoading, setReminderLoading] = useState(false);
+    const [reminderSaving, setReminderSaving] = useState(false);
+    const [fallbackConfig, setFallbackConfig] = useState<{
+        text: string;
+        limit: number | '';
+    }>({
+        text: '',
+        limit: 3
+    });
+    const [fallbackLoading, setFallbackLoading] = useState(false);
+    const [fallbackSaving, setFallbackSaving] = useState(false);
+    const [fallbackError, setFallbackError] = useState<string | null>(null);
+    const [connectedBusinesses, setConnectedBusinesses] = useState<any[]>([]);
+    const [connectedPaging, setConnectedPaging] = useState<any | null>(null);
+    const [connectedLoading, setConnectedLoading] = useState(false);
+    const [connectedError, setConnectedError] = useState<string | null>(null);
+    const [connectedAppId, setConnectedAppId] = useState('');
+    const [quickRepliesDraft, setQuickRepliesDraft] = useState<QuickReply[]>([]);
 
     useEffect(() => {
+        if (!profileId) return;
         fetchWebhooks();
         fetchApiKeys();
-    }, [profileId]);
+        fetchAutomation();
+        fetchWindowReminder();
+        fetchFallbackSettings();
+        fetchConnectedBusinesses();
+        onRefreshQuickReplies();
+    }, [profileId, onRefreshQuickReplies]);
+
+    useEffect(() => {
+        setQuickRepliesDraft(quickReplies.map(item => ({ ...item })));
+    }, [quickReplies]);
+
+    const handleAddQuickReply = () => {
+        setQuickRepliesDraft(prev => ([
+            ...prev,
+            { shortcut: '', text: '' }
+        ]));
+    };
+
+    const handleUpdateQuickReply = (index: number, field: 'shortcut' | 'text', value: string) => {
+        setQuickRepliesDraft(prev => {
+            const next = [...prev];
+            next[index] = { ...next[index], [field]: value };
+            return next;
+        });
+    };
+
+    const handleRemoveQuickReply = (index: number) => {
+        setQuickRepliesDraft(prev => prev.filter((_, idx) => idx !== index));
+    };
+
+    const handleSaveQuickReplies = () => {
+        onSaveQuickReplies(quickRepliesDraft);
+    };
 
     const fetchWebhooks = () => {
         fetch(`${SOCKET_URL}/addon/admin/webhooks?profileId=${profileId}&adminPassword=${ADMIN_PASS}`)
-            .then(res => res.json())
+            .then(async res => {
+                const text = await res.text();
+                try {
+                    return JSON.parse(text);
+                } catch {
+                    console.error('Webhook fetch failed:', text);
+                    return null;
+                }
+            })
             .then(data => {
-                if (data.success) setWebhooks(data.data);
+                if (data?.success) setWebhooks(data.data || []);
             });
     };
 
     const fetchApiKeys = () => {
         fetch(`${SOCKET_URL}/api/admin/api-keys?adminPassword=${ADMIN_PASS}`)
-            .then(res => res.json())
+            .then(async res => {
+                const text = await res.text();
+                try {
+                    return JSON.parse(text);
+                } catch {
+                    console.error('API key fetch failed:', text);
+                    return null;
+                }
+            })
             .then(data => {
-                if (data.success) setApiKeys(data.data);
+                if (data?.success) setApiKeys(data.data || {});
             });
     };
 
@@ -45,11 +156,21 @@ export default function WebhookView({ profileId }: { profileId: string }) {
                 url: newUrl,
                 events: newEvents
             })
-        }).then(() => {
-            setLoading(false);
-            setNewUrl('');
-            fetchWebhooks();
-        });
+        })
+            .then(async res => {
+                const text = await res.text();
+                try {
+                    return JSON.parse(text);
+                } catch {
+                    console.error('Add webhook failed:', text);
+                    return null;
+                }
+            })
+            .then(() => {
+                setLoading(false);
+                setNewUrl('');
+                fetchWebhooks();
+            });
     };
 
     const handleDeleteWebhook = (url: string) => {
@@ -62,7 +183,17 @@ export default function WebhookView({ profileId }: { profileId: string }) {
                 adminPassword: ADMIN_PASS,
                 url
             })
-        }).then(() => fetchWebhooks());
+        })
+            .then(async res => {
+                const text = await res.text();
+                try {
+                    return JSON.parse(text);
+                } catch {
+                    console.error('Delete webhook failed:', text);
+                    return null;
+                }
+            })
+            .then(() => fetchWebhooks());
     };
 
     const generateApiKey = () => {
@@ -79,18 +210,260 @@ export default function WebhookView({ profileId }: { profileId: string }) {
         }).then(() => fetchApiKeys());
     };
 
+    const fetchAutomation = () => {
+        setAutoLoading(true);
+        fetch(`${SOCKET_URL}/api/waba/conversational-automation?profileId=${profileId}&adminPassword=${ADMIN_PASS}`)
+            .then(async res => {
+                const text = await res.text();
+                try {
+                    return JSON.parse(text);
+                } catch {
+                    console.error('Conversational automation fetch failed:', text);
+                    return null;
+                }
+            })
+            .then(data => {
+                const ca = data?.data?.conversational_automation || {};
+                setAutoConfig({
+                    enable_welcome_message: Boolean(ca.enable_welcome_message),
+                    prompts: Array.isArray(ca.prompts) ? ca.prompts : [],
+                    commands: Array.isArray(ca.commands) ? ca.commands : []
+                });
+            })
+            .finally(() => setAutoLoading(false));
+    };
+
+    const fetchWindowReminder = () => {
+        setReminderLoading(true);
+        fetch(`${SOCKET_URL}/api/waba/window-reminder?profileId=${profileId}&adminPassword=${ADMIN_PASS}`)
+            .then(async res => {
+                const text = await res.text();
+                try {
+                    return JSON.parse(text);
+                } catch {
+                    console.error('Window reminder fetch failed:', text);
+                    return null;
+                }
+            })
+            .then(data => {
+                const config = data?.data || {};
+                setReminderConfig({
+                    enabled: Boolean(config.window_reminder_enabled),
+                    minutes: typeof config.window_reminder_minutes === 'number' ? config.window_reminder_minutes : '',
+                    text: typeof config.window_reminder_text === 'string' ? config.window_reminder_text : ''
+                });
+            })
+            .finally(() => setReminderLoading(false));
+    };
+
+    const handleSaveAutomation = () => {
+        setAutoSaving(true);
+        const payload = {
+            enable_welcome_message: autoConfig.enable_welcome_message,
+            prompts: (autoConfig.prompts || []).map(p => p.trim()).filter(Boolean),
+            commands: (autoConfig.commands || [])
+                .map(c => ({
+                    command_name: (c.command_name || '').trim(),
+                    command_description: (c.command_description || '').trim()
+                }))
+                .filter(c => c.command_name && c.command_description),
+            profileId,
+            adminPassword: ADMIN_PASS
+        };
+        fetch(`${SOCKET_URL}/api/waba/conversational-automation`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        })
+            .then(async res => {
+                const text = await res.text();
+                try {
+                    return JSON.parse(text);
+                } catch {
+                    console.error('Conversational automation save failed:', text);
+                    return null;
+                }
+            })
+            .then(data => {
+                if (data?.success) {
+                    alert('Conversational components saved.');
+                } else {
+                    alert(data?.error || 'Failed to save conversational components');
+                }
+            })
+            .finally(() => setAutoSaving(false));
+    };
+
+    const handleSaveReminder = () => {
+        setReminderSaving(true);
+        const payload = {
+            enabled: reminderConfig.enabled,
+            minutes: reminderConfig.minutes === '' ? null : Number(reminderConfig.minutes),
+            text: reminderConfig.text
+        };
+        fetch(`${SOCKET_URL}/api/waba/window-reminder`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                profileId,
+                adminPassword: ADMIN_PASS,
+                ...payload
+            })
+        })
+            .then(async res => {
+                const text = await res.text();
+                try {
+                    return JSON.parse(text);
+                } catch {
+                    console.error('Window reminder save failed:', text);
+                    return null;
+                }
+            })
+            .then(data => {
+                if (data?.success) {
+                    alert('Window reminder settings saved.');
+                } else {
+                    alert(data?.error || 'Failed to save window reminder settings');
+                }
+            })
+            .finally(() => setReminderSaving(false));
+    };
+
+    const fetchFallbackSettings = () => {
+        if (!profileId) return;
+        setFallbackLoading(true);
+        setFallbackError(null);
+        fetch(`${SOCKET_URL}/api/company/fallback-settings?profileId=${profileId}&adminPassword=${ADMIN_PASS}`)
+            .then(async res => {
+                const text = await res.text();
+                try {
+                    return JSON.parse(text);
+                } catch {
+                    console.error('Fallback settings fetch failed:', text);
+                    return null;
+                }
+            })
+            .then(data => {
+                if (data?.success) {
+                    const cfg = data?.data || {};
+                    setFallbackConfig({
+                        text: typeof cfg.fallback_text === 'string' ? cfg.fallback_text : '',
+                        limit: typeof cfg.fallback_limit === 'number' ? cfg.fallback_limit : 3
+                    });
+                } else {
+                    setFallbackError(data?.error || 'Failed to load fallback settings');
+                }
+            })
+            .finally(() => setFallbackLoading(false));
+    };
+
+    const handleSaveFallbackSettings = () => {
+        setFallbackSaving(true);
+        setFallbackError(null);
+        const payload = {
+            fallback_text: fallbackConfig.text,
+            fallback_limit: fallbackConfig.limit === '' ? null : Number(fallbackConfig.limit)
+        };
+        fetch(`${SOCKET_URL}/api/company/fallback-settings`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                profileId,
+                adminPassword: ADMIN_PASS,
+                ...payload
+            })
+        })
+            .then(async res => {
+                const text = await res.text();
+                try {
+                    return JSON.parse(text);
+                } catch {
+                    console.error('Fallback settings save failed:', text);
+                    return null;
+                }
+            })
+            .then(data => {
+                if (data?.success) {
+                    alert('Fallback settings saved.');
+                } else {
+                    setFallbackError(data?.error || 'Failed to save fallback settings');
+                }
+            })
+            .finally(() => setFallbackSaving(false));
+    };
+
+    const formatConnectedDate = (value?: string) => {
+        if (!value) return '--';
+        const date = new Date(value);
+        if (Number.isNaN(date.getTime())) return value;
+        return date.toLocaleString();
+    };
+
+    const statusBadgeClass = (value?: string) => {
+        const normalized = (value || '').toUpperCase();
+        if (normalized === 'ACTIVE' || normalized === 'VERIFIED') {
+            return 'bg-emerald-50 text-emerald-700 border-emerald-200';
+        }
+        if (normalized === 'PENDING' || normalized === 'PENDING_APPROVAL') {
+            return 'bg-amber-50 text-amber-700 border-amber-200';
+        }
+        if (normalized === 'SUSPENDED' || normalized === 'REJECTED') {
+            return 'bg-rose-50 text-rose-600 border-rose-200';
+        }
+        return 'bg-[#f0f2f5] text-[#54656f] border-[#eceff1]';
+    };
+
+    const fetchConnectedBusinesses = (opts: { after?: string; before?: string } = {}) => {
+        if (!profileId) return;
+        setConnectedLoading(true);
+        setConnectedError(null);
+
+        const params = new URLSearchParams();
+        params.set('profileId', profileId);
+        params.set('adminPassword', ADMIN_PASS);
+        params.set('fields', 'id,name,verification_status,business_status,created_time,updated_time');
+        params.set('limit', '50');
+        if (connectedAppId.trim()) params.set('appId', connectedAppId.trim());
+        if (opts.after) params.set('after', opts.after);
+        if (opts.before) params.set('before', opts.before);
+
+        fetch(`${SOCKET_URL}/api/waba/connected-client-businesses?${params.toString()}`)
+            .then(async res => {
+                const text = await res.text();
+                try {
+                    return JSON.parse(text);
+                } catch {
+                    console.error('Connected businesses fetch failed:', text);
+                    return null;
+                }
+            })
+            .then(data => {
+                if (data?.success) {
+                    const payload = data?.data || {};
+                    setConnectedBusinesses(Array.isArray(payload.data) ? payload.data : []);
+                    setConnectedPaging(payload.paging || null);
+                    setConnectedError(null);
+                } else {
+                    setConnectedBusinesses([]);
+                    setConnectedPaging(null);
+                    setConnectedError(data?.error || 'Failed to load connected businesses');
+                }
+            })
+            .finally(() => setConnectedLoading(false));
+    };
+
     return (
         <div className="flex-1 bg-[#fcfdfd] p-10 overflow-y-auto text-[#111b21] h-screen font-sans">
             <h2 className="text-3xl font-black mb-10 flex items-center gap-4 tracking-tight">
                 <Globe className="text-[#00a884] w-8 h-8" /> API & Connectivity
-                <span className="text-xs bg-[#f0f2f5] px-4 py-1.5 rounded-full text-[#54656f] font-bold border border-[#eceff1] uppercase tracking-widest">Active session: {profileId}</span>
+                <span className="text-xs bg-[#f0f2f5] px-4 py-1.5 rounded-full text-[#54656f] font-bold border border-[#eceff1] uppercase tracking-widest">Active profile: {profileId}</span>
             </h2>
 
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-10">
                 {/* Webhooks Section */}
                 <div className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)]">
                     <h3 className="text-xl mb-2 text-[#111b21] font-bold">Outgoing Webhooks</h3>
-                    <p className="text-sm text-[#54656f] mb-8 font-medium">Configure endpoints to receive real-time updates from this session.</p>
+                    <p className="text-sm text-[#54656f] mb-8 font-medium">Configure endpoints to receive real-time updates from this profile.</p>
 
                     <div className="space-y-4 mb-8">
                         {webhooks.length === 0 && (
@@ -264,6 +637,483 @@ export default function WebhookView({ profileId }: { profileId: string }) {
                             <p className="text-[11px] font-bold text-[#111b21] bg-white border border-[#eceff1] py-3 px-4 rounded-2xl shadow-sm">
                                 Use the <code className="text-[#00a884]">x-api-key</code> to authenticate external requests.
                             </p>
+                        </div>
+                    </div>
+                </div>
+
+                {/* Conversational Components */}
+                <div className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)] lg:col-span-2">
+                    <div className="flex items-center justify-between mb-6">
+                        <div>
+                            <h3 className="text-xl text-[#111b21] font-bold">Conversational Components</h3>
+                            <p className="text-sm text-[#54656f] font-medium mt-1">
+                                Configure welcome message, ice breakers, and commands for this phone number.
+                            </p>
+                        </div>
+                        <button
+                            onClick={fetchAutomation}
+                            className="text-xs font-bold uppercase tracking-widest text-[#00a884] border border-[#00a884]/30 px-3 py-2 rounded-xl hover:bg-[#00a884]/5 transition-all"
+                        >
+                            Refresh
+                        </button>
+                    </div>
+
+                    <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                        <div className="bg-[#fcfdfd] p-5 rounded-2xl border border-[#eceff1]">
+                            <div className="flex items-center justify-between mb-3">
+                                <span className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Welcome Message</span>
+                                <input
+                                    type="checkbox"
+                                    checked={autoConfig.enable_welcome_message}
+                                    onChange={(e) => setAutoConfig(prev => ({ ...prev, enable_welcome_message: e.target.checked }))}
+                                    className="w-4 h-4 accent-[#00a884]"
+                                />
+                            </div>
+                            <p className="text-[11px] text-[#8696a0] leading-relaxed">
+                                When enabled, Meta sends a <code className="font-mono">request_welcome</code> webhook for first‑time chats.
+                                Create a workflow with trigger keyword <code className="font-mono">request_welcome</code> to reply.
+                            </p>
+                        </div>
+
+                        <div className="bg-[#fcfdfd] p-5 rounded-2xl border border-[#eceff1]">
+                            <div className="flex items-center justify-between mb-3">
+                                <span className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Ice Breakers</span>
+                                <button
+                                    onClick={() => {
+                                        setAutoConfig(prev => ({
+                                            ...prev,
+                                            prompts: [...(prev.prompts || []), '']
+                                        }))
+                                    }}
+                                    className="text-[11px] font-bold text-[#00a884] hover:underline"
+                                >
+                                    + Add
+                                </button>
+                            </div>
+                            <div className="space-y-3">
+                                {(autoConfig.prompts || []).map((prompt, idx) => (
+                                    <div key={idx} className="flex items-center gap-2">
+                                        <input
+                                            className="flex-1 bg-white border border-[#eceff1] rounded-xl px-3 py-2 text-xs font-bold text-[#111b21] focus:outline-none focus:border-[#00a884]"
+                                            value={prompt}
+                                            onChange={(e) => {
+                                                const next = [...(autoConfig.prompts || [])];
+                                                next[idx] = e.target.value;
+                                                setAutoConfig(prev => ({ ...prev, prompts: next }));
+                                            }}
+                                            placeholder="Plan a trip"
+                                        />
+                                        <button
+                                            onClick={() => {
+                                                const next = (autoConfig.prompts || []).filter((_, i) => i !== idx);
+                                                setAutoConfig(prev => ({ ...prev, prompts: next }));
+                                            }}
+                                            className="text-rose-500 text-xs font-bold"
+                                        >
+                                            Remove
+                                        </button>
+                                    </div>
+                                ))}
+                                {autoConfig.prompts.length === 0 && (
+                                    <p className="text-[11px] text-[#aebac1]">No ice breakers configured.</p>
+                                )}
+                            </div>
+                        </div>
+
+                        <div className="bg-[#fcfdfd] p-5 rounded-2xl border border-[#eceff1]">
+                            <div className="flex items-center justify-between mb-3">
+                                <span className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Commands</span>
+                                <button
+                                    onClick={() => {
+                                        setAutoConfig(prev => ({
+                                            ...prev,
+                                            commands: [...(prev.commands || []), { command_name: '', command_description: '' }]
+                                        }))
+                                    }}
+                                    className="text-[11px] font-bold text-[#00a884] hover:underline"
+                                >
+                                    + Add
+                                </button>
+                            </div>
+                            <div className="space-y-3">
+                                {(autoConfig.commands || []).map((cmd, idx) => (
+                                    <div key={idx} className="space-y-2 bg-white p-3 rounded-xl border border-[#eceff1]">
+                                        <input
+                                            className="w-full bg-[#f8f9fa] border border-[#eceff1] rounded-lg px-3 py-2 text-xs font-bold text-[#111b21] focus:outline-none focus:border-[#00a884]"
+                                            value={cmd.command_name}
+                                            onChange={(e) => {
+                                                const next = [...(autoConfig.commands || [])];
+                                                next[idx] = { ...next[idx], command_name: e.target.value };
+                                                setAutoConfig(prev => ({ ...prev, commands: next }));
+                                            }}
+                                            placeholder="tickets"
+                                        />
+                                        <input
+                                            className="w-full bg-[#f8f9fa] border border-[#eceff1] rounded-lg px-3 py-2 text-xs text-[#111b21] focus:outline-none focus:border-[#00a884]"
+                                            value={cmd.command_description}
+                                            onChange={(e) => {
+                                                const next = [...(autoConfig.commands || [])];
+                                                next[idx] = { ...next[idx], command_description: e.target.value };
+                                                setAutoConfig(prev => ({ ...prev, commands: next }));
+                                            }}
+                                            placeholder="Book flight tickets"
+                                        />
+                                        <button
+                                            onClick={() => {
+                                                const next = (autoConfig.commands || []).filter((_, i) => i !== idx);
+                                                setAutoConfig(prev => ({ ...prev, commands: next }));
+                                            }}
+                                            className="text-rose-500 text-[11px] font-bold"
+                                        >
+                                            Remove
+                                        </button>
+                                    </div>
+                                ))}
+                                {autoConfig.commands.length === 0 && (
+                                    <p className="text-[11px] text-[#aebac1]">No commands configured.</p>
+                                )}
+                            </div>
+                        </div>
+                    </div>
+
+                    <div className="mt-6 flex items-center justify-end gap-3">
+                        <button
+                            onClick={handleSaveAutomation}
+                            disabled={autoSaving || autoLoading}
+                            className="bg-[#00a884] hover:bg-[#008f6f] text-white px-5 py-3 rounded-2xl font-bold transition-all shadow-[0_8px_20px_rgba(0,168,132,0.2)] disabled:opacity-50"
+                        >
+                            {autoSaving ? 'Saving…' : 'Save Conversational Components'}
+                        </button>
+                    </div>
+                </div>
+
+                {/* 24h Window Reminder */}
+                <div className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)] lg:col-span-2">
+                    <div className="flex items-center justify-between mb-6">
+                        <div>
+                            <h3 className="text-xl text-[#111b21] font-bold">24h Window Reminder</h3>
+                            <p className="text-sm text-[#54656f] font-medium mt-1">
+                                Send a reminder message before the 24h reply window closes. Use <code className="font-mono">{'{minutes}'}</code> in the text.
+                            </p>
+                        </div>
+                        <button
+                            onClick={fetchWindowReminder}
+                            className="text-xs font-bold uppercase tracking-widest text-[#00a884] border border-[#00a884]/30 px-3 py-2 rounded-xl hover:bg-[#00a884]/5 transition-all"
+                        >
+                            Refresh
+                        </button>
+                    </div>
+
+                    <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                        <div className="bg-[#fcfdfd] p-5 rounded-2xl border border-[#eceff1] flex items-center justify-between">
+                            <span className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Enabled</span>
+                            <input
+                                type="checkbox"
+                                checked={reminderConfig.enabled}
+                                onChange={(e) => setReminderConfig(prev => ({ ...prev, enabled: e.target.checked }))}
+                                className="w-4 h-4 accent-[#00a884]"
+                            />
+                        </div>
+
+                        <div className="bg-[#fcfdfd] p-5 rounded-2xl border border-[#eceff1]">
+                            <span className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Minutes Before Close</span>
+                            <input
+                                type="number"
+                                min={1}
+                                className="mt-3 w-full bg-white border border-[#eceff1] rounded-xl px-3 py-2 text-sm font-bold text-[#111b21] focus:outline-none focus:border-[#00a884]"
+                                value={reminderConfig.minutes}
+                                onChange={(e) => {
+                                    const next = e.target.value === '' ? '' : Number(e.target.value);
+                                    setReminderConfig(prev => ({ ...prev, minutes: next }));
+                                }}
+                                placeholder="30"
+                            />
+                            <p className="text-[11px] text-[#8696a0] mt-2">Set to the number of minutes before the window ends.</p>
+                        </div>
+
+                        <div className="bg-[#fcfdfd] p-5 rounded-2xl border border-[#eceff1] lg:col-span-1">
+                            <span className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Reminder Text</span>
+                            <textarea
+                                className="mt-3 w-full bg-white border border-[#eceff1] rounded-xl px-3 py-2 text-sm font-medium text-[#111b21] focus:outline-none focus:border-[#00a884] h-24 resize-none"
+                                value={reminderConfig.text}
+                                onChange={(e) => setReminderConfig(prev => ({ ...prev, text: e.target.value }))}
+                                placeholder="Heads up! Our 24h reply window closes in {minutes} minutes."
+                            />
+                        </div>
+                    </div>
+
+                    <div className="mt-6 flex items-center justify-end gap-3">
+                        <button
+                            onClick={handleSaveReminder}
+                            disabled={reminderSaving || reminderLoading}
+                            className="bg-[#00a884] hover:bg-[#008f6f] text-white px-5 py-3 rounded-2xl font-bold transition-all shadow-[0_8px_20px_rgba(0,168,132,0.2)] disabled:opacity-50"
+                        >
+                            {reminderSaving ? 'Saving…' : 'Save Window Reminder'}
+                        </button>
+                    </div>
+                </div>
+
+                {/* Global Fallback Settings */}
+                <div className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)] lg:col-span-2">
+                    <div className="flex items-center justify-between mb-6">
+                        <div>
+                            <h3 className="text-xl text-[#111b21] font-bold">Fallback Message</h3>
+                            <p className="text-sm text-[#54656f] font-medium mt-1">
+                                Set the default reply when a user presses an invalid button.
+                            </p>
+                        </div>
+                        <button
+                            onClick={fetchFallbackSettings}
+                            className="text-xs font-bold uppercase tracking-widest text-[#00a884] border border-[#00a884]/30 px-3 py-2 rounded-xl hover:bg-[#00a884]/5 transition-all"
+                        >
+                            Refresh
+                        </button>
+                    </div>
+
+                    {fallbackError && (
+                        <div className="mb-4 bg-rose-50 border border-rose-200 text-rose-700 rounded-2xl px-4 py-3 text-sm font-medium">
+                            {fallbackError}
+                        </div>
+                    )}
+
+                    <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                        <div className="bg-[#fcfdfd] p-5 rounded-2xl border border-[#eceff1] lg:col-span-2">
+                            <span className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Fallback Text</span>
+                            <textarea
+                                className="mt-3 w-full bg-white border border-[#eceff1] rounded-xl px-3 py-2 text-sm font-medium text-[#111b21] focus:outline-none focus:border-[#00a884] h-24 resize-none"
+                                value={fallbackConfig.text}
+                                onChange={(e) => setFallbackConfig(prev => ({ ...prev, text: e.target.value }))}
+                                placeholder="Please choose one of the options above."
+                            />
+                            <p className="text-[11px] text-[#8696a0] mt-2">
+                                Leave empty to stop sending fallback replies.
+                            </p>
+                        </div>
+
+                        <div className="bg-[#fcfdfd] p-5 rounded-2xl border border-[#eceff1]">
+                            <span className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Max Times</span>
+                            <input
+                                type="number"
+                                min={0}
+                                className="mt-3 w-full bg-white border border-[#eceff1] rounded-xl px-3 py-2 text-sm font-bold text-[#111b21] focus:outline-none focus:border-[#00a884]"
+                                value={fallbackConfig.limit}
+                                onChange={(e) => {
+                                    const next = e.target.value === '' ? '' : Number(e.target.value);
+                                    setFallbackConfig(prev => ({ ...prev, limit: next }));
+                                }}
+                                placeholder="3"
+                            />
+                            <p className="text-[11px] text-[#8696a0] mt-2">Set to <code className="font-mono">0</code> for unlimited replies.</p>
+                        </div>
+                    </div>
+
+                    <div className="mt-6 flex items-center justify-end gap-3">
+                        <button
+                            onClick={handleSaveFallbackSettings}
+                            disabled={fallbackSaving || fallbackLoading}
+                            className="bg-[#00a884] hover:bg-[#008f6f] text-white px-5 py-3 rounded-2xl font-bold transition-all shadow-[0_8px_20px_rgba(0,168,132,0.2)] disabled:opacity-50"
+                        >
+                            {fallbackSaving ? 'Saving…' : 'Save Fallback Settings'}
+                        </button>
+                    </div>
+                </div>
+
+                {/* Quick Replies */}
+                <div className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)] lg:col-span-2">
+                    <div className="flex items-center justify-between mb-6">
+                        <div>
+                            <h3 className="text-xl text-[#111b21] font-bold">Quick Replies</h3>
+                            <p className="text-sm text-[#54656f] font-medium mt-1">
+                                Type <code className="font-mono">/shortcut</code> in chat to send the full message.
+                            </p>
+                        </div>
+                        <button
+                            onClick={onRefreshQuickReplies}
+                            className="text-xs font-bold uppercase tracking-widest text-[#00a884] border border-[#00a884]/30 px-3 py-2 rounded-xl hover:bg-[#00a884]/5 transition-all"
+                        >
+                            Refresh
+                        </button>
+                    </div>
+
+                    {quickRepliesError && (
+                        <div className="mb-4 bg-rose-50 border border-rose-200 text-rose-700 rounded-2xl px-4 py-3 text-sm font-medium">
+                            {quickRepliesError}
+                        </div>
+                    )}
+
+                    <div className="space-y-4">
+                        {quickRepliesDraft.length === 0 ? (
+                            <div className="bg-[#fcfdfd] border border-dashed border-[#d7dfe2] rounded-2xl p-6 text-sm text-[#8696a0]">
+                                No quick replies yet. Add one below.
+                            </div>
+                        ) : (
+                            quickRepliesDraft.map((item, index) => (
+                                <div key={`${item.id || 'new'}-${index}`} className="bg-[#fcfdfd] border border-[#eceff1] rounded-2xl p-5">
+                                    <div className="grid grid-cols-1 lg:grid-cols-6 gap-4 items-start">
+                                        <div className="lg:col-span-1">
+                                            <span className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Shortcut</span>
+                                            <input
+                                                className="mt-3 w-full bg-white border border-[#eceff1] rounded-xl px-3 py-2 text-sm font-bold text-[#111b21] focus:outline-none focus:border-[#00a884]"
+                                                value={item.shortcut}
+                                                onChange={(e) => handleUpdateQuickReply(index, 'shortcut', e.target.value)}
+                                                placeholder="/hi"
+                                            />
+                                        </div>
+                                        <div className="lg:col-span-4">
+                                            <span className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Message</span>
+                                            <textarea
+                                                className="mt-3 w-full bg-white border border-[#eceff1] rounded-xl px-3 py-2 text-sm font-medium text-[#111b21] focus:outline-none focus:border-[#00a884] h-20 resize-none"
+                                                value={item.text}
+                                                onChange={(e) => handleUpdateQuickReply(index, 'text', e.target.value)}
+                                                placeholder="Hello! How can we help you today?"
+                                            />
+                                        </div>
+                                        <div className="lg:col-span-1 flex items-end justify-end">
+                                            <button
+                                                onClick={() => handleRemoveQuickReply(index)}
+                                                className="mt-6 flex items-center gap-2 text-xs font-bold uppercase tracking-widest text-rose-500 hover:text-rose-600"
+                                            >
+                                                <Trash2 className="w-4 h-4" /> Remove
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+                            ))
+                        )}
+                    </div>
+
+                    <div className="mt-6 flex items-center justify-between gap-3">
+                        <button
+                            onClick={handleAddQuickReply}
+                            className="flex items-center gap-2 text-xs font-bold uppercase tracking-widest text-[#111b21] border border-[#d7dfe2] px-4 py-3 rounded-2xl hover:bg-[#f6f8f9] transition-all"
+                        >
+                            <Plus className="w-4 h-4" /> Add Quick Reply
+                        </button>
+                        <button
+                            onClick={handleSaveQuickReplies}
+                            disabled={quickRepliesSaving || quickRepliesLoading}
+                            className="bg-[#00a884] hover:bg-[#008f6f] text-white px-5 py-3 rounded-2xl font-bold transition-all shadow-[0_8px_20px_rgba(0,168,132,0.2)] disabled:opacity-50"
+                        >
+                            {quickRepliesSaving ? 'Saving…' : 'Save Quick Replies'}
+                        </button>
+                    </div>
+                </div>
+
+                {/* Connected Client Businesses */}
+                <div className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)] lg:col-span-2">
+                    <div className="flex items-center justify-between mb-6">
+                        <div>
+                            <h3 className="text-xl text-[#111b21] font-bold">Connected Businesses</h3>
+                            <p className="text-sm text-[#54656f] font-medium mt-1">
+                                Fetch client businesses connected to your Meta app for this profile.
+                            </p>
+                        </div>
+                        <button
+                            onClick={() => fetchConnectedBusinesses()}
+                            className="text-xs font-bold uppercase tracking-widest text-[#00a884] border border-[#00a884]/30 px-3 py-2 rounded-xl hover:bg-[#00a884]/5 transition-all"
+                        >
+                            Refresh
+                        </button>
+                    </div>
+
+                    <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 mb-6">
+                        <div className="lg:col-span-2">
+                            <label className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Application ID (optional)</label>
+                            <input
+                                className="mt-3 w-full bg-[#f8f9fa] border border-[#eceff1] rounded-2xl px-5 py-4 text-sm focus:outline-none focus:ring-2 focus:ring-[#00a884]/20 focus:border-[#00a884] text-[#111b21] font-bold placeholder-[#aebac1]"
+                                placeholder="Uses waba_configs.app_id if left empty"
+                                value={connectedAppId}
+                                onChange={e => setConnectedAppId(e.target.value)}
+                            />
+                            <p className="text-[11px] text-[#8696a0] mt-2">
+                                Leave blank to use the stored <code className="font-mono">app_id</code> from Supabase or <code className="font-mono">WABA_APP_ID</code>.
+                            </p>
+                        </div>
+                        <button
+                            onClick={() => fetchConnectedBusinesses()}
+                            disabled={connectedLoading}
+                            className="h-[58px] mt-[24px] bg-[#111b21] text-white px-5 rounded-2xl flex items-center justify-center gap-2 font-bold hover:bg-[#202c33] transition-all shadow-lg text-xs disabled:opacity-50"
+                        >
+                            {connectedLoading ? <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" /> : 'Fetch'}
+                        </button>
+                    </div>
+
+                    {connectedError && (
+                        <div className="mb-4 bg-rose-50 border border-rose-200 text-rose-700 rounded-2xl px-4 py-3 text-sm font-medium">
+                            {connectedError}
+                        </div>
+                    )}
+
+                    <div className="bg-[#fcfdfd] rounded-2xl border border-[#eceff1] overflow-hidden">
+                        <table className="w-full text-left">
+                            <thead className="bg-white text-[#54656f] text-[10px] uppercase font-black tracking-widest border-b border-[#eceff1]">
+                                <tr>
+                                    <th className="px-6 py-4">Business</th>
+                                    <th className="px-6 py-4">Business ID</th>
+                                    <th className="px-6 py-4">Verification</th>
+                                    <th className="px-6 py-4">Status</th>
+                                    <th className="px-6 py-4">Updated</th>
+                                </tr>
+                            </thead>
+                            <tbody className="divide-y divide-[#f0f2f5]">
+                                {connectedLoading ? (
+                                    <tr>
+                                        <td className="px-6 py-6 text-sm text-[#8696a0]" colSpan={5}>
+                                            Loading connected businesses...
+                                        </td>
+                                    </tr>
+                                ) : connectedBusinesses.length === 0 ? (
+                                    <tr>
+                                        <td className="px-6 py-6 text-sm text-[#8696a0]" colSpan={5}>
+                                            No connected businesses found.
+                                        </td>
+                                    </tr>
+                                ) : (
+                                    connectedBusinesses.map((biz: any) => (
+                                        <tr key={biz.id} className="hover:bg-white transition-all">
+                                            <td className="px-6 py-4">
+                                                <div className="text-sm font-bold text-[#111b21]">{biz.name || 'Unnamed Business'}</div>
+                                            </td>
+                                            <td className="px-6 py-4 text-xs font-mono text-[#54656f]">{biz.id}</td>
+                                            <td className="px-6 py-4">
+                                                <span className={`text-[10px] px-3 py-1 rounded-full border font-bold uppercase tracking-widest ${statusBadgeClass(biz.verification_status)}`}>
+                                                    {biz.verification_status || 'UNKNOWN'}
+                                                </span>
+                                            </td>
+                                            <td className="px-6 py-4">
+                                                <span className={`text-[10px] px-3 py-1 rounded-full border font-bold uppercase tracking-widest ${statusBadgeClass(biz.business_status)}`}>
+                                                    {biz.business_status || 'UNKNOWN'}
+                                                </span>
+                                            </td>
+                                            <td className="px-6 py-4 text-xs text-[#54656f]">
+                                                {formatConnectedDate(biz.updated_time || biz.created_time)}
+                                            </td>
+                                        </tr>
+                                    ))
+                                )}
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <div className="mt-4 flex items-center justify-between">
+                        <div className="text-[11px] text-[#8696a0] font-bold uppercase tracking-widest">
+                            {connectedBusinesses.length} results
+                        </div>
+                        <div className="flex items-center gap-2">
+                            <button
+                                onClick={() => fetchConnectedBusinesses({ before: connectedPaging?.cursors?.before })}
+                                disabled={!connectedPaging?.cursors?.before || connectedLoading}
+                                className="px-3 py-2 rounded-xl border border-[#eceff1] text-[11px] font-bold uppercase tracking-widest text-[#54656f] hover:border-[#aebac1] disabled:opacity-50"
+                            >
+                                Previous
+                            </button>
+                            <button
+                                onClick={() => fetchConnectedBusinesses({ after: connectedPaging?.cursors?.after })}
+                                disabled={!connectedPaging?.cursors?.after || connectedLoading}
+                                className="px-3 py-2 rounded-xl border border-[#eceff1] text-[11px] font-bold uppercase tracking-widest text-[#54656f] hover:border-[#aebac1] disabled:opacity-50"
+                            >
+                                Next
+                            </button>
                         </div>
                     </div>
                 </div>

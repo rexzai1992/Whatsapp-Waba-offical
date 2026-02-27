@@ -1,7 +1,7 @@
 
 import React, { useState, useEffect } from 'react';
 import { Socket } from 'socket.io-client';
-import { Users, Shield, Trash2, Power, Globe, Search } from 'lucide-react';
+import { Users, Shield, Trash2, Globe, Search } from 'lucide-react';
 
 export default function AdminView({ socket }: { socket: Socket | null }) {
     const [allProfiles, setAllProfiles] = useState<any[]>([]);
@@ -64,13 +64,13 @@ export default function AdminView({ socket }: { socket: Socket | null }) {
                         <div className="text-[11px] text-[#aebac1] mt-2 font-medium">Provisioned in database</div>
                     </div>
                     <div className="bg-white p-8 rounded-[32px] border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.03)]">
-                        <div className="text-[#54656f] text-[10px] uppercase font-black tracking-widest mb-3">Active Sockets</div>
+                        <div className="text-[#54656f] text-[10px] uppercase font-black tracking-widest mb-3">Active WABA Configs</div>
                         <div className="text-3xl font-black text-[#00a884]">
                             {allProfiles.filter(p => p.status === 'open').length}
                         </div>
                         <div className="text-[11px] text-[#00a884]/60 mt-2 font-bold flex items-center gap-1">
                             <div className="w-1.5 h-1.5 bg-[#00a884] rounded-full animate-pulse" />
-                            Direct real-time link
+                            Cloud API configured
                         </div>
                     </div>
                     <div className="bg-white p-8 rounded-[32px] border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.03)]">
@@ -115,13 +115,6 @@ export default function AdminView({ socket }: { socket: Socket | null }) {
                                     </td>
                                     <td className="px-8 py-6 text-right">
                                         <div className="flex items-center justify-end gap-3">
-                                            <button
-                                                onClick={() => handleAction('logout', p.id)}
-                                                className="w-9 h-9 flex items-center justify-center bg-white hover:bg-rose-50 text-rose-500 rounded-xl border border-rose-100 transition-all shadow-sm"
-                                                title="Force Logout"
-                                            >
-                                                <Power className="w-4 h-4" />
-                                            </button>
                                             <button
                                                 onClick={() => handleAction('delete', p.id)}
                                                 className="w-9 h-9 flex items-center justify-center bg-white hover:bg-rose-500 text-rose-500 hover:text-white rounded-xl border border-rose-100 transition-all shadow-sm"

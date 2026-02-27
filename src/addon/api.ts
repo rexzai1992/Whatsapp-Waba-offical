@@ -1,9 +1,17 @@
 
 import { Router } from 'express'
 import { webhookService } from './webhook-service'
-import { store } from '../store'
+import type { WabaClient } from '../waba/client'
+import type { WorkflowEngine } from '../workflow/engine'
+import { findOrCreateUser, getMessagesForUsers, getUsersForCompany, insertMessage } from '../services/wa-store'
+import { sendWhatsAppMessage, canReplyFreely } from '../services/whatsapp'
 
-export function createAddonRouter(sessions: Map<string, any>, verifyApiKey: any) {
+export function createAddonRouter(
+    getClient: (profileId: string) => Promise<WabaClient | null>,
+    getCompanyIdForProfile: (profileId: string) => Promise<string | null>,
+    workflowEngine: WorkflowEngine,
+    verifyApiKey: any
+) {
     const router = Router()
 
     // 1. Send Message API
@@ -22,21 +30,30 @@ export function createAddonRouter(sessions: Map<string, any>, verifyApiKey: any)
             // Format phone
             let jid = phone.includes('@') ? phone : `${phone.replace(/\D/g, '')}@s.whatsapp.net`
 
-            const session = sessions.get(profileId)
-            if (!session || !session.sock) {
-                return res.status(503).json({ success: false, error: 'WhatsApp not connected' })
+            const client = await getClient(profileId)
+            if (!client) {
+                return res.status(503).json({ success: false, error: 'WABA not configured for this profile' })
+            }
+
+            const companyId = await getCompanyIdForProfile(profileId)
+            if (!companyId) {
+                return res.status(400).json({ success: false, error: 'Company not found' })
+            }
+
+            const phoneNumber = jid.replace(/@s\\.whatsapp\\.net$/, '').replace(/\\D/g, '')
+            const user = await findOrCreateUser(companyId, phoneNumber)
+            if (!user) {
+                return res.status(500).json({ success: false, error: 'Failed to resolve user' })
             }
 
             let responseMsg;
 
             if (media) {
-                // Optimization: Pass URL to Baileys instead of buffering in memory
+                // WABA Cloud API expects a public URL for media
                 // 1. Try to determine type via Extension (fastest)
                 // 2. Fallback to HEAD request (light)
 
                 let type = 'document'
-                let mimetype = ''
-
                 const ext = media.split('.').pop()?.toLowerCase() || ''
                 if (['jpg', 'jpeg', 'png', 'gif', 'webp'].includes(ext)) type = 'image'
                 else if (['mp4', 'avi', 'mov'].includes(ext)) type = 'video'
@@ -44,49 +61,68 @@ export function createAddonRouter(sessions: Map<string, any>, verifyApiKey: any)
                 else {
                     // Fetch HEAD to check content-type
                     try {
-                        const fetch = (await import('node-fetch')).default || global.fetch
                         const headRes = await fetch(media, { method: 'HEAD' })
                         const contentType = headRes.headers.get('content-type') || ''
                         if (contentType.includes('image')) type = 'image'
                         else if (contentType.includes('video')) type = 'video'
                         else if (contentType.includes('audio')) type = 'audio'
-                        mimetype = contentType
                     } catch (e) {
                         console.warn('HEAD request failed, defaulting to document', e)
                     }
                 }
 
-                const msgPayload: any = { caption: caption || '' }
-
-                if (type === 'image') msgPayload.image = { url: media }
-                else if (type === 'video') msgPayload.video = { url: media }
-                else if (type === 'audio') {
-                    msgPayload.audio = { url: media }
-                    if (mimetype) msgPayload.mimetype = mimetype
-                } else {
-                    msgPayload.document = { url: media }
-                    // For documents, mimetype is often required
-                    msgPayload.mimetype = mimetype || 'application/octet-stream'
+                const withinWindow = await canReplyFreely(user.id)
+                if (!withinWindow) {
+                    return res.status(400).json({ success: false, error: 'Outside 24h window: template required' })
                 }
 
-                responseMsg = await session.sock.sendMessage(jid, msgPayload)
+                responseMsg = await client.sendMedia(
+                    jid,
+                    type as 'image' | 'video' | 'audio' | 'document',
+                    media,
+                    {
+                        caption: caption || undefined
+                    }
+                )
+                const messageId = responseMsg?.messages?.[0]?.id
+                await insertMessage({
+                    userId: user.id,
+                    direction: 'out',
+                    content: {
+                        type,
+                        to: phoneNumber,
+                        message_id: messageId,
+                        media_url: media,
+                        caption: caption || '',
+                        status: 'sent'
+                    },
+                    workflowState: null
+                })
 
             } else {
                 // Text message
-                responseMsg = await session.sock.sendMessage(jid, { text: message })
+                responseMsg = await sendWhatsAppMessage({
+                    client,
+                    userId: user.id,
+                    to: phoneNumber,
+                    type: 'text',
+                    content: { text: message }
+                })
             }
+
+            const messageId = responseMsg?.messageId || responseMsg?.messages?.[0]?.id
 
             // Trigger event
             webhookService.trigger(profileId, 'message_sent', {
                 to: jid,
                 message: message || 'media',
-                messageId: responseMsg?.key?.id
+                messageId
             })
 
             res.json({
                 success: true,
                 data: {
-                    messageId: responseMsg?.key?.id,
+                    messageId,
                     status: 'sent',
                     timestamp: new Date().toISOString()
                 }
@@ -102,34 +138,35 @@ export function createAddonRouter(sessions: Map<string, any>, verifyApiKey: any)
                 })
             }
 
-            res.status(500).json({ success: false, error: error.message })
+            const status = error?.message?.includes('Outside 24h') ? 400 : 500
+            res.status(status).json({ success: false, error: error.message })
         }
     })
 
     // 2. Get Message History API
-    router.get('/api/messages', verifyApiKey, (req: any, res: any) => {
+    router.get('/api/messages', verifyApiKey, async (req: any, res: any) => {
         try {
             const profileId = req.apiKeyInfo.profileId
             const { phone, limit = 50 } = req.query
 
-            let messages = store.getMessages(profileId)
-
-            if (phone) {
-                const cleanPhone = phone.replace(/\D/g, '')
-                messages = messages.filter((m: any) => {
-                    const remoteJid = m.key.remoteJid || ''
-                    return remoteJid.includes(cleanPhone)
-                })
+            const companyId = await getCompanyIdForProfile(profileId)
+            if (!companyId) {
+                return res.json({ success: true, data: [] })
             }
 
-            // Sort desc (newest first) or asc? Usually history is desc.
-            // Messages are stored via push(), so newest last.
-            // Reverse for API response?
-            const sliced = messages.slice(-parseInt(limit))
+            const users = await getUsersForCompany(companyId)
+            let filteredUsers = users
+
+            if (phone) {
+                const cleanPhone = String(phone).replace(/\D/g, '')
+                filteredUsers = users.filter(u => u.phone_number.includes(cleanPhone))
+            }
+
+            const messages = await getMessagesForUsers(filteredUsers.map(u => u.id), Number(limit))
 
             res.json({
                 success: true,
-                data: sliced
+                data: messages
             })
         } catch (error: any) {
             res.status(500).json({ success: false, error: error.message })
@@ -142,33 +179,29 @@ export function createAddonRouter(sessions: Map<string, any>, verifyApiKey: any)
             const profileId = req.apiKeyInfo.profileId
             const body = req.body
 
-            // "Capture incoming messages"
-            // "Sync with current chat database"
-            // "Forward data to registered webhooks"
-
-            // Construct a fake message object compliant with Baileys/Store format if possible
-            // Or just store raw? Store expects Baileys proto usually.
-            // Let's create a synthetic record.
-
-            const from = body.from
-            const text = body.message
-            const timestamp = body.time || new Date().toISOString()
-
-            const syntheticMsg = {
-                key: {
-                    remoteJid: from.includes('@') ? from : `${from.replace(/\D/g, '')}@s.whatsapp.net`,
-                    fromMe: false,
-                    id: `ext_${Date.now()}`
-                },
-                messageTimestamp: Date.parse(timestamp) / 1000,
-                pushName: body.senderName || 'External',
-                message: {
-                    conversation: text
-                }
+            const client = await getClient(profileId)
+            if (!client) {
+                return res.status(503).json({ success: false, error: 'WABA not configured for this profile' })
             }
 
-            // Sync with DB
-            store.addMessage(profileId, syntheticMsg)
+            const companyId = await getCompanyIdForProfile(profileId)
+            if (!companyId) {
+                return res.status(400).json({ success: false, error: 'Company not found' })
+            }
+
+            const from = body.from || ''
+            const text = body.message || ''
+            const phoneNumber = from.replace(/\D/g, '')
+
+            await workflowEngine.processInbound({
+                companyId,
+                profileId,
+                client,
+                phoneNumber,
+                messageType: 'text',
+                text,
+                raw: body
+            })
 
             // Trigger Webhook (Outgoing)
             webhookService.trigger(profileId, 'message_received', {
@@ -198,36 +231,48 @@ export function createAddonRouter(sessions: Map<string, any>, verifyApiKey: any)
     }
 
     router.get('/admin/webhooks', checkAdminAuth, (req: any, res: any) => {
-        const profileId = req.apiKeyInfo.profileId
-        res.json({
-            success: true,
-            data: webhookService.getWebhooks(profileId)
-        })
+        try {
+            const profileId = req.apiKeyInfo?.profileId || 'default'
+            res.json({
+                success: true,
+                data: webhookService.getWebhooks(profileId)
+            })
+        } catch (error: any) {
+            res.status(500).json({ success: false, error: error?.message || 'Failed to load webhooks' })
+        }
     })
 
     router.post('/admin/webhooks', checkAdminAuth, (req: any, res: any) => {
-        const profileId = req.apiKeyInfo.profileId
-        const { url, events, enabled, secret } = req.body
+        try {
+            const profileId = req.apiKeyInfo?.profileId || 'default'
+            const { url, events, enabled, secret } = req.body
 
-        if (!url || !events) {
-            return res.status(400).json({ success: false, error: 'URL and events required' })
+            if (!url || !events) {
+                return res.status(400).json({ success: false, error: 'URL and events required' })
+            }
+
+            webhookService.addWebhook(profileId, {
+                url,
+                events,
+                enabled: enabled !== false, // default true
+                secret
+            })
+
+            res.json({ success: true })
+        } catch (error: any) {
+            res.status(500).json({ success: false, error: error?.message || 'Failed to save webhook' })
         }
-
-        webhookService.addWebhook(profileId, {
-            url,
-            events,
-            enabled: enabled !== false, // default true
-            secret
-        })
-
-        res.json({ success: true })
     })
 
     router.delete('/admin/webhooks', checkAdminAuth, (req: any, res: any) => {
-        const profileId = req.apiKeyInfo.profileId
-        const { url } = req.body
-        webhookService.removeWebhook(profileId, url)
-        res.json({ success: true })
+        try {
+            const profileId = req.apiKeyInfo?.profileId || 'default'
+            const { url } = req.body
+            webhookService.removeWebhook(profileId, url)
+            res.json({ success: true })
+        } catch (error: any) {
+            res.status(500).json({ success: false, error: error?.message || 'Failed to delete webhook' })
+        }
     })
 
     return router

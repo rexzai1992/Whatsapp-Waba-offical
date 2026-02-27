@@ -16,6 +16,7 @@ export default function Login({ onLogin }: { onLogin: () => void }) {
     const [loading, setLoading] = useState(false)
     const [email, setEmail] = useState('')
     const [password, setPassword] = useState('')
+    const [companyId, setCompanyId] = useState('')
     const [mode, setMode] = useState<'login' | 'signup'>('login')
     const [msg, setMsg] = useState('')
     const [isVisible, setIsVisible] = useState(false)
@@ -30,13 +31,33 @@ export default function Login({ onLogin }: { onLogin: () => void }) {
         setMsg('')
 
         try {
+            const trimmedCompany = companyId.trim()
+            if (!trimmedCompany) {
+                throw new Error('Company ID is required.')
+            }
             if (mode === 'signup') {
-                const { error } = await supabase.auth.signUp({ email, password })
+                const { error } = await supabase.auth.signUp({
+                    email,
+                    password,
+                    options: {
+                        data: { company_id: trimmedCompany }
+                    }
+                })
                 if (error) throw error
                 setMsg('Success! Check your email for confirmation link.')
             } else {
-                const { error } = await supabase.auth.signInWithPassword({ email, password })
+                const { data, error } = await supabase.auth.signInWithPassword({ email, password })
                 if (error) throw error
+                const metaCompany = data?.user?.user_metadata?.company_id || data?.user?.app_metadata?.company_id
+                if (!metaCompany) {
+                    const { error: updateError } = await supabase.auth.updateUser({
+                        data: { company_id: trimmedCompany }
+                    })
+                    if (updateError) throw updateError
+                } else if (metaCompany !== trimmedCompany) {
+                    await supabase.auth.signOut()
+                    throw new Error('Company ID does not match this account.')
+                }
                 onLogin()
             }
         } catch (error: any) {
@@ -49,8 +70,8 @@ export default function Login({ onLogin }: { onLogin: () => void }) {
     const services = [
         {
             icon: <Layers className="w-5 h-5 text-[#00a884]" />,
-            title: "Multi-Session Infrastructure",
-            desc: "Run hundreds of WhatsApp profiles concurrently with zero lag."
+            title: "WABA Cloud Infrastructure",
+            desc: "Run official Meta WhatsApp Business API profiles with zero lag."
         },
         {
             icon: <Cpu className="w-5 h-5 text-[#00a884]" />,
@@ -133,7 +154,7 @@ export default function Login({ onLogin }: { onLogin: () => void }) {
                                 {mode === 'login' ? 'Welcome Back' : 'Get Started'}
                             </h2>
                             <p className="text-[#54656f]">
-                                {mode === 'login' ? 'Manage your sessions with Nexus WA.' : 'Create your admin account to begin.'}
+                                {mode === 'login' ? 'Manage your WABA profiles with Nexus WA.' : 'Create your admin account to begin.'}
                             </p>
                         </div>
 
@@ -153,6 +174,17 @@ export default function Login({ onLogin }: { onLogin: () => void }) {
                         </div>
 
                         <form onSubmit={handleAuth} className="space-y-6">
+                            <div className="space-y-2">
+                                <label className="text-xs font-bold text-[#54656f] uppercase tracking-wider ml-1">Company ID</label>
+                                <input
+                                    type="text"
+                                    placeholder="company-id"
+                                    value={companyId}
+                                    onChange={e => setCompanyId(e.target.value)}
+                                    className="w-full bg-[#f8f9fa] border border-[#eceff1] text-[#111b21] px-4 py-4 rounded-xl focus:border-[#00a884] focus:bg-white outline-none transition-all placeholder:text-[#aebac1]"
+                                    required
+                                />
+                            </div>
                             <div className="space-y-2">
                                 <label className="text-xs font-bold text-[#54656f] uppercase tracking-wider ml-1">Email Address</label>
                                 <input

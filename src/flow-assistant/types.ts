@@ -32,3 +32,8 @@ export interface FlowConfig {
     idleMessage?: string;
     idleEnabled: boolean;
 }
+
+export interface MessageSender {
+    sendText(to: string, text: string): Promise<any>;
+    sendImage(to: string, url: string, caption?: string): Promise<any>;
+}
