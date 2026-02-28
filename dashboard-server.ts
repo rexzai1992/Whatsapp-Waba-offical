@@ -2600,7 +2600,8 @@ const frontendPath = path.join(process.cwd(), 'dashboard/dist')
 if (fs.existsSync(frontendPath)) {
     console.log('Serving frontend from:', frontendPath)
     app.use(express.static(frontendPath))
-    app.get('*', (req: any, res: any) => {
+    // Express 5 + path-to-regexp v6 doesn't accept '*' wildcard
+    app.get('/*', (req: any, res: any) => {
         // Skip API/Socket paths to avoid HTML response on 404s
         if (req.path.startsWith('/api') || req.path.startsWith('/addon') || req.path.startsWith('/socket.io')) {
             return res.status(404).json({ error: 'Not Found' })
