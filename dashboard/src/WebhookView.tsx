@@ -13,6 +13,7 @@ type QuickReply = {
 
 type WebhookViewProps = {
     profileId: string;
+    sessionToken?: string | null;
     quickReplies: QuickReply[];
     quickRepliesLoading: boolean;
     quickRepliesSaving: boolean;
@@ -23,6 +24,7 @@ type WebhookViewProps = {
 
 export default function WebhookView({
     profileId,
+    sessionToken,
     quickReplies,
     quickRepliesLoading,
     quickRepliesSaving,
@@ -73,6 +75,11 @@ export default function WebhookView({
     const [connectedError, setConnectedError] = useState<string | null>(null);
     const [connectedAppId, setConnectedAppId] = useState('');
     const [quickRepliesDraft, setQuickRepliesDraft] = useState<QuickReply[]>([]);
+    const [connectLoading, setConnectLoading] = useState(false);
+    const [connectError, setConnectError] = useState<string | null>(null);
+    const [clientConnections, setClientConnections] = useState<any[]>([]);
+    const [clientLoading, setClientLoading] = useState(false);
+    const [clientError, setClientError] = useState<string | null>(null);
 
     useEffect(() => {
         if (!profileId) return;
@@ -82,6 +89,7 @@ export default function WebhookView({
         fetchWindowReminder();
         fetchFallbackSettings();
         fetchConnectedBusinesses();
+        fetchClientConnections();
         onRefreshQuickReplies();
     }, [profileId, onRefreshQuickReplies]);
 
@@ -110,6 +118,98 @@ export default function WebhookView({
 
     const handleSaveQuickReplies = () => {
         onSaveQuickReplies(quickRepliesDraft);
+    };
+
+    const handleConnectWhatsapp = async () => {
+        if (!sessionToken) {
+            setConnectError('You must be logged in to connect WhatsApp.');
+            return;
+        }
+        setConnectLoading(true);
+        setConnectError(null);
+        try {
+            const res = await fetch(`${SOCKET_URL}/api/waba/embedded-signup/url?profileId=${encodeURIComponent(profileId)}`, {
+                headers: {
+                    Authorization: `Bearer ${sessionToken}`
+                }
+            });
+            const data = await res.json();
+            if (!res.ok || !data?.success || !data?.url) {
+                throw new Error(data?.error || 'Failed to start embedded signup');
+            }
+            window.location.href = data.url;
+        } catch (err: any) {
+            setConnectError(err?.message || 'Failed to start embedded signup');
+        } finally {
+            setConnectLoading(false);
+        }
+    };
+
+    const fetchClientConnections = () => {
+        if (!sessionToken) {
+            setClientConnections([]);
+            return;
+        }
+        setClientLoading(true);
+        setClientError(null);
+        fetch(`${SOCKET_URL}/api/waba/clients`, {
+            headers: { Authorization: `Bearer ${sessionToken}` }
+        })
+            .then(async res => {
+                const text = await res.text();
+                try {
+                    return JSON.parse(text);
+                } catch {
+                    console.error('Client connections fetch failed:', text);
+                    return null;
+                }
+            })
+            .then(data => {
+                if (data?.success) {
+                    setClientConnections(Array.isArray(data.data) ? data.data : []);
+                    setClientError(null);
+                } else {
+                    setClientConnections([]);
+                    setClientError(data?.error || 'Failed to load connected clients');
+                }
+            })
+            .finally(() => setClientLoading(false));
+    };
+
+    const handleDisconnectClient = async (targetProfileId: string, revoke = false) => {
+        if (!sessionToken) {
+            setClientError('You must be logged in.');
+            return;
+        }
+        if (!confirm(`Disconnect this client${revoke ? ' and revoke webhook subscription' : ''}?`)) return;
+        setClientLoading(true);
+        setClientError(null);
+        try {
+            const res = await fetch(`${SOCKET_URL}/api/waba/clients/disconnect`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    Authorization: `Bearer ${sessionToken}`
+                },
+                body: JSON.stringify({ profileId: targetProfileId, revoke })
+            });
+            const data = await res.json().catch(() => null);
+            if (!res.ok || !data?.success) {
+                throw new Error(data?.error || 'Failed to disconnect client');
+            }
+            fetchClientConnections();
+        } catch (err: any) {
+            setClientError(err?.message || 'Failed to disconnect client');
+        } finally {
+            setClientLoading(false);
+        }
+    };
+
+    const formatTokenExpiry = (value?: string) => {
+        if (!value) return '—';
+        const date = new Date(value);
+        if (Number.isNaN(date.getTime())) return value;
+        return date.toLocaleString();
     };
 
     const fetchWebhooks = () => {
@@ -460,6 +560,31 @@ export default function WebhookView({
             </h2>
 
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-10">
+                {/* Embedded Signup Section */}
+                <div className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)]">
+                    <div className="flex items-center gap-3 mb-4">
+                        <Shield className="w-6 h-6 text-[#00a884]" />
+                        <h3 className="text-xl text-[#111b21] font-bold">Connect WhatsApp Business</h3>
+                    </div>
+                    <p className="text-sm text-[#54656f] mb-6 font-medium">
+                        Link a client’s WhatsApp Business account using Meta Embedded Signup. You’ll be redirected to Facebook Login.
+                    </p>
+                    <button
+                        onClick={handleConnectWhatsapp}
+                        disabled={connectLoading || !sessionToken}
+                        className="w-full bg-[#111b21] hover:bg-[#202c33] text-white font-black py-4 rounded-2xl transition-all flex items-center justify-center gap-3 shadow-[0_8px_20px_rgba(17,27,33,0.18)] disabled:opacity-50 active:scale-95"
+                    >
+                        {connectLoading ? <div className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin" /> : <Globe className="w-5 h-5" />}
+                        Connect WhatsApp Business
+                    </button>
+                    {connectError && (
+                        <p className="text-sm text-rose-600 mt-4 font-semibold">{connectError}</p>
+                    )}
+                    {!sessionToken && (
+                        <p className="text-xs text-[#aebac1] mt-3">Login required to connect a client account.</p>
+                    )}
+                </div>
+
                 {/* Webhooks Section */}
                 <div className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)]">
                     <h3 className="text-xl mb-2 text-[#111b21] font-bold">Outgoing Webhooks</h3>
@@ -996,6 +1121,108 @@ export default function WebhookView({
                         >
                             {quickRepliesSaving ? 'Saving…' : 'Save Quick Replies'}
                         </button>
+                    </div>
+                </div>
+
+                {/* Connected WABA Clients */}
+                <div className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)] lg:col-span-2">
+                    <div className="flex items-center justify-between mb-6">
+                        <div>
+                            <h3 className="text-xl text-[#111b21] font-bold">Connected Clients</h3>
+                            <p className="text-sm text-[#54656f] font-medium mt-1">
+                                Clients connected via Embedded Signup for your company.
+                            </p>
+                        </div>
+                        <button
+                            onClick={() => fetchClientConnections()}
+                            disabled={clientLoading}
+                            className="text-xs font-bold uppercase tracking-widest text-[#00a884] border border-[#00a884]/30 px-3 py-2 rounded-xl hover:bg-[#00a884]/5 transition-all disabled:opacity-50"
+                        >
+                            Refresh
+                        </button>
+                    </div>
+
+                    {clientError && (
+                        <div className="mb-4 bg-rose-50 border border-rose-200 text-rose-700 rounded-2xl px-4 py-3 text-sm font-medium">
+                            {clientError}
+                        </div>
+                    )}
+
+                    <div className="bg-[#fcfdfd] rounded-2xl border border-[#eceff1] overflow-hidden">
+                        <table className="w-full text-left">
+                            <thead className="bg-white text-[#54656f] text-[10px] uppercase font-black tracking-widest border-b border-[#eceff1]">
+                                <tr>
+                                    <th className="px-6 py-4">Profile</th>
+                                    <th className="px-6 py-4">Phone Number ID</th>
+                                    <th className="px-6 py-4">WABA ID</th>
+                                    <th className="px-6 py-4">Status</th>
+                                    <th className="px-6 py-4">Token Source</th>
+                                    <th className="px-6 py-4">Token Expiry</th>
+                                    <th className="px-6 py-4">Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody className="divide-y divide-[#f0f2f5]">
+                                {clientLoading ? (
+                                    <tr>
+                                        <td className="px-6 py-6 text-sm text-[#8696a0]" colSpan={7}>
+                                            Loading connected clients...
+                                        </td>
+                                    </tr>
+                                ) : clientConnections.length === 0 ? (
+                                    <tr>
+                                        <td className="px-6 py-6 text-sm text-[#8696a0]" colSpan={7}>
+                                            No connected clients found.
+                                        </td>
+                                    </tr>
+                                ) : (
+                                    clientConnections.map((client: any) => {
+                                        const status = client.enabled ? 'ACTIVE' : 'DISABLED';
+                                        return (
+                                            <tr key={client.profile_id} className="hover:bg-white transition-all">
+                                                <td className="px-6 py-4">
+                                                    <div className="text-sm font-bold text-[#111b21]">{client.profile_id}</div>
+                                                </td>
+                                                <td className="px-6 py-4 text-xs font-mono text-[#54656f]">
+                                                    {client.phone_number_id || '—'}
+                                                </td>
+                                                <td className="px-6 py-4 text-xs font-mono text-[#54656f]">
+                                                    {client.waba_id || client.business_account_id || '—'}
+                                                </td>
+                                                <td className="px-6 py-4">
+                                                    <span className={`text-[10px] px-3 py-1 rounded-full border font-bold uppercase tracking-widest ${statusBadgeClass(status)}`}>
+                                                        {status}
+                                                    </span>
+                                                </td>
+                                                <td className="px-6 py-4 text-xs text-[#54656f] uppercase font-bold tracking-widest">
+                                                    {client.token_source || 'user'}
+                                                </td>
+                                                <td className="px-6 py-4 text-xs text-[#54656f]">
+                                                    {formatTokenExpiry(client.access_token_expires_at)}
+                                                </td>
+                                                <td className="px-6 py-4">
+                                                    <div className="flex items-center gap-2">
+                                                        <button
+                                                            onClick={() => handleDisconnectClient(client.profile_id, false)}
+                                                            disabled={!client.enabled || clientLoading}
+                                                            className="px-3 py-2 rounded-xl border border-[#eceff1] text-[11px] font-bold uppercase tracking-widest text-[#54656f] hover:border-[#aebac1] disabled:opacity-50"
+                                                        >
+                                                            Disable
+                                                        </button>
+                                                        <button
+                                                            onClick={() => handleDisconnectClient(client.profile_id, true)}
+                                                            disabled={!client.enabled || clientLoading}
+                                                            className="px-3 py-2 rounded-xl border border-rose-200 text-[11px] font-bold uppercase tracking-widest text-rose-600 hover:border-rose-300 disabled:opacity-50"
+                                                        >
+                                                            Revoke
+                                                        </button>
+                                                    </div>
+                                                </td>
+                                            </tr>
+                                        );
+                                    })
+                                )}
+                            </tbody>
+                        </table>
                     </div>
                 </div>
 

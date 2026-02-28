@@ -219,11 +219,11 @@ export function createAddonRouter(
     // 4. Admin Settings API (Webhooks)
     // We allow either a valid API Key OR the admin password
     const checkAdminAuth = (req: any, res: any, next: any) => {
-        const adminPass = req.query.adminPassword || req.body.adminPassword
+        const adminPass = req.query?.adminPassword || req.body?.adminPassword
         if (adminPass === 'admin123') {
             // Mock api key info for profile context if needed
             // If admin is accessing, they likely want to manage a specific profile provided in query/body
-            const targetProfile = req.query.profileId || req.body.profileId || 'default'
+            const targetProfile = req.query?.profileId || req.body?.profileId || 'default'
             req.apiKeyInfo = { profileId: targetProfile }
             return next()
         }

@@ -1,9 +1,9 @@
 # WhatsApp Business API Workflow Engine
 
-This project integrates with the official Meta WhatsApp Business Platform (Cloud API). It does not use Baileys or the WhatsApp Web API.
+This project integrates with the official Meta WhatsApp Business Platform (Cloud API). This is the official WhatsApp API via Meta.
 
 > [!CAUTION]
-> Breaking change: if you were using the previous Baileys/WhatsApp Web flow, you must migrate to the official Cloud API setup.
+> Breaking change: if you were using a previous WhatsApp Web flow, you must migrate to the official Cloud API setup.
 > See `docs/waba.md` for configuration details.
 
 ## What it does

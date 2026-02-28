@@ -3,8 +3,13 @@ export type WabaConfig = {
     companyId?: string
     appId?: string
     phoneNumberId: string
+    businessId?: string
+    wabaId?: string
     businessAccountId?: string
     accessToken: string
+    accessTokenType?: string
+    accessTokenExpiresAt?: string | null
+    tokenSource?: 'user' | 'system_user'
     verifyToken: string
     appSecret?: string
     apiVersion: string

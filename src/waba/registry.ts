@@ -1,4 +1,5 @@
 import { supabase } from '../supabase'
+import { decryptToken } from '../services/token-vault'
 import type { WabaConfig } from './types'
 import { WabaClient } from './client'
 
@@ -9,8 +10,14 @@ type WabaConfigRow = {
     company_id?: string
     app_id?: string | null
     phone_number_id?: string
+    business_id?: string | null
+    waba_id?: string | null
     business_account_id?: string | null
     access_token?: string
+    access_token_type?: string | null
+    access_token_expires_at?: string | null
+    token_source?: string | null
+    system_user_token?: string | null
     verify_token?: string
     app_secret?: string | null
     api_version?: string | null
@@ -22,18 +29,38 @@ type WabaConfigRow = {
 
 function rowToConfig(row: WabaConfigRow | null): WabaConfig | null {
     if (!row) return null
-    if (!row.phone_number_id || !row.access_token || !row.verify_token) return null
+    const verifyToken = row.verify_token || process.env.WABA_VERIFY_TOKEN
+    const appId = row.app_id || process.env.WABA_APP_ID
+    const appSecret = row.app_secret || process.env.WABA_APP_SECRET
+    const apiVersion = row.api_version || DEFAULT_API_VERSION
+    const wabaId = row.waba_id || row.business_account_id || undefined
+    const rawToken = row.system_user_token || row.access_token
+
+    if (!row.phone_number_id || !rawToken || !verifyToken) return null
+
+    let accessToken: string
+    try {
+        accessToken = decryptToken(rawToken)
+    } catch (err: any) {
+        console.warn('[WABA] Failed to decrypt access token for profile', row.profile_id || row.phone_number_id, err?.message || err)
+        return null
+    }
 
     return {
         profileId: row.profile_id || row.phone_number_id,
         companyId: row.company_id || row.profile_id || undefined,
-        appId: row.app_id || undefined,
+        appId: appId || undefined,
         phoneNumberId: row.phone_number_id,
-        businessAccountId: row.business_account_id || undefined,
-        accessToken: row.access_token,
-        verifyToken: row.verify_token,
-        appSecret: row.app_secret || undefined,
-        apiVersion: row.api_version || DEFAULT_API_VERSION,
+        businessId: row.business_id || undefined,
+        wabaId,
+        businessAccountId: wabaId,
+        accessToken,
+        accessTokenType: row.access_token_type || undefined,
+        accessTokenExpiresAt: row.access_token_expires_at || null,
+        tokenSource: row.system_user_token ? 'system_user' : (row.token_source as 'user' | 'system_user' | null) || undefined,
+        verifyToken,
+        appSecret: appSecret || undefined,
+        apiVersion,
         windowReminderEnabled: row.window_reminder_enabled ?? false,
         windowReminderMinutes: row.window_reminder_minutes ?? undefined,
         windowReminderText: row.window_reminder_text ?? undefined

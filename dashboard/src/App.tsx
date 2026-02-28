@@ -2705,6 +2705,7 @@ export default function App() {
                         <div className="flex-1 overflow-y-auto">
                             <WebhookView
                                 profileId={activeProfileId || ''}
+                                sessionToken={session?.access_token || null}
                                 quickReplies={quickReplies}
                                 quickRepliesLoading={quickRepliesLoading}
                                 quickRepliesSaving={quickRepliesSaving}

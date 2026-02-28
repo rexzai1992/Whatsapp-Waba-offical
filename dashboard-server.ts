@@ -6,6 +6,7 @@ import cors from 'cors'
 import fs from 'fs'
 import path from 'path'
 import os from 'os'
+import { createHash, randomBytes } from 'crypto'
 import type { Socket as NetSocket } from 'net'
 import * as addon from './src/addon'
 import { resolvePath } from './src/config'
@@ -17,6 +18,8 @@ import { resolveCompanyId, findOrCreateUser, getMessagesForUsers, getUsersForCom
 import type { MessageRecord } from './src/services/wa-store'
 import { sendWhatsAppMessage, canReplyFreely } from './src/services/whatsapp'
 import { WorkflowEngine } from './src/workflow/engine'
+import { encryptToken, decryptToken, getTokenEncryptionKey } from './src/services/token-vault'
+import { exchangeCodeForToken, exchangeForLongLivedToken, fetchBusinesses, fetchOwnedWabaAccounts, fetchClientWabaAccounts, fetchPhoneNumbers, subscribeWabaApp, createSystemUserToken, unsubscribeWabaApp } from './src/services/meta-graph'
 
 // Helper functions replaced by store methods
 const app = express()
@@ -131,9 +134,16 @@ setInterval(() => {
     wabaRegistry.refresh().catch((err) => console.error('[WABA] Refresh failed:', err))
 }, 60_000)
 
+const WABA_OAUTH_SCOPES = [
+    'whatsapp_business_management',
+    'whatsapp_business_messaging',
+    'business_management'
+]
+
 const WINDOW_MS = 24 * 60 * 60 * 1000
 const DEFAULT_REMINDER_TEXT = 'Heads up! Our 24h reply window closes soon. Reply now if you need anything.'
 const reminderRunningProfiles = new Set<string>()
+const reminderCache = new Map<string, number>()
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin123'
 
 async function runWindowReminders() {
@@ -158,6 +168,8 @@ async function runWindowReminders() {
                 if (!lastInboundMs || Number.isNaN(lastInboundMs)) continue
                 const remainingMs = lastInboundMs + WINDOW_MS - Date.now()
                 if (remainingMs <= 0) continue
+                const cachedReminder = reminderCache.get(user.id)
+                if (cachedReminder && cachedReminder >= lastInboundMs) continue
 
                 const fallbackText = config.windowReminderText || DEFAULT_REMINDER_TEXT
                 const message = fallbackText.replace('{minutes}', String(Math.max(1, Math.ceil(remainingMs / 60000))))
@@ -172,6 +184,7 @@ async function runWindowReminders() {
                         workflowState: null
                     })
                     await updateUserWindowReminder(user.id)
+                    reminderCache.set(user.id, lastInboundMs)
                 } catch (err: any) {
                     console.warn('[Reminder] Failed to send window reminder:', err?.message || err)
                 }
@@ -225,6 +238,76 @@ async function getCompanyIdForProfileOrProfileTable(profileId: string) {
 
     if (data?.company_id) return data.company_id
     return getCompanyIdForProfile(profileId)
+}
+
+function hashOAuthState(state: string) {
+    return createHash('sha256').update(state).digest('hex')
+}
+
+async function getSupabaseUserFromRequest(req: any, res: any) {
+    const rawAuth = req.headers['authorization'] || ''
+    const token = typeof rawAuth === 'string' && rawAuth.startsWith('Bearer ')
+        ? rawAuth.slice(7)
+        : rawAuth
+
+    if (!token) {
+        res.status(401).json({ success: false, error: 'Authorization token required' })
+        return null
+    }
+
+    const { data: { user }, error } = await supabase.auth.getUser(token)
+    if (error || !user) {
+        res.status(401).json({ success: false, error: 'Invalid or expired session' })
+        return null
+    }
+
+    return user
+}
+
+function getUserCompanyId(user: any): string | null {
+    return user?.user_metadata?.company_id || user?.app_metadata?.company_id || null
+}
+
+async function assertProfileCompany(profileId: string, companyId: string): Promise<boolean> {
+    const { data } = await supabase
+        .from('profiles')
+        .select('company_id')
+        .eq('id', profileId)
+        .maybeSingle()
+
+    if (!data?.company_id) return false
+    return data.company_id === companyId
+}
+
+function resolveOauthRedirectUri(req: any) {
+    if (process.env.WABA_OAUTH_REDIRECT_URI) return process.env.WABA_OAUTH_REDIRECT_URI
+    const host = req.get('host')
+    const protocol = req.protocol || 'https'
+    return `${protocol}://${host}/auth/waba/callback`
+}
+
+function resolveOauthReturnUrl(req: any) {
+    return process.env.WABA_OAUTH_RETURN_URL || process.env.DASHBOARD_URL || `${req.protocol}://${req.get('host')}`
+}
+
+function buildEmbeddedSignupUrl(params: {
+    appId: string
+    redirectUri: string
+    state: string
+    scopes: string[]
+    apiVersion: string
+    configId?: string
+}) {
+    const base = `https://www.facebook.com/${params.apiVersion}/dialog/oauth`
+    const search = new URLSearchParams({
+        client_id: params.appId,
+        redirect_uri: params.redirectUri,
+        response_type: 'code',
+        scope: params.scopes.join(','),
+        state: params.state
+    })
+    if (params.configId) search.set('config_id', params.configId)
+    return `${base}?${search.toString()}`
 }
 
 app.get('/', (req: any, res: any) => {
@@ -833,6 +916,391 @@ app.post('/api/waba/window-reminder', async (req: any, res: any) => {
         await wabaRegistry.refresh(true)
 
         res.json({ success: true, data: updatePayload })
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message })
+    }
+})
+
+// ============================================
+// WABA EMBEDDED SIGNUP (OAUTH)
+// ============================================
+app.get('/api/waba/embedded-signup/url', async (req: any, res: any) => {
+    try {
+        const user = await getSupabaseUserFromRequest(req, res)
+        if (!user) return
+
+        const profileId = typeof req.query?.profileId === 'string' ? req.query.profileId : undefined
+        if (!profileId) {
+            return res.status(400).json({ success: false, error: 'profileId is required' })
+        }
+
+        const companyId = getUserCompanyId(user)
+        if (!companyId) {
+            return res.status(400).json({ success: false, error: 'Company ID missing in user metadata' })
+        }
+
+        const ownsProfile = await assertProfileCompany(profileId, companyId)
+        if (!ownsProfile) {
+            return res.status(403).json({ success: false, error: 'Profile does not belong to your company' })
+        }
+
+        const appId = process.env.WABA_APP_ID || process.env.APP_ID
+        const appSecret = process.env.WABA_APP_SECRET || process.env.APP_SECRET
+        const verifyToken = process.env.WABA_VERIFY_TOKEN || process.env.VERIFY_TOKEN
+        if (!appId || !appSecret || !verifyToken) {
+            return res.status(500).json({ success: false, error: 'Missing WABA_APP_ID, WABA_APP_SECRET, or WABA_VERIFY_TOKEN' })
+        }
+
+        if (!getTokenEncryptionKey()) {
+            return res.status(500).json({ success: false, error: 'Missing WABA_TOKEN_ENCRYPTION_KEY' })
+        }
+
+        const redirectUri = resolveOauthRedirectUri(req)
+        const apiVersion = process.env.WABA_API_VERSION || 'v19.0'
+        const configId = process.env.WABA_EMBEDDED_SIGNUP_CONFIG_ID
+
+        const state = randomBytes(16).toString('hex')
+        const stateHash = hashOAuthState(state)
+        const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString()
+
+        const requestedBusinessId = typeof req.query?.businessId === 'string' ? req.query.businessId : null
+        const requestedWabaId = typeof req.query?.wabaId === 'string' ? req.query.wabaId : null
+        const requestedPhoneNumberId = typeof req.query?.phoneNumberId === 'string' ? req.query.phoneNumberId : null
+
+        const redirectUrl = resolveOauthReturnUrl(req)
+
+        const { error } = await supabase
+            .from('waba_oauth_states')
+            .insert({
+                state_hash: stateHash,
+                profile_id: profileId,
+                company_id: companyId,
+                user_id: user.id,
+                requested_business_id: requestedBusinessId,
+                requested_waba_id: requestedWabaId,
+                requested_phone_number_id: requestedPhoneNumberId,
+                redirect_url: redirectUrl,
+                expires_at: expiresAt
+            })
+
+        if (error) {
+            return res.status(500).json({ success: false, error: error.message })
+        }
+
+        const url = buildEmbeddedSignupUrl({
+            appId,
+            redirectUri,
+            state,
+            scopes: WABA_OAUTH_SCOPES,
+            apiVersion,
+            configId: configId || undefined
+        })
+
+        res.json({ success: true, url })
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message })
+    }
+})
+
+function renderOauthHtml(title: string, message: string, returnUrl?: string) {
+    const link = returnUrl ? `<p><a href=\"${returnUrl}\">Return to dashboard</a></p>` : ''
+    return `<!doctype html><html><head><meta charset=\"utf-8\"/><title>${title}</title></head><body style=\"font-family:Arial, sans-serif; padding:24px;\"><h2>${title}</h2><p>${message}</p>${link}</body></html>`
+}
+
+app.get('/auth/waba/callback', async (req: any, res: any) => {
+    try {
+        const errorParam = typeof req.query?.error === 'string' ? req.query.error : null
+        const errorDescription = typeof req.query?.error_description === 'string' ? req.query.error_description : null
+        if (errorParam) {
+            return res.status(400).send(renderOauthHtml('Connection failed', errorDescription || errorParam, resolveOauthReturnUrl(req)))
+        }
+
+        const code = typeof req.query?.code === 'string' ? req.query.code : null
+        const state = typeof req.query?.state === 'string' ? req.query.state : null
+        if (!code || !state) {
+            return res.status(400).send(renderOauthHtml('Invalid callback', 'Missing code or state.', resolveOauthReturnUrl(req)))
+        }
+
+        const stateHash = hashOAuthState(state)
+        const { data: stateRow, error: stateError } = await supabase
+            .from('waba_oauth_states')
+            .select('*')
+            .eq('state_hash', stateHash)
+            .maybeSingle()
+
+        if (stateError || !stateRow) {
+            return res.status(400).send(renderOauthHtml('Invalid state', 'OAuth state not found or expired.', resolveOauthReturnUrl(req)))
+        }
+
+        if (stateRow.used_at) {
+            return res.status(400).send(renderOauthHtml('State already used', 'Please restart the signup flow.', stateRow.redirect_url || resolveOauthReturnUrl(req)))
+        }
+
+        if (stateRow.expires_at && new Date(stateRow.expires_at).getTime() < Date.now()) {
+            return res.status(400).send(renderOauthHtml('State expired', 'Please restart the signup flow.', stateRow.redirect_url || resolveOauthReturnUrl(req)))
+        }
+
+        await supabase
+            .from('waba_oauth_states')
+            .update({ used_at: new Date().toISOString() })
+            .eq('id', stateRow.id)
+
+        const appId = process.env.WABA_APP_ID || process.env.APP_ID
+        const appSecret = process.env.WABA_APP_SECRET || process.env.APP_SECRET
+        const verifyToken = process.env.WABA_VERIFY_TOKEN || process.env.VERIFY_TOKEN
+        if (!appId || !appSecret || !verifyToken) {
+            return res.status(500).send(renderOauthHtml('Server misconfigured', 'Missing WABA_APP_ID, WABA_APP_SECRET, or WABA_VERIFY_TOKEN.'))
+        }
+
+        if (!getTokenEncryptionKey()) {
+            return res.status(500).send(renderOauthHtml('Server misconfigured', 'Missing WABA_TOKEN_ENCRYPTION_KEY.'))
+        }
+
+        const apiVersion = process.env.WABA_API_VERSION || 'v19.0'
+        const redirectUri = resolveOauthRedirectUri(req)
+
+        const tokenData = await exchangeCodeForToken({
+            appId,
+            appSecret,
+            redirectUri,
+            code,
+            apiVersion
+        })
+
+        let accessToken = tokenData.access_token
+        let tokenType = tokenData.token_type
+        let expiresIn = tokenData.expires_in
+
+        try {
+            const longLived = await exchangeForLongLivedToken({
+                appId,
+                appSecret,
+                shortLivedToken: accessToken,
+                apiVersion
+            })
+            if (longLived?.access_token) {
+                accessToken = longLived.access_token
+                tokenType = longLived.token_type || tokenType
+                expiresIn = longLived.expires_in || expiresIn
+            }
+        } catch (err: any) {
+            console.warn('[WABA] Long-lived token exchange failed:', err?.message || err)
+        }
+
+        let businessId = stateRow.requested_business_id as string | null
+        if (!businessId) {
+            const businesses = await fetchBusinesses(accessToken, apiVersion)
+            if (!businesses.length) {
+                return res.status(400).send(renderOauthHtml('No businesses found', 'This account has no Meta businesses available.'))
+            }
+            if (businesses.length > 1) {
+                const list = businesses.map((b) => `${b.name || 'Business'} (${b.id})`).join(', ')
+                return res.status(400).send(renderOauthHtml('Multiple businesses found', `Please restart and select a business ID. Found: ${list}`))
+            }
+            businessId = businesses[0].id
+        }
+
+        let wabaId = stateRow.requested_waba_id as string | null
+        if (!wabaId) {
+            const owned = await fetchOwnedWabaAccounts(businessId, accessToken, apiVersion)
+            const candidates = owned.length ? owned : await fetchClientWabaAccounts(businessId, accessToken, apiVersion)
+            if (!candidates.length) {
+                return res.status(400).send(renderOauthHtml('No WABA found', 'No WhatsApp Business Accounts found for this business.'))
+            }
+            if (candidates.length > 1) {
+                const list = candidates.map((b) => `${b.name || 'WABA'} (${b.id})`).join(', ')
+                return res.status(400).send(renderOauthHtml('Multiple WABAs found', `Please restart and select a WABA ID. Found: ${list}`))
+            }
+            wabaId = candidates[0].id
+        }
+
+        let phoneNumberId = stateRow.requested_phone_number_id as string | null
+        if (!phoneNumberId) {
+            const numbers = await fetchPhoneNumbers(wabaId, accessToken, apiVersion)
+            if (!numbers.length) {
+                return res.status(400).send(renderOauthHtml('No phone numbers found', 'No phone numbers were found for this WABA.'))
+            }
+            phoneNumberId = numbers[0].id
+        }
+
+        try {
+            await subscribeWabaApp(wabaId, accessToken, apiVersion)
+        } catch (err: any) {
+            return res.status(500).send(renderOauthHtml('Subscription failed', err?.message || 'Failed to subscribe app.'))
+        }
+
+        let systemUserToken: string | null = null
+        let systemUserTokenExpiresAt: string | null = null
+        const systemUserId = process.env.WABA_SYSTEM_USER_ID
+        if (systemUserId) {
+            try {
+                const systemTokenResponse = await createSystemUserToken({
+                    systemUserId,
+                    accessToken,
+                    scopes: WABA_OAUTH_SCOPES,
+                    apiVersion
+                }) as any
+                if (systemTokenResponse?.access_token) {
+                    systemUserToken = systemTokenResponse.access_token
+                    if (systemTokenResponse.expires_in) {
+                        systemUserTokenExpiresAt = new Date(Date.now() + Number(systemTokenResponse.expires_in) * 1000).toISOString()
+                    }
+                }
+            } catch (err: any) {
+                console.warn('[WABA] System user token exchange failed:', err?.message || err)
+            }
+        }
+
+        const nowIso = new Date().toISOString()
+        const accessTokenExpiresAt = expiresIn ? new Date(Date.now() + Number(expiresIn) * 1000).toISOString() : null
+
+        const payload: any = {
+            profile_id: stateRow.profile_id,
+            company_id: stateRow.company_id,
+            app_id: appId,
+            phone_number_id: phoneNumberId,
+            business_id: businessId,
+            waba_id: wabaId,
+            business_account_id: wabaId,
+            access_token: encryptToken(accessToken),
+            access_token_type: tokenType || null,
+            access_token_expires_at: accessTokenExpiresAt,
+            token_scopes: WABA_OAUTH_SCOPES,
+            token_source: systemUserToken ? 'system_user' : 'user',
+            system_user_token: systemUserToken ? encryptToken(systemUserToken) : null,
+            system_user_token_expires_at: systemUserTokenExpiresAt,
+            token_last_refreshed_at: nowIso,
+            verify_token: verifyToken,
+            app_secret: appSecret,
+            api_version: apiVersion,
+            enabled: true,
+            connected_at: nowIso
+        }
+
+        const { error: upsertError } = await supabase
+            .from('waba_configs')
+            .upsert(payload, { onConflict: 'profile_id' })
+
+        if (upsertError) {
+            return res.status(500).send(renderOauthHtml('Storage failed', upsertError.message))
+        }
+
+        await wabaRegistry.refresh(true)
+
+        const returnUrl = stateRow.redirect_url || resolveOauthReturnUrl(req)
+        if (returnUrl) {
+            const redirect = new URL(returnUrl)
+            redirect.searchParams.set('waba', 'connected')
+            return res.redirect(302, redirect.toString())
+        }
+
+        return res.send(renderOauthHtml('Connected', 'WhatsApp Business account connected successfully.'))
+    } catch (error: any) {
+        res.status(500).send(renderOauthHtml('Unexpected error', error.message || 'Unexpected error'))
+    }
+})
+
+app.get('/api/waba/clients', async (req: any, res: any) => {
+    try {
+        const user = await getSupabaseUserFromRequest(req, res)
+        if (!user) return
+
+        const companyId = getUserCompanyId(user)
+        if (!companyId) {
+            return res.status(400).json({ success: false, error: 'Company ID missing in user metadata' })
+        }
+
+        const { data: profiles } = await supabase
+            .from('profiles')
+            .select('id')
+            .eq('company_id', companyId)
+
+        const profileIds = (profiles || []).map((row: any) => row.id).filter(Boolean)
+
+        let query = supabase
+            .from('waba_configs')
+            .select('profile_id, company_id, app_id, phone_number_id, business_id, waba_id, business_account_id, enabled, connected_at, access_token_expires_at, token_source, api_version')
+
+        if (profileIds.length > 0) {
+            const inList = profileIds.map((id: string) => `"${id}"`).join(',')
+            query = query.or(`company_id.eq.${companyId},profile_id.in.(${inList})`)
+        } else {
+            query = query.eq('company_id', companyId)
+        }
+
+        const { data, error } = await query
+        if (error) {
+            return res.status(500).json({ success: false, error: error.message })
+        }
+
+        res.json({ success: true, data: data || [] })
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message })
+    }
+})
+
+app.post('/api/waba/clients/disconnect', async (req: any, res: any) => {
+    try {
+        const user = await getSupabaseUserFromRequest(req, res)
+        if (!user) return
+
+        const companyId = getUserCompanyId(user)
+        if (!companyId) {
+            return res.status(400).json({ success: false, error: 'Company ID missing in user metadata' })
+        }
+
+        const profileId = req.body?.profileId
+        if (!profileId || typeof profileId !== 'string') {
+            return res.status(400).json({ success: false, error: 'profileId is required' })
+        }
+
+        const ownsProfile = await assertProfileCompany(profileId, companyId)
+        if (!ownsProfile) {
+            return res.status(403).json({ success: false, error: 'Profile does not belong to your company' })
+        }
+
+        const revoke = Boolean(req.body?.revoke)
+
+        const { data: config, error: fetchError } = await supabase
+            .from('waba_configs')
+            .select('profile_id, company_id, app_id, phone_number_id, business_id, waba_id, business_account_id, access_token, system_user_token, api_version')
+            .eq('profile_id', profileId)
+            .maybeSingle()
+
+        if (fetchError || !config) {
+            return res.status(404).json({ success: false, error: fetchError?.message || 'WABA config not found' })
+        }
+
+        const wabaId = config.waba_id || config.business_account_id
+        let unsubscribed = false
+        let unsubscribeError: string | null = null
+
+        if (revoke && wabaId) {
+            try {
+                const token = decryptToken(config.system_user_token || config.access_token)
+                await unsubscribeWabaApp(wabaId, token, config.api_version || process.env.WABA_API_VERSION || 'v19.0')
+                unsubscribed = true
+            } catch (err: any) {
+                unsubscribeError = err?.message || 'Failed to unsubscribe app'
+            }
+        }
+
+        const { error: updateError } = await supabase
+            .from('waba_configs')
+            .update({ enabled: false })
+            .eq('profile_id', profileId)
+
+        if (updateError) {
+            return res.status(500).json({ success: false, error: updateError.message })
+        }
+
+        await wabaRegistry.refresh(true)
+
+        if (unsubscribeError) {
+            return res.json({ success: false, error: unsubscribeError, disabled: true, unsubscribed })
+        }
+
+        res.json({ success: true, disabled: true, unsubscribed })
     } catch (error: any) {
         res.status(500).json({ success: false, error: error.message })
     }
