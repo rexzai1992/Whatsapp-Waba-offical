@@ -268,6 +268,17 @@ function getUserCompanyId(user: any): string | null {
     return user?.user_metadata?.company_id || user?.app_metadata?.company_id || null
 }
 
+async function isAdminUser(userId: string): Promise<boolean> {
+    if (!userId) return false
+    const { data, error } = await supabase
+        .from('user_roles')
+        .select('role')
+        .eq('user_id', userId)
+        .maybeSingle()
+    if (error) return false
+    return data?.role === 'admin'
+}
+
 async function assertProfileCompany(profileId: string, companyId: string): Promise<boolean> {
     const { data } = await supabase
         .from('profiles')
@@ -1205,6 +1216,11 @@ app.get('/api/waba/clients', async (req: any, res: any) => {
         const user = await getSupabaseUserFromRequest(req, res)
         if (!user) return
 
+        const admin = await isAdminUser(user.id)
+        if (!admin) {
+            return res.status(403).json({ success: false, error: 'Admin access required' })
+        }
+
         const companyId = getUserCompanyId(user)
         if (!companyId) {
             return res.status(400).json({ success: false, error: 'Company ID missing in user metadata' })
@@ -1243,6 +1259,11 @@ app.post('/api/waba/clients/disconnect', async (req: any, res: any) => {
     try {
         const user = await getSupabaseUserFromRequest(req, res)
         if (!user) return
+
+        const admin = await isAdminUser(user.id)
+        if (!admin) {
+            return res.status(403).json({ success: false, error: 'Admin access required' })
+        }
 
         const companyId = getUserCompanyId(user)
         if (!companyId) {
@@ -2600,12 +2621,8 @@ const frontendPath = path.join(process.cwd(), 'dashboard/dist')
 if (fs.existsSync(frontendPath)) {
     console.log('Serving frontend from:', frontendPath)
     app.use(express.static(frontendPath))
-    // Express 5 + path-to-regexp v6 doesn't accept '*' wildcard
-    app.get('/*', (req: any, res: any) => {
-        // Skip API/Socket paths to avoid HTML response on 404s
-        if (req.path.startsWith('/api') || req.path.startsWith('/addon') || req.path.startsWith('/socket.io')) {
-            return res.status(404).json({ error: 'Not Found' })
-        }
+    // Express 5 + path-to-regexp v6: use regex fallback instead of '*' patterns
+    app.get(/^(?!\/api|\/addon|\/socket\.io).*/, (req: any, res: any) => {
         res.sendFile(path.join(frontendPath, 'index.html'))
     })
 }

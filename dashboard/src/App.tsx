@@ -2710,6 +2710,7 @@ export default function App() {
                             <WebhookView
                                 profileId={activeProfileId || ''}
                                 sessionToken={session?.access_token || null}
+                                isAdmin={isAdmin}
                                 quickReplies={quickReplies}
                                 quickRepliesLoading={quickRepliesLoading}
                                 quickRepliesSaving={quickRepliesSaving}

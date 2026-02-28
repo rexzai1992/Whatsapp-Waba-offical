@@ -14,6 +14,7 @@ type QuickReply = {
 type WebhookViewProps = {
     profileId: string;
     sessionToken?: string | null;
+    isAdmin?: boolean;
     quickReplies: QuickReply[];
     quickRepliesLoading: boolean;
     quickRepliesSaving: boolean;
@@ -25,6 +26,7 @@ type WebhookViewProps = {
 export default function WebhookView({
     profileId,
     sessionToken,
+    isAdmin,
     quickReplies,
     quickRepliesLoading,
     quickRepliesSaving,
@@ -88,10 +90,12 @@ export default function WebhookView({
         fetchAutomation();
         fetchWindowReminder();
         fetchFallbackSettings();
-        fetchConnectedBusinesses();
-        fetchClientConnections();
+        if (isAdmin) {
+            fetchConnectedBusinesses();
+            fetchClientConnections();
+        }
         onRefreshQuickReplies();
-    }, [profileId, onRefreshQuickReplies]);
+    }, [profileId, onRefreshQuickReplies, isAdmin]);
 
     useEffect(() => {
         setQuickRepliesDraft(quickReplies.map(item => ({ ...item })));
@@ -1124,110 +1128,111 @@ export default function WebhookView({
                     </div>
                 </div>
 
-                {/* Connected WABA Clients */}
-                <div className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)] lg:col-span-2">
-                    <div className="flex items-center justify-between mb-6">
-                        <div>
-                            <h3 className="text-xl text-[#111b21] font-bold">Connected Clients</h3>
-                            <p className="text-sm text-[#54656f] font-medium mt-1">
-                                Clients connected via Embedded Signup for your company.
-                            </p>
+                {isAdmin && (
+                    <div className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)] lg:col-span-2">
+                        <div className="flex items-center justify-between mb-6">
+                            <div>
+                                <h3 className="text-xl text-[#111b21] font-bold">Connected Clients</h3>
+                                <p className="text-sm text-[#54656f] font-medium mt-1">
+                                    Clients connected via Embedded Signup for your company.
+                                </p>
+                            </div>
+                            <button
+                                onClick={() => fetchClientConnections()}
+                                disabled={clientLoading}
+                                className="text-xs font-bold uppercase tracking-widest text-[#00a884] border border-[#00a884]/30 px-3 py-2 rounded-xl hover:bg-[#00a884]/5 transition-all disabled:opacity-50"
+                            >
+                                Refresh
+                            </button>
                         </div>
-                        <button
-                            onClick={() => fetchClientConnections()}
-                            disabled={clientLoading}
-                            className="text-xs font-bold uppercase tracking-widest text-[#00a884] border border-[#00a884]/30 px-3 py-2 rounded-xl hover:bg-[#00a884]/5 transition-all disabled:opacity-50"
-                        >
-                            Refresh
-                        </button>
-                    </div>
 
-                    {clientError && (
-                        <div className="mb-4 bg-rose-50 border border-rose-200 text-rose-700 rounded-2xl px-4 py-3 text-sm font-medium">
-                            {clientError}
+                        {clientError && (
+                            <div className="mb-4 bg-rose-50 border border-rose-200 text-rose-700 rounded-2xl px-4 py-3 text-sm font-medium">
+                                {clientError}
+                            </div>
+                        )}
+
+                        <div className="bg-[#fcfdfd] rounded-2xl border border-[#eceff1] overflow-hidden">
+                            <table className="w-full text-left">
+                                <thead className="bg-white text-[#54656f] text-[10px] uppercase font-black tracking-widest border-b border-[#eceff1]">
+                                    <tr>
+                                        <th className="px-6 py-4">Profile</th>
+                                        <th className="px-6 py-4">Phone Number ID</th>
+                                        <th className="px-6 py-4">WABA ID</th>
+                                        <th className="px-6 py-4">Status</th>
+                                        <th className="px-6 py-4">Token Source</th>
+                                        <th className="px-6 py-4">Token Expiry</th>
+                                        <th className="px-6 py-4">Actions</th>
+                                    </tr>
+                                </thead>
+                                <tbody className="divide-y divide-[#f0f2f5]">
+                                    {clientLoading ? (
+                                        <tr>
+                                            <td className="px-6 py-6 text-sm text-[#8696a0]" colSpan={7}>
+                                                Loading connected clients...
+                                            </td>
+                                        </tr>
+                                    ) : clientConnections.length === 0 ? (
+                                        <tr>
+                                            <td className="px-6 py-6 text-sm text-[#8696a0]" colSpan={7}>
+                                                No connected clients found.
+                                            </td>
+                                        </tr>
+                                    ) : (
+                                        clientConnections.map((client: any) => {
+                                            const status = client.enabled ? 'ACTIVE' : 'DISABLED';
+                                            return (
+                                                <tr key={client.profile_id} className="hover:bg-white transition-all">
+                                                    <td className="px-6 py-4">
+                                                        <div className="text-sm font-bold text-[#111b21]">{client.profile_id}</div>
+                                                    </td>
+                                                    <td className="px-6 py-4 text-xs font-mono text-[#54656f]">
+                                                        {client.phone_number_id || '—'}
+                                                    </td>
+                                                    <td className="px-6 py-4 text-xs font-mono text-[#54656f]">
+                                                        {client.waba_id || client.business_account_id || '—'}
+                                                    </td>
+                                                    <td className="px-6 py-4">
+                                                        <span className={`text-[10px] px-3 py-1 rounded-full border font-bold uppercase tracking-widest ${statusBadgeClass(status)}`}>
+                                                            {status}
+                                                        </span>
+                                                    </td>
+                                                    <td className="px-6 py-4 text-xs text-[#54656f] uppercase font-bold tracking-widest">
+                                                        {client.token_source || 'user'}
+                                                    </td>
+                                                    <td className="px-6 py-4 text-xs text-[#54656f]">
+                                                        {formatTokenExpiry(client.access_token_expires_at)}
+                                                    </td>
+                                                    <td className="px-6 py-4">
+                                                        <div className="flex items-center gap-2">
+                                                            <button
+                                                                onClick={() => handleDisconnectClient(client.profile_id, false)}
+                                                                disabled={!client.enabled || clientLoading}
+                                                                className="px-3 py-2 rounded-xl border border-[#eceff1] text-[11px] font-bold uppercase tracking-widest text-[#54656f] hover:border-[#aebac1] disabled:opacity-50"
+                                                            >
+                                                                Disable
+                                                            </button>
+                                                            <button
+                                                                onClick={() => handleDisconnectClient(client.profile_id, true)}
+                                                                disabled={!client.enabled || clientLoading}
+                                                                className="px-3 py-2 rounded-xl border border-rose-200 text-[11px] font-bold uppercase tracking-widest text-rose-600 hover:border-rose-300 disabled:opacity-50"
+                                                            >
+                                                                Revoke
+                                                            </button>
+                                                        </div>
+                                                    </td>
+                                                </tr>
+                                            );
+                                        })
+                                    )}
+                                </tbody>
+                            </table>
                         </div>
-                    )}
-
-                    <div className="bg-[#fcfdfd] rounded-2xl border border-[#eceff1] overflow-hidden">
-                        <table className="w-full text-left">
-                            <thead className="bg-white text-[#54656f] text-[10px] uppercase font-black tracking-widest border-b border-[#eceff1]">
-                                <tr>
-                                    <th className="px-6 py-4">Profile</th>
-                                    <th className="px-6 py-4">Phone Number ID</th>
-                                    <th className="px-6 py-4">WABA ID</th>
-                                    <th className="px-6 py-4">Status</th>
-                                    <th className="px-6 py-4">Token Source</th>
-                                    <th className="px-6 py-4">Token Expiry</th>
-                                    <th className="px-6 py-4">Actions</th>
-                                </tr>
-                            </thead>
-                            <tbody className="divide-y divide-[#f0f2f5]">
-                                {clientLoading ? (
-                                    <tr>
-                                        <td className="px-6 py-6 text-sm text-[#8696a0]" colSpan={7}>
-                                            Loading connected clients...
-                                        </td>
-                                    </tr>
-                                ) : clientConnections.length === 0 ? (
-                                    <tr>
-                                        <td className="px-6 py-6 text-sm text-[#8696a0]" colSpan={7}>
-                                            No connected clients found.
-                                        </td>
-                                    </tr>
-                                ) : (
-                                    clientConnections.map((client: any) => {
-                                        const status = client.enabled ? 'ACTIVE' : 'DISABLED';
-                                        return (
-                                            <tr key={client.profile_id} className="hover:bg-white transition-all">
-                                                <td className="px-6 py-4">
-                                                    <div className="text-sm font-bold text-[#111b21]">{client.profile_id}</div>
-                                                </td>
-                                                <td className="px-6 py-4 text-xs font-mono text-[#54656f]">
-                                                    {client.phone_number_id || '—'}
-                                                </td>
-                                                <td className="px-6 py-4 text-xs font-mono text-[#54656f]">
-                                                    {client.waba_id || client.business_account_id || '—'}
-                                                </td>
-                                                <td className="px-6 py-4">
-                                                    <span className={`text-[10px] px-3 py-1 rounded-full border font-bold uppercase tracking-widest ${statusBadgeClass(status)}`}>
-                                                        {status}
-                                                    </span>
-                                                </td>
-                                                <td className="px-6 py-4 text-xs text-[#54656f] uppercase font-bold tracking-widest">
-                                                    {client.token_source || 'user'}
-                                                </td>
-                                                <td className="px-6 py-4 text-xs text-[#54656f]">
-                                                    {formatTokenExpiry(client.access_token_expires_at)}
-                                                </td>
-                                                <td className="px-6 py-4">
-                                                    <div className="flex items-center gap-2">
-                                                        <button
-                                                            onClick={() => handleDisconnectClient(client.profile_id, false)}
-                                                            disabled={!client.enabled || clientLoading}
-                                                            className="px-3 py-2 rounded-xl border border-[#eceff1] text-[11px] font-bold uppercase tracking-widest text-[#54656f] hover:border-[#aebac1] disabled:opacity-50"
-                                                        >
-                                                            Disable
-                                                        </button>
-                                                        <button
-                                                            onClick={() => handleDisconnectClient(client.profile_id, true)}
-                                                            disabled={!client.enabled || clientLoading}
-                                                            className="px-3 py-2 rounded-xl border border-rose-200 text-[11px] font-bold uppercase tracking-widest text-rose-600 hover:border-rose-300 disabled:opacity-50"
-                                                        >
-                                                            Revoke
-                                                        </button>
-                                                    </div>
-                                                </td>
-                                            </tr>
-                                        );
-                                    })
-                                )}
-                            </tbody>
-                        </table>
                     </div>
-                </div>
+                )}
 
-                {/* Connected Client Businesses */}
-                <div className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)] lg:col-span-2">
+                {isAdmin && (
+                    <div className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)] lg:col-span-2">
                     <div className="flex items-center justify-between mb-6">
                         <div>
                             <h3 className="text-xl text-[#111b21] font-bold">Connected Businesses</h3>
@@ -1343,7 +1348,8 @@ export default function WebhookView({
                             </button>
                         </div>
                     </div>
-                </div>
+                    </div>
+                )}
             </div>
         </div>
     );
