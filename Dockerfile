@@ -18,9 +18,10 @@ FROM node:20-alpine
 WORKDIR /app
 
 # Install backend dependencies (including devDependencies for tsx)
+# Skip lifecycle scripts to avoid running "prepare" during image build.
 COPY package*.json ./
 COPY engine-requirements.js ./
-RUN npm install
+RUN npm install --ignore-scripts
 
 # Copy backend source code
 COPY . .
