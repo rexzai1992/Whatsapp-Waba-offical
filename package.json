@@ -21,8 +21,10 @@
     "engine-requirements.js"
   ],
   "scripts": {
+    "start": "tsx dashboard-server.ts",
     "dev": "concurrently \"npx tsx watch dashboard-server.ts\" \"npm run dev --prefix dashboard\"",
     "build:all": "npm run build && npm run build:docs",
+    "build:dashboard": "npm run build --prefix dashboard",
     "build:docs": "typedoc",
     "build": "tsc -P tsconfig.build.json && tsc-esm-fix --tsconfig=tsconfig.build.json --ext=.js",
     "changelog:last": "conventional-changelog -p angular -r 2",
@@ -35,7 +37,6 @@
     "lint:fix": "npm run format && npm run lint -- --fix",
     "ngrok:forward": "node scripts/ngrok-forward.mjs",
     "prepack": "npm run build",
-    "prepare": "npm run build",
     "preinstall": "node ./engine-requirements.js",
     "release": "release-it",
     "test": "node --experimental-vm-modules ./node_modules/.bin/jest --testMatch '**/*.test.ts'",
@@ -60,6 +61,7 @@
     "protobufjs": "^7.2.4",
     "qrcode": "^1.5.4",
     "socket.io": "^4.8.3",
+    "tsx": "^4.20.3",
     "ws": "^8.13.0"
   },
   "devDependencies": {
@@ -91,7 +93,6 @@
     "release-it": "^15.10.3",
     "ts-jest": "^29.4.0",
     "tsc-esm-fix": "^3.1.2",
-    "tsx": "^4.20.3",
     "typedoc": "^0.27.9",
     "typedoc-plugin-markdown": "4.4.2",
     "typescript": "^5.8.2"
