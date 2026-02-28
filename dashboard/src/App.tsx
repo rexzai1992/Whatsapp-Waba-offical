@@ -83,6 +83,8 @@ interface Message {
         };
         imageMessage?: any;
         documentMessage?: any;
+        audioMessage?: any;
+        videoMessage?: any;
     };
     pushName?: string;
     messageTimestamp?: number;
@@ -166,7 +168,7 @@ const isPhoneLikeName = (name: string, jid?: string): boolean => {
     return false;
 };
 
-const pickContactName = (incoming: string, prev: string, jid?: string): string => {
+const pickContactName = (incoming: string, prev?: string, jid?: string): string => {
     const incomingTrimmed = (incoming || '').trim();
     const prevTrimmed = (prev || '').trim();
     if (!incomingTrimmed) return prevTrimmed;
@@ -583,6 +585,7 @@ const buildBuilderFromActions = (actions: any[], workflowId: string) => {
             } else {
                 targetIndex = idx + 1;
             }
+            if (targetIndex === undefined) return;
             const targetNodeId = indexToNodeId[targetIndex];
             if (targetNodeId) {
                 connections[node.options?.[btnIdx] || button.title || `Option ${btnIdx + 1}`] = targetNodeId;
@@ -613,6 +616,7 @@ const buildBuilderFromActions = (actions: any[], workflowId: string) => {
                 } else {
                     targetIndex = idx + 1;
                 }
+                if (targetIndex === undefined) return;
                 const targetNodeId = indexToNodeId[targetIndex];
                 if (targetNodeId) {
                     const handleId = `row-${sectionIdx}-${rowIdx}`;
