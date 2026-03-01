@@ -1,10 +1,14 @@
 
-import React, { useEffect, useState, useRef, useCallback, useMemo } from 'react';
+import React, { Suspense, lazy, useEffect, useLayoutEffect, useState, useRef, useCallback, useMemo } from 'react';
+import { List, useDynamicRowHeight, useListRef } from 'react-window';
 import { io, Socket } from 'socket.io-client';
 import {
     Search,
     MoreVertical,
     MessageSquare,
+    FileText,
+    File as FileIcon,
+    Image as ImageIcon,
     Paperclip,
     Smile,
     Mic,
@@ -33,10 +37,8 @@ import {
     Bug,
     Bot
 } from 'lucide-react';
-import WebhookView from './WebhookView';
 import Login from './Login';
-import AdminView from './AdminView';
-import FlowCanvas from './FlowCanvas';
+import DebugButton from './DebugButton';
 import { supabase } from './supabase';
 import type { Session } from '@supabase/supabase-js';
 
@@ -44,6 +46,11 @@ import type { Session } from '@supabase/supabase-js';
 const SOCKET_URL = import.meta.env.VITE_SOCKET_URL || 'http://localhost:3000';
 const SINGLE_PROFILE_MODE = true;
 const ADMIN_PASS = 'admin123';
+
+const LazyWebhookView = lazy(() => import('./WebhookView'));
+const LazyBroadcastTemplateBuilder = lazy(() => import('./BroadcastTemplateBuilder'));
+const LazyBroadcastTemplatesList = lazy(() => import('./BroadcastTemplatesList'));
+const LazyFlowCanvas = lazy(() => import('./FlowCanvas'));
 
 interface Message {
     key: {
@@ -86,8 +93,14 @@ interface Message {
         audioMessage?: any;
         videoMessage?: any;
     };
+    agent?: {
+        user_id?: string;
+        name?: string;
+        color?: string;
+    } | null;
     pushName?: string;
     messageTimestamp?: number;
+    workflowState?: any | null;
 }
 
 interface Chat {
@@ -109,6 +122,13 @@ interface QuickReply {
     text: string;
 }
 
+type TeamUserLite = {
+    id: string;
+    name: string;
+    role: 'owner' | 'admin' | 'agent';
+    color: string;
+};
+
 type LogEntry = {
     id: string;
     ts: number;
@@ -128,6 +148,57 @@ type ServerStats = {
         outBytes?: number;
     };
     timestamp?: number;
+};
+
+type ContactMeta = {
+    name?: string;
+    lastInboundAt?: string | null;
+    tags?: string[];
+    assigneeUserId?: string | null;
+    assigneeName?: string | null;
+    assigneeColor?: string | null;
+    ctaReferralAt?: string | null;
+    ctaFreeWindowStartedAt?: string | null;
+    ctaFreeWindowExpiresAt?: string | null;
+};
+
+type MessageVirtualRow =
+    | { kind: 'date'; id: string; label: string }
+    | { kind: 'message'; id: string; msg: Message };
+
+const CHAT_ROW_HEIGHT = 86;
+const MESSAGE_DRAFT_STORAGE_PREFIX = 'draftMessage:';
+
+const useElementSize = <T extends HTMLElement>() => {
+    const [node, setNode] = useState<T | null>(null);
+    const [size, setSize] = useState({ width: 0, height: 0 });
+    const ref = useCallback((el: T | null) => {
+        setNode(el);
+    }, []);
+
+    useLayoutEffect(() => {
+        if (!node) return;
+
+        const update = () => {
+            setSize({
+                width: node.clientWidth,
+                height: node.clientHeight
+            });
+        };
+
+        update();
+
+        if (typeof ResizeObserver === 'undefined') {
+            window.addEventListener('resize', update);
+            return () => window.removeEventListener('resize', update);
+        }
+
+        const observer = new ResizeObserver(() => update());
+        observer.observe(node);
+        return () => observer.disconnect();
+    }, [node]);
+
+    return { ref, size };
 };
 
 const getCleanId = (jid: string | undefined): string => {
@@ -178,6 +249,26 @@ const pickContactName = (incoming: string, prev?: string, jid?: string): string 
     return incomingTrimmed;
 };
 
+const getInitials = (name?: string | null): string => {
+    const value = (name || '').trim();
+    if (!value) return '?';
+    const parts = value.split(/\s+/).filter(Boolean);
+    if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
+    return `${parts[0][0] || ''}${parts[1][0] || ''}`.toUpperCase();
+};
+
+const withHexAlpha = (color?: string | null, alpha = '22', fallback = '#e5e7eb'): string => {
+    const value = (color || '').trim();
+    if (/^#[0-9a-fA-F]{6}$/.test(value)) return `${value}${alpha}`;
+    return fallback;
+};
+
+const textColor = (color?: string | null, fallback = '#374151'): string => {
+    const value = (color || '').trim();
+    if (/^#[0-9a-fA-F]{6}$/.test(value)) return value;
+    return fallback;
+};
+
 
 const formatBytes = (value?: number): string => {
     if (value === undefined || value === null || !Number.isFinite(value)) return '--';
@@ -196,10 +287,17 @@ const formatBps = (value?: number): string => {
     return `${formatBytes(value)}/s`;
 };
 
+const redactSecret = (value?: string | null, visibleStart = 6, visibleEnd = 4): string | null => {
+    if (!value) return null;
+    const str = String(value);
+    if (str.length <= visibleStart + visibleEnd + 3) return `${str} (len ${str.length})`;
+    return `${str.slice(0, visibleStart)}…${str.slice(-visibleEnd)} (len ${str.length})`;
+};
+
 const getLastInboundTs = (
     messages: Message[],
     chatId: string | null,
-    contacts: Record<string, { name?: string; lastInboundAt?: string | null; tags?: string[] }>
+    contacts: Record<string, ContactMeta>
 ): number | null => {
     if (!chatId) return null;
     let latestSeconds = 0;
@@ -240,6 +338,16 @@ const formatDateLabel = (ms: number) => {
     if (dateKey === yesterday.toDateString()) return 'Yesterday';
 
     return date.toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' });
+};
+
+const getMessagePreviewText = (msg: Message): string => {
+    return (
+        msg.message?.conversation ||
+        msg.message?.extendedTextMessage?.text ||
+        msg.message?.buttonsMessage?.contentText ||
+        msg.message?.listMessage?.description ||
+        ''
+    );
 };
 
 const formatLogTime = (ts: number) => {
@@ -640,7 +748,7 @@ export default function App() {
     const [socket, setSocket] = useState<Socket | null>(null);
     const [connectionStatus, setConnectionStatus] = useState<'connecting' | 'open' | 'close'>('connecting');
     const [allMessages, setAllMessages] = useState<Message[]>([]);
-    const [contacts, setContacts] = useState<Record<string, { name?: string; lastInboundAt?: string | null; tags?: string[] }>>({});
+    const [contacts, setContacts] = useState<Record<string, ContactMeta>>({});
     const [selectedChatId, setSelectedChatId] = useState<string | null>(() => {
         if (typeof window === 'undefined') return null;
         try {
@@ -656,6 +764,7 @@ export default function App() {
     const [startWorkflowId, setStartWorkflowId] = useState('');
     const [startingWorkflow, setStartingWorkflow] = useState(false);
     const [showWorkflowStarter, setShowWorkflowStarter] = useState(false);
+    const [showTemplateComposer, setShowTemplateComposer] = useState(false);
     const [forceTemplateMode, setForceTemplateMode] = useState(false);
     const [lastProfileError, setLastProfileError] = useState<string | null>(null);
     const [logEntries, setLogEntries] = useState<LogEntry[]>([]);
@@ -682,19 +791,41 @@ export default function App() {
     const [quickRepliesError, setQuickRepliesError] = useState<string | null>(null);
 
     const [searchQuery, setSearchQuery] = useState('');
+    const [contactsSearchQuery, setContactsSearchQuery] = useState('');
+    const [teamUsers, setTeamUsers] = useState<TeamUserLite[]>([]);
+    const [teamUsersLoading, setTeamUsersLoading] = useState(false);
+    const [assignMenuContactId, setAssignMenuContactId] = useState<string | null>(null);
+    const [assigningContactId, setAssigningContactId] = useState<string | null>(null);
     const [mediaCache, setMediaCache] = useState<Record<string, MediaData>>({});
     const [showContactInfo, setShowContactInfo] = useState(false);
     const [showNewChatModal, setShowNewChatModal] = useState(false);
     const [newPhoneNumber, setNewPhoneNumber] = useState('');
     const [showMenu, setShowMenu] = useState(false);
     const [now, setNow] = useState(Date.now());
+    const [isOffline, setIsOffline] = useState(() => {
+        if (typeof window === 'undefined') return false;
+        return !window.navigator.onLine;
+    });
 
     const [activeView, setActiveView] = useState<'dashboard' | 'chatflow' | 'settings' | 'admin'>('dashboard');
+    const [workspaceSection, setWorkspaceSection] = useState<
+        'team-inbox' | 'broadcast' | 'chatbots' | 'contacts' | 'ads' | 'automations' | 'more'
+    >('team-inbox');
+    const [broadcastSection, setBroadcastSection] = useState<
+        'template-library' | 'my-templates' | 'broadcast-history' | 'scheduled-broadcasts'
+    >('template-library');
     const [isAdmin, setIsAdmin] = useState(false);
     const [profiles, setProfiles] = useState<any[]>([]);
+    const [profilesLoaded, setProfilesLoaded] = useState(false);
 
-
-    const [activeProfileId, setActiveProfileId] = useState<string | null>(null);
+    const [activeProfileId, setActiveProfileId] = useState<string | null>(() => {
+        if (typeof window === 'undefined') return null;
+        try {
+            return window.localStorage.getItem('lastActiveProfileId');
+        } catch {
+            return null;
+        }
+    });
     const [showProfileMenu, setShowProfileMenu] = useState(false);
     const [showAddProfileModal, setShowAddProfileModal] = useState(false);
     const [showEditProfileModal, setShowEditProfileModal] = useState(false);
@@ -706,13 +837,66 @@ export default function App() {
     const [selectedWorkflowId, setSelectedWorkflowId] = useState<string | null>(null);
     const [workflowDrafts, setWorkflowDrafts] = useState<Record<string, string>>({});
     const [workflowEditorMode, setWorkflowEditorMode] = useState<'visual' | 'json'>('visual');
-    const chatEndRef = useRef<HTMLDivElement>(null);
     const menuRef = useRef<HTMLDivElement>(null);
     const profileMenuRef = useRef<HTMLDivElement>(null);
     const messageInputRef = useRef<HTMLInputElement>(null);
     const activeProfileIdRef = useRef<string | null>(null);
+    const lastRecoverAtRef = useRef(0);
     const lastInboundRef = useRef<number | null>(null);
     const requestedMediaRef = useRef<Set<string>>(new Set());
+    const { ref: chatListViewportRef, size: chatListViewport } = useElementSize<HTMLDivElement>();
+    const { ref: messageViewportRef, size: messageViewport } = useElementSize<HTMLDivElement>();
+    const messageListRef = useListRef(null);
+    const messageRowHeight = useDynamicRowHeight({
+        defaultRowHeight: 120,
+        key: selectedChatId || 'all'
+    });
+
+    const settingsNav = [
+        {
+            group: 'Onboarding',
+            items: [
+                { id: 'settings-connect', label: 'Connect WhatsApp' },
+                { id: 'settings-manual', label: 'Manual Setup' },
+                { id: 'settings-register', label: 'Register Number' }
+            ]
+        },
+        {
+            group: 'Connectivity',
+            items: [
+                { id: 'settings-webhooks', label: 'Outgoing Webhooks' }
+            ]
+        },
+        {
+            group: 'Automation',
+            items: [
+                { id: 'settings-conversational', label: 'Conversational Components' },
+                { id: 'settings-reminder', label: '24h Window Reminder' },
+                { id: 'settings-fallback', label: 'Fallback Message' },
+                { id: 'settings-quick-replies', label: 'Quick Replies' }
+            ]
+        },
+        {
+            group: 'Workspace',
+            items: [
+                { id: 'settings-team-users', label: 'Team Users' }
+            ]
+        },
+        ...(isAdmin ? [{
+            group: 'Admin',
+            items: [
+                { id: 'settings-connected-clients', label: 'Connected Clients' },
+                { id: 'settings-connected-businesses', label: 'Connected Businesses' }
+            ]
+        }] : [])
+    ];
+
+    const scrollToSettingsSection = (id: string) => {
+        const element = document.getElementById(id);
+        if (element) {
+            element.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }
+    };
 
     const pushLog = useCallback((message: string, level: 'info' | 'error' = 'error') => {
         if (!message) return;
@@ -729,6 +913,155 @@ export default function App() {
             return next.slice(-200);
         });
     }, []);
+
+    const getDraftStorageKey = useCallback((profileId?: string | null, chatId?: string | null) => {
+        if (!profileId || !chatId) return null;
+        return `${MESSAGE_DRAFT_STORAGE_PREFIX}${profileId}:${chatId}`;
+    }, []);
+
+    const persistDraft = useCallback(
+        (value: string, profileId?: string | null, chatId?: string | null) => {
+            const key = getDraftStorageKey(profileId, chatId);
+            if (!key) return;
+            try {
+                const trimmed = value || '';
+                if (trimmed.length === 0) {
+                    window.localStorage.removeItem(key);
+                } else {
+                    window.localStorage.setItem(key, trimmed);
+                }
+            } catch {
+                // ignore storage errors
+            }
+        },
+        [getDraftStorageKey]
+    );
+
+    const clearAllDrafts = useCallback(() => {
+        try {
+            const keysToDelete: string[] = [];
+            for (let i = 0; i < window.localStorage.length; i += 1) {
+                const key = window.localStorage.key(i);
+                if (key && key.startsWith(MESSAGE_DRAFT_STORAGE_PREFIX)) {
+                    keysToDelete.push(key);
+                }
+            }
+            keysToDelete.forEach((key) => window.localStorage.removeItem(key));
+        } catch {
+            // ignore storage errors
+        }
+    }, []);
+
+    const setMessageTextWithDraft = useCallback(
+        (value: string) => {
+            setMessageText(value);
+            persistDraft(value, activeProfileIdRef.current, selectedChatId);
+        },
+        [persistDraft, selectedChatId]
+    );
+
+    const fetchTeamUsers = useCallback(async () => {
+        if (!session?.access_token) return;
+        setTeamUsersLoading(true);
+        try {
+            const res = await fetch(`${SOCKET_URL}/api/company/team-users`, {
+                headers: {
+                    Authorization: `Bearer ${session.access_token}`
+                }
+            });
+            const data = await res.json().catch(() => null);
+            if (!res.ok || !data?.success) {
+                throw new Error(data?.error || 'Failed to load team users');
+            }
+            const users = Array.isArray(data?.data?.users) ? data.data.users : [];
+            setTeamUsers(
+                users.map((user: any) => ({
+                    id: String(user.id || ''),
+                    name: String(user.name || user.email || user.id || 'Agent'),
+                    role: (String(user.role || 'agent').toLowerCase() as TeamUserLite['role']),
+                    color: String(user.color || '#6b7280')
+                })).filter((user: TeamUserLite) => Boolean(user.id))
+            );
+        } catch (err) {
+            console.error('Failed to load team users:', err);
+            setTeamUsers([]);
+        } finally {
+            setTeamUsersLoading(false);
+        }
+    }, [session?.access_token]);
+
+    const handleAssignContact = useCallback(
+        async (jid: string, assigneeUserId: string | null) => {
+            if (!socket || !activeProfileId || !jid || jid.endsWith('@g.us')) return;
+            setAssigningContactId(jid);
+            try {
+                const response: any = await new Promise((resolve) => {
+                    const timeout = window.setTimeout(() => {
+                        resolve({ success: false, error: 'Assignment timed out. Please try again.' });
+                    }, 8000);
+                    socket.emit(
+                        'contact.assign',
+                        {
+                            profileId: activeProfileId,
+                            jid,
+                            assigneeUserId
+                        },
+                        (ack: any) => {
+                            window.clearTimeout(timeout);
+                            resolve(ack);
+                        }
+                    );
+                });
+
+                if (!response?.success) {
+                    throw new Error(response?.error || 'Failed to assign contact');
+                }
+
+                const contact = response?.data?.contact;
+                if (contact?.id) {
+                    setContacts(prev => ({
+                        ...prev,
+                        [contact.id]: {
+                            ...(prev[contact.id] || {}),
+                            name: contact.name || prev[contact.id]?.name || getCleanId(contact.id),
+                            lastInboundAt: contact.lastInboundAt ?? prev[contact.id]?.lastInboundAt ?? null,
+                            tags: Array.isArray(contact.tags) ? contact.tags : (prev[contact.id]?.tags || []),
+                            assigneeUserId: contact.assigneeUserId ?? null,
+                            assigneeName: contact.assigneeName ?? null,
+                            assigneeColor: contact.assigneeColor ?? null,
+                            ctaReferralAt: contact.ctaReferralAt ?? prev[contact.id]?.ctaReferralAt ?? null,
+                            ctaFreeWindowStartedAt: contact.ctaFreeWindowStartedAt ?? prev[contact.id]?.ctaFreeWindowStartedAt ?? null,
+                            ctaFreeWindowExpiresAt: contact.ctaFreeWindowExpiresAt ?? prev[contact.id]?.ctaFreeWindowExpiresAt ?? null
+                        }
+                    }));
+                }
+            } catch (err: any) {
+                alert(err?.message || 'Failed to assign contact');
+            } finally {
+                setAssigningContactId(null);
+                setAssignMenuContactId(null);
+            }
+        },
+        [socket, activeProfileId]
+    );
+
+    const recoverSocketConnection = useCallback(
+        (reason: string) => {
+            const nowMs = Date.now();
+            if (nowMs - lastRecoverAtRef.current < 30_000) return;
+            lastRecoverAtRef.current = nowMs;
+            pushLog(reason, 'error');
+            setConnectionStatus('connecting');
+            if (!socket) return;
+            try {
+                if (socket.connected) socket.disconnect();
+                socket.connect();
+            } catch (err: any) {
+                pushLog(`Reconnect failed: ${err?.message || err}`, 'error');
+            }
+        },
+        [pushLog, socket]
+    );
 
     const fetchAnalytics = useCallback(() => {
         if (!activeProfileId) return;
@@ -850,6 +1183,18 @@ export default function App() {
     }, [activeProfileId]);
 
     useEffect(() => {
+        try {
+            if (activeProfileId) {
+                window.localStorage.setItem('lastActiveProfileId', activeProfileId);
+            } else {
+                window.localStorage.removeItem('lastActiveProfileId');
+            }
+        } catch {
+            // ignore storage errors
+        }
+    }, [activeProfileId]);
+
+    useEffect(() => {
         if (!activeProfileId) {
             setQuickReplies([]);
             return;
@@ -869,6 +1214,24 @@ export default function App() {
             // ignore storage errors
         }
     }, [activeProfileId, selectedChatId]);
+
+    useEffect(() => {
+        if (!activeProfileId || !selectedChatId) {
+            setMessageText('');
+            return;
+        }
+        try {
+            const key = getDraftStorageKey(activeProfileId, selectedChatId);
+            if (!key) {
+                setMessageText('');
+                return;
+            }
+            const storedDraft = window.localStorage.getItem(key);
+            setMessageText(storedDraft || '');
+        } catch {
+            setMessageText('');
+        }
+    }, [activeProfileId, selectedChatId, getDraftStorageKey]);
 
     useEffect(() => {
         if (!activeProfileId || !selectedChatId) return;
@@ -920,12 +1283,35 @@ export default function App() {
     }, []);
 
     useEffect(() => {
+        if (typeof window === 'undefined') return;
+        const syncOnlineState = () => setIsOffline(!window.navigator.onLine);
+        syncOnlineState();
+        window.addEventListener('online', syncOnlineState);
+        window.addEventListener('offline', syncOnlineState);
+        return () => {
+            window.removeEventListener('online', syncOnlineState);
+            window.removeEventListener('offline', syncOnlineState);
+        };
+    }, []);
+
+    useEffect(() => {
         if (!showAnalytics) return;
         fetchAnalytics();
     }, [showAnalytics, fetchAnalytics]);
 
+    useEffect(() => {
+        if (workspaceSection !== 'contacts') return;
+        fetchTeamUsers();
+    }, [workspaceSection, fetchTeamUsers]);
+
+    useEffect(() => {
+        setAssignMenuContactId(null);
+    }, [activeProfileId, workspaceSection]);
+
 
     const handleSignOut = async () => {
+        clearAllDrafts();
+        setMessageText('');
         await supabase.auth.signOut();
         setSession(null);
     };
@@ -962,7 +1348,8 @@ export default function App() {
                     setIsAdmin(false);
                     return;
                 }
-                setIsAdmin(data?.role === 'admin');
+                const role = typeof data?.role === 'string' ? data.role.toLowerCase() : '';
+                setIsAdmin(role === 'admin' || role === 'owner');
             });
     }, [session]);
 
@@ -974,10 +1361,16 @@ export default function App() {
     useEffect(() => {
         if (!session) {
             setSocket(null);
+            setProfiles([]);
+            setProfilesLoaded(false);
+            setActiveProfileId(null);
+            setAllMessages([]);
+            setContacts({});
             return;
         }
 
         console.log('Connecting socket with token', session.access_token.substring(0, 10));
+        setProfilesLoaded(false);
         const newSocket = io(SOCKET_URL, {
             auth: { token: session.access_token }
         });
@@ -990,11 +1383,27 @@ export default function App() {
         });
 
         newSocket.on('profiles.update', (data) => {
-            setProfiles(data);
-            // Auto-select first profile if none active
-            if (data.length > 0 && !activeProfileId) {
-                setActiveProfileId(data[0].id);
+            const list = Array.isArray(data) ? data : [];
+            setProfiles(list);
+            setProfilesLoaded(true);
+            if (list.length === 0) {
+                setActiveProfileId(null);
+                setLoadingChats(false);
+                return;
             }
+
+            // Keep current selection if still valid; otherwise pick persisted profile, then first.
+            const current = activeProfileIdRef.current;
+            if (current && list.some((p: any) => p.id === current)) return;
+
+            let persisted: string | null = null;
+            try {
+                persisted = window.localStorage.getItem('lastActiveProfileId');
+            } catch {
+                persisted = null;
+            }
+            const next = (persisted && list.find((p: any) => p.id === persisted)) || list[0];
+            if (next?.id) setActiveProfileId(next.id);
         });
 
         newSocket.on('connection.update', (update) => {
@@ -1052,11 +1461,24 @@ export default function App() {
                         if (!c.id) return;
                         const prev = next[c.id] || {};
                         const incomingName = typeof c.name === 'string' ? c.name : (typeof c.notify === 'string' ? c.notify : '');
-    const resolvedName = pickContactName(incomingName, prev.name, c.id);
+                        const resolvedName = pickContactName(incomingName, prev.name, c.id);
+                        const nextLastInboundAt = c.lastInboundAt === undefined ? (prev as any).lastInboundAt || null : c.lastInboundAt;
+                        const nextAssigneeUserId = c.assigneeUserId === undefined ? (prev as any).assigneeUserId || null : c.assigneeUserId;
+                        const nextAssigneeName = c.assigneeName === undefined ? (prev as any).assigneeName || null : c.assigneeName;
+                        const nextAssigneeColor = c.assigneeColor === undefined ? (prev as any).assigneeColor || null : c.assigneeColor;
+                        const nextCtaReferralAt = c.ctaReferralAt === undefined ? (prev as any).ctaReferralAt || null : c.ctaReferralAt;
+                        const nextCtaFreeWindowStartedAt = c.ctaFreeWindowStartedAt === undefined ? (prev as any).ctaFreeWindowStartedAt || null : c.ctaFreeWindowStartedAt;
+                        const nextCtaFreeWindowExpiresAt = c.ctaFreeWindowExpiresAt === undefined ? (prev as any).ctaFreeWindowExpiresAt || null : c.ctaFreeWindowExpiresAt;
                         next[c.id] = {
                             name: resolvedName || prev.name,
-                            lastInboundAt: c.lastInboundAt || prev.lastInboundAt || null,
-                            tags: Array.isArray(c.tags) ? c.tags : prev.tags || []
+                            lastInboundAt: nextLastInboundAt,
+                            tags: Array.isArray(c.tags) ? c.tags : prev.tags || [],
+                            assigneeUserId: nextAssigneeUserId,
+                            assigneeName: nextAssigneeName,
+                            assigneeColor: nextAssigneeColor,
+                            ctaReferralAt: nextCtaReferralAt,
+                            ctaFreeWindowStartedAt: nextCtaFreeWindowStartedAt,
+                            ctaFreeWindowExpiresAt: nextCtaFreeWindowExpiresAt
                         };
                     });
                     return next;
@@ -1106,6 +1528,7 @@ export default function App() {
         });
 
         newSocket.on('connect_error', (err: any) => {
+            setProfilesLoaded(true);
             pushLog(`Socket connect error: ${err?.message || err}`, 'error');
         });
 
@@ -1133,6 +1556,22 @@ export default function App() {
             socket.emit('switchProfile', activeProfileId);
         }
     }, [socket, activeProfileId]);
+
+    useEffect(() => {
+        if (!session || profilesLoaded) return;
+        const timer = window.setTimeout(() => {
+            recoverSocketConnection('Profiles load timed out. Restarting socket connection...');
+        }, 15_000);
+        return () => window.clearTimeout(timer);
+    }, [session, profilesLoaded, recoverSocketConnection]);
+
+    useEffect(() => {
+        if (!session || !activeProfileId || !loadingChats) return;
+        const timer = window.setTimeout(() => {
+            recoverSocketConnection('Chat sync timed out. Restarting socket connection...');
+        }, 15_000);
+        return () => window.clearTimeout(timer);
+    }, [session, activeProfileId, loadingChats, recoverSocketConnection]);
 
     const applyWorkflowsFromServer = (list: any[]) => {
         setWorkflows(list);
@@ -1220,47 +1659,143 @@ export default function App() {
         }
     };
 
-    useEffect(() => {
-        chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-    }, [allMessages, selectedChatId]);
+    const { chatsMap, chatList, latestChatId } = useMemo(() => {
+        const nextMap = new Map<string, Chat>();
+        allMessages.forEach(msg => {
+            const jid = msg.key.remoteJid;
+            if (!jid) return;
 
-    // Process unique chats
-    const chatsMap = new Map<string, Chat>();
-    allMessages.forEach(msg => {
-        const jid = msg.key.remoteJid;
-        if (!jid) return;
+            const existing = nextMap.get(jid);
+            const content =
+                msg.message?.conversation ||
+                msg.message?.extendedTextMessage?.text ||
+                msg.message?.buttonsMessage?.contentText ||
+                msg.message?.listMessage?.description ||
+                (msg.message?.buttonsMessage ? 'Buttons' : msg.message?.listMessage ? 'List' : 'Media message');
 
-        const existing = chatsMap.get(jid);
-        const content =
-            msg.message?.conversation ||
-            msg.message?.extendedTextMessage?.text ||
-            msg.message?.buttonsMessage?.contentText ||
-            msg.message?.listMessage?.description ||
-            (msg.message?.buttonsMessage ? 'Buttons' : msg.message?.listMessage ? 'List' : 'Media message');
+            if (!existing || (msg.messageTimestamp && msg.messageTimestamp > (existing.timestamp || 0))) {
+                const cleanId = getCleanId(jid);
+                let rawName = contacts[jid]?.name || msg.pushName || cleanId;
+                if (rawName.includes('@')) {
+                    rawName = getCleanId(rawName);
+                }
 
-        if (!existing || (msg.messageTimestamp && msg.messageTimestamp > (existing.timestamp || 0))) {
-            const cleanId = getCleanId(jid);
-            let rawName = contacts[jid]?.name || msg.pushName || cleanId;
-            // If the name itself is a JID, clean it
-            if (rawName.includes('@')) {
-                rawName = getCleanId(rawName);
+                nextMap.set(jid, {
+                    id: jid,
+                    name: rawName,
+                    lastMessage: content,
+                    timestamp: msg.messageTimestamp,
+                    unreadCount: 0,
+                });
             }
+        });
 
-            chatsMap.set(jid, {
+        // Ensure contacts with no messages still appear in chat list.
+        Object.entries(contacts).forEach(([jid, contact]) => {
+            if (!jid || nextMap.has(jid)) return;
+            const cleanId = getCleanId(jid);
+            let rawName = contact?.name || cleanId;
+            if (rawName.includes('@')) rawName = getCleanId(rawName);
+            const lastInboundMs = contact?.lastInboundAt ? new Date(contact.lastInboundAt).getTime() : 0;
+            const timestamp = Number.isFinite(lastInboundMs) && lastInboundMs > 0
+                ? Math.floor(lastInboundMs / 1000)
+                : 0;
+            nextMap.set(jid, {
                 id: jid,
                 name: rawName,
-                lastMessage: content,
-                timestamp: msg.messageTimestamp,
-                unreadCount: 0,
+                lastMessage: '',
+                timestamp,
+                unreadCount: 0
             });
-        }
-    });
+        });
 
-    const chatList = Array.from(chatsMap.values())
-        .filter(chat => chat.name.toLowerCase().includes(searchQuery.toLowerCase()))
-        .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+        const nextList = Array.from(nextMap.values())
+            .filter(chat => chat.name.toLowerCase().includes(searchQuery.toLowerCase()))
+            .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
 
-    const latestChatId = chatList[0]?.id || null;
+        return {
+            chatsMap: nextMap,
+            chatList: nextList,
+            latestChatId: nextList[0]?.id || null
+        };
+    }, [allMessages, contacts, searchQuery]);
+
+    const contactsList = useMemo(() => {
+        type ContactRow = {
+            id: string;
+            name: string;
+            phone: string;
+            tags: string[];
+            assigneeUserId: string | null;
+            assigneeName: string | null;
+            assigneeColor: string | null;
+            lastInboundAt: string | null;
+            lastActivityTs: number;
+            totalMessages: number;
+        };
+
+        const rows = new Map<string, ContactRow>();
+        const ensure = (jid: string): ContactRow | null => {
+            if (!jid || jid.endsWith('@g.us')) return null;
+            const existing = rows.get(jid);
+            if (existing) return existing;
+            const meta = contacts[jid] || {};
+            const fallbackName = formatPhoneNumber(getCleanId(jid));
+            const row: ContactRow = {
+                id: jid,
+                name: meta.name || fallbackName,
+                phone: formatPhoneNumber(getCleanId(jid)),
+                tags: Array.isArray(meta.tags) ? meta.tags : [],
+                assigneeUserId: meta.assigneeUserId || null,
+                assigneeName: meta.assigneeName || null,
+                assigneeColor: meta.assigneeColor || null,
+                lastInboundAt: meta.lastInboundAt || null,
+                lastActivityTs: meta.lastInboundAt ? new Date(meta.lastInboundAt).getTime() || 0 : 0,
+                totalMessages: 0
+            };
+            rows.set(jid, row);
+            return row;
+        };
+
+        Object.keys(contacts).forEach((jid) => {
+            ensure(jid);
+        });
+
+        allMessages.forEach((msg) => {
+            const jid = msg.key?.remoteJid || '';
+            const row = ensure(jid);
+            if (!row) return;
+            row.totalMessages += 1;
+            const ts = (msg.messageTimestamp || 0) * 1000;
+            if (ts > row.lastActivityTs) row.lastActivityTs = ts;
+            if (!msg.key.fromMe && ts > 0) {
+                const inboundIso = new Date(ts).toISOString();
+                if (!row.lastInboundAt || ts > new Date(row.lastInboundAt).getTime()) {
+                    row.lastInboundAt = inboundIso;
+                }
+            }
+            if (!row.name) {
+                row.name = msg.pushName || row.phone;
+            }
+        });
+
+        const query = contactsSearchQuery.trim().toLowerCase();
+        const filtered = Array.from(rows.values()).filter((row) => {
+            if (!query) return true;
+            if (row.name.toLowerCase().includes(query)) return true;
+            if (row.phone.toLowerCase().includes(query)) return true;
+            if (row.tags.some((tag) => tag.toLowerCase().includes(query))) return true;
+            return false;
+        });
+
+        filtered.sort((a, b) => {
+            const aTs = a.lastActivityTs || (a.lastInboundAt ? new Date(a.lastInboundAt).getTime() : 0);
+            const bTs = b.lastActivityTs || (b.lastInboundAt ? new Date(b.lastInboundAt).getTime() : 0);
+            return bTs - aTs;
+        });
+
+        return filtered;
+    }, [contacts, allMessages, contactsSearchQuery]);
 
     useEffect(() => {
         if (activeView !== 'dashboard') return;
@@ -1316,9 +1851,46 @@ export default function App() {
         }
     }, [startWorkflowId, startableWorkflows]);
 
-    const currentChatMessages = allMessages
-        .filter(msg => msg.key.remoteJid === selectedChatId)
-        .sort((a, b) => (a.messageTimestamp || 0) - (b.messageTimestamp || 0));
+    const currentChatMessages = useMemo(() => {
+        return allMessages
+            .filter(msg => msg.key.remoteJid === selectedChatId)
+            .sort((a, b) => (a.messageTimestamp || 0) - (b.messageTimestamp || 0));
+    }, [allMessages, selectedChatId]);
+
+    const messageRows = useMemo<MessageVirtualRow[]>(() => {
+        const rows: MessageVirtualRow[] = [];
+        let lastDateKey = '';
+        currentChatMessages.forEach((msg, idx) => {
+            const msgMs = (msg.messageTimestamp || 0) * 1000;
+            const dateKey = msgMs ? new Date(msgMs).toDateString() : '';
+            const showDate = Boolean(dateKey && dateKey !== lastDateKey);
+            if (showDate) {
+                lastDateKey = dateKey;
+                rows.push({
+                    kind: 'date',
+                    id: `date-${dateKey}-${idx}`,
+                    label: formatDateLabel(msgMs)
+                });
+            }
+            rows.push({
+                kind: 'message',
+                id: msg.key.id || `${msg.key.remoteJid || 'msg'}-${idx}`,
+                msg
+            });
+        });
+        return rows;
+    }, [currentChatMessages]);
+
+    useEffect(() => {
+        if (!selectedChatId) return;
+        if (messageRows.length === 0) return;
+        requestAnimationFrame(() => {
+            messageListRef.current?.scrollToRow({
+                index: messageRows.length - 1,
+                align: 'end'
+            });
+        });
+    }, [selectedChatId, messageRows.length]);
 
     useEffect(() => {
         if (!socket || !activeProfileId) return;
@@ -1345,6 +1917,11 @@ export default function App() {
         });
     }, [socket, activeProfileId, selectedChatId, currentChatMessages, mediaCache]);
 
+    const currentAgentName =
+        (session?.user?.user_metadata as any)?.full_name ||
+        (session?.user?.user_metadata as any)?.name ||
+        (session?.user?.email ? String(session.user.email).split('@')[0] : 'You');
+
     const selectedChat = selectedChatId
         ? (chatsMap.get(selectedChatId) || {
             id: selectedChatId,
@@ -1354,10 +1931,28 @@ export default function App() {
             unreadCount: 0
         })
         : null;
+    const selectedContact = selectedChatId ? contacts[selectedChatId] : null;
+    const selectedAssigneeName = selectedContact?.assigneeName || null;
+    const selectedAssigneeColor = selectedContact?.assigneeColor || '#6b7280';
+    const selectedAssigneeInitials = getInitials(selectedAssigneeName || 'Unassigned');
+    const assignTargetContact = assignMenuContactId ? contacts[assignMenuContactId] : null;
+    const assignTargetName = assignMenuContactId
+        ? (assignTargetContact?.name || chatsMap.get(assignMenuContactId)?.name || formatPhoneNumber(getCleanId(assignMenuContactId)))
+        : '';
+    const assignTargetPhone = assignMenuContactId ? formatPhoneNumber(getCleanId(assignMenuContactId)) : '';
+    const assignTargetAssigneeUserId = assignTargetContact?.assigneeUserId || null;
     const lastInboundMs = getLastInboundTs(allMessages, selectedChatId, contacts);
     const windowExpiresMs = lastInboundMs ? lastInboundMs + 24 * 60 * 60 * 1000 : null;
     const windowRemainingMs = windowExpiresMs ? windowExpiresMs - now : null;
     const windowOpen = windowRemainingMs !== null && windowRemainingMs > 0;
+    const ctaFreeWindowExpiresMs = selectedChatId && contacts[selectedChatId]?.ctaFreeWindowExpiresAt
+        ? new Date(contacts[selectedChatId]?.ctaFreeWindowExpiresAt || '').getTime()
+        : null;
+    const ctaFreeWindowRemainingMs =
+        ctaFreeWindowExpiresMs && !Number.isNaN(ctaFreeWindowExpiresMs)
+            ? ctaFreeWindowExpiresMs - now
+            : null;
+    const ctaFreeWindowOpen = ctaFreeWindowRemainingMs !== null && ctaFreeWindowRemainingMs > 0;
     const canSendText = windowOpen && !forceTemplateMode;
     const quickReplyQuery = useMemo(() => {
         const trimmed = messageText.trim();
@@ -1381,7 +1976,7 @@ export default function App() {
     const handleQuickReplyPick = (item: QuickReply) => {
         const text = typeof item.text === 'string' ? item.text.trim() : '';
         if (!text) return;
-        setMessageText(text);
+        setMessageTextWithDraft(text);
         requestAnimationFrame(() => {
             if (!messageInputRef.current) return;
             messageInputRef.current.focus();
@@ -1398,15 +1993,22 @@ export default function App() {
     }, [lastInboundMs]);
 
     const handleSendMessage = () => {
-        if (!socket || !selectedChatId || !messageText.trim()) return;
-        socket.emit('sendMessage', { profileId: activeProfileId, jid: selectedChatId, text: messageText });
+        if (!socket || !activeProfileId || !selectedChatId || !messageText.trim()) return;
+        const outgoingText = messageText.trim();
+        socket.emit('sendMessage', { profileId: activeProfileId, jid: selectedChatId, text: outgoingText });
         const tempMsg: Message = {
             key: { id: Math.random().toString(), remoteJid: selectedChatId, fromMe: true },
-            message: { conversation: messageText },
+            message: { conversation: outgoingText },
             messageTimestamp: Math.floor(Date.now() / 1000),
             status: 'sent',
+            agent: {
+                user_id: session?.user?.id,
+                name: currentAgentName,
+                color: '#6b7280'
+            }
         };
         setAllMessages(prev => [tempMsg, ...prev]);
+        persistDraft('', activeProfileId, selectedChatId);
         setMessageText('');
     };
 
@@ -1504,6 +2106,7 @@ export default function App() {
             language: templateLanguage.trim() || 'en_US',
             components
         });
+        setShowTemplateComposer(false);
     };
 
     const handleSwitchProfile = (id: string) => {
@@ -1511,6 +2114,7 @@ export default function App() {
         setAllMessages([]);
         setContacts({});
         setSelectedChatId(null);
+        setShowTemplateComposer(false);
         setConnectionStatus('connecting'); // Anticipate status update
         setLoadingChats(true);
         socket?.emit('switchProfile', id);
@@ -1613,11 +2217,114 @@ export default function App() {
     }
 
     if (!session) {
-        return <Login onLogin={() => { }} />
+        return (
+            <Login
+                onLogin={(nextSession) => {
+                    setSession(nextSession);
+                    setAuthChecking(false);
+                }}
+            />
+        )
     }
 
+    const workspaceTabs: Array<{
+        id: 'team-inbox' | 'broadcast' | 'chatbots' | 'contacts' | 'ads' | 'automations' | 'more';
+        label: string;
+        icon: React.ComponentType<{ className?: string }>;
+        beta?: boolean;
+    }> = [
+            { id: 'team-inbox', label: 'Team Inbox', icon: MessageSquare },
+            { id: 'broadcast', label: 'Broadcast', icon: Send },
+            { id: 'chatbots', label: 'Chatbots', icon: Bot },
+            { id: 'contacts', label: 'Contacts', icon: Users },
+            { id: 'ads', label: 'Ads', icon: CircleDashed, beta: true },
+            { id: 'automations', label: 'Automations', icon: Workflow },
+            { id: 'more', label: 'More', icon: MoreVertical }
+        ];
+
+    const activeWorkspaceLabel = workspaceTabs.find(tab => tab.id === workspaceSection)?.label || 'Workspace';
+    const broadcastNav: Array<{ id: 'template-library' | 'my-templates' | 'broadcast-history' | 'scheduled-broadcasts'; label: string }> = [
+        { id: 'template-library', label: 'Template Library' },
+        { id: 'my-templates', label: 'My Templates' },
+        { id: 'broadcast-history', label: 'Broadcast History' },
+        { id: 'scheduled-broadcasts', label: 'Scheduled Broadcasts' }
+    ];
+
     return (
-        <div className="flex h-screen bg-[#f8f9fa] overflow-hidden text-[#111b21] font-sans">
+        <>
+            {isOffline && (
+                <>
+                    <div className="fixed top-0 inset-x-0 z-[260] bg-[#111b21] text-white border-b border-[#2f3b42]">
+                        <div className="h-11 px-4 flex items-center justify-center gap-2 text-[12px] font-bold tracking-wide">
+                            <span className="px-2 py-0.5 rounded-full bg-rose-500/90 text-[10px] uppercase">Offline</span>
+                            <span>No internet connection. Reconnecting…</span>
+                        </div>
+                    </div>
+                    <div className="fixed left-1/2 -translate-x-1/2 bottom-5 z-[260] pointer-events-none">
+                        <div className="offline-dino-card">
+                            <div className="offline-dino-stage">
+                                <div className="offline-dino-runner" role="img" aria-label="Running dinosaur">🦖</div>
+                                <div className="offline-dino-ground" />
+                            </div>
+                            <div className="offline-dino-label">
+                                Waiting for internet
+                                <span className="offline-dino-dots" aria-hidden="true">
+                                    <span>.</span>
+                                    <span>.</span>
+                                    <span>.</span>
+                                </span>
+                            </div>
+                        </div>
+                    </div>
+                </>
+            )}
+            <header className="fixed top-0 inset-x-0 z-[120] h-[72px] bg-white border-b border-[#eceff1]">
+                <div className="h-full px-5 flex items-center justify-between gap-4">
+                    <div className="flex items-center gap-5 min-w-0 flex-1">
+                        <div className="flex items-center gap-2 shrink-0">
+                            <div className="w-9 h-9 rounded-xl bg-[#00a884]/10 border border-[#00a884]/20 text-[#00a884] flex items-center justify-center">
+                                <MessageSquare className="w-5 h-5" />
+                            </div>
+                            <div className="h-8 min-w-[96px] px-3 rounded-lg border border-[#eceff1] bg-[#f8f9fa] flex items-center justify-center">
+                                <span className="text-[10px] font-black uppercase tracking-widest text-[#8696a0]">Logo</span>
+                            </div>
+                        </div>
+                        <div className="hidden xl:block w-px h-8 bg-[#eceff1]" />
+                        <nav className="flex items-center gap-1 overflow-x-auto whitespace-nowrap custom-scrollbar">
+                            {workspaceTabs.map((tab) => {
+                                const Icon = tab.icon;
+                                const active = workspaceSection === tab.id;
+                                return (
+                                    <button
+                                        key={tab.id}
+                                        onClick={() => setWorkspaceSection(tab.id)}
+                                        className={`px-3 py-2 rounded-xl text-[16px] font-bold transition-all flex items-center gap-2 ${active ? 'text-[#00a884] bg-[#00a884]/10' : 'text-[#4a4a4a] hover:bg-[#f0f2f5]'}`}
+                                    >
+                                        <Icon className="w-4 h-4" />
+                                        <span>{tab.label}</span>
+                                        {tab.beta && (
+                                            <span className="px-2 py-0.5 rounded-full bg-[#dcfce7] text-[#15803d] text-[10px] font-black uppercase tracking-wider">
+                                                Beta
+                                            </span>
+                                        )}
+                                    </button>
+                                );
+                            })}
+                        </nav>
+                    </div>
+                    <div className="hidden md:flex items-center gap-3">
+                        <button className="w-10 h-10 rounded-full bg-[#f3f4f6] text-[#6b7280] flex items-center justify-center">
+                            <MoreVertical className="w-5 h-5" />
+                        </button>
+                        <button className="w-10 h-10 rounded-full bg-[#f3f4f6] text-[#6b7280] flex items-center justify-center">
+                            <User className="w-5 h-5" />
+                        </button>
+                    </div>
+                </div>
+            </header>
+
+            {workspaceSection === 'team-inbox' ? (
+                <div className="flex h-screen pt-[72px] bg-[#f8f9fa] overflow-hidden text-[#111b21] font-sans">
             <div className="w-[400px] border-r border-[#eceff1] flex flex-col bg-white">
                 <header className="h-[60px] bg-[#f0f2f5] px-4 flex items-center justify-between border-b border-[#eceff1]">
                     <div className="flex items-center gap-4">
@@ -1767,20 +2474,30 @@ export default function App() {
                 <div className="flex-1 overflow-y-auto custom-scrollbar">
                     {!activeProfileId ? (
                         <div className="p-4 flex flex-col items-center justify-center h-full text-center bg-white">
-                            <User className="w-12 h-12 text-[#54656f] mb-4 opacity-10" />
-                            <p className="text-[#111b21] font-bold mb-2">No Profile active</p>
-                            <p className="text-sm text-[#8696a0] mb-6">
-                                {SINGLE_PROFILE_MODE
-                                    ? 'Default WABA profile will appear here once created.'
-                                    : 'Create or select a profile to start'}
-                            </p>
-                            {!SINGLE_PROFILE_MODE && (
-                                <button
-                                    onClick={() => setShowAddProfileModal(true)}
-                                    className="bg-[#00a884] text-black px-6 py-2 rounded-lg font-bold hover:bg-[#008f6f] transition-all"
-                                >
-                                    Create First Profile
-                                </button>
+                            {profilesLoaded ? (
+                                <>
+                                    <User className="w-12 h-12 text-[#54656f] mb-4 opacity-10" />
+                                    <p className="text-[#111b21] font-bold mb-2">No Profile active</p>
+                                    <p className="text-sm text-[#8696a0] mb-6">
+                                        {SINGLE_PROFILE_MODE
+                                            ? 'Default WABA profile will appear here once created.'
+                                            : 'Create or select a profile to start'}
+                                    </p>
+                                    {!SINGLE_PROFILE_MODE && (
+                                        <button
+                                            onClick={() => setShowAddProfileModal(true)}
+                                            className="bg-[#00a884] text-black px-6 py-2 rounded-lg font-bold hover:bg-[#008f6f] transition-all"
+                                        >
+                                            Create First Profile
+                                        </button>
+                                    )}
+                                </>
+                            ) : (
+                                <>
+                                    <div className="w-10 h-10 rounded-full border-4 border-[#e5e7eb] border-t-[#00a884] animate-spin mb-4" />
+                                    <p className="text-[#111b21] font-bold mb-1">Loading profiles…</p>
+                                    <p className="text-sm text-[#8696a0]">Connecting to your workspace</p>
+                                </>
                             )}
                         </div>
                     ) : connectionStatus !== 'open' ? (
@@ -1794,53 +2511,118 @@ export default function App() {
                                 </p>
                             </div>
                         </div>
-                    ) : chatList.map((chat) => (
-                        <div
-                            key={chat.id}
-                            onClick={() => setSelectedChatId(chat.id)}
-                            className={`flex items-center px-3 py-2 cursor-pointer hover:bg-[#f5f6f6] transition-colors border-b border-[#fcfdfd] ${selectedChatId === chat.id ? 'bg-[#f0f2f5]' : ''}`}
-                        >
-                            <div className="w-12 h-12 rounded-full bg-[#f0f2f5] mr-3 flex-shrink-0 flex items-center justify-center border border-[#eceff1]">
-                                {chat.id.endsWith('@g.us') ? (
-                                    <Users className="text-[#54656f] w-5 h-5" />
-                                ) : (
-                                    <User className="text-[#54656f] w-5 h-5" />
-                                )}
-                            </div>
-                            <div className="flex-1 min-w-0 border-b border-[#f5f6f6] pb-3 pt-1">
-                                <div className="flex justify-between items-baseline mb-0.5">
-                                    <h3 className="font-bold text-[16px] truncate pr-2 text-[#111b21]">
-                                        {chat.name}
-                                    </h3>
-                                    <span className="text-[11px] font-medium text-[#54656f]">
-                                        {chat.timestamp ? new Date(chat.timestamp * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''}
-                                    </span>
+                    ) : (
+                        <div className="h-full overflow-hidden" ref={chatListViewportRef}>
+                            {loadingChats ? (
+                                <div className="h-full flex flex-col items-center justify-center text-sm text-[#8696a0] gap-3">
+                                    <div className="w-8 h-8 rounded-full border-4 border-[#e5e7eb] border-t-[#00a884] animate-spin" />
+                                    <span>Loading chats…</span>
                                 </div>
-                                {(chat.id.endsWith('@s.whatsapp.net') || chat.id.endsWith('@lid')) &&
-                                    getCleanId(chat.name) !== getCleanId(chat.id) && (
-                                        <div className="text-[11px] text-[#00a884] font-bold leading-none mb-1">
-                                            {formatPhoneNumber(getCleanId(chat.id))}
-                                        </div>
-                                    )}
-                                <div className="flex items-center justify-between mt-0.5">
-                                    <p className="truncate text-[13px] text-[#54656f] font-medium leading-tight flex-1">
-                                        {chat.lastMessage}
-                                    </p>
-                                    {chat.id.endsWith('@g.us') && (
-                                        <span className="ml-2 px-1.5 py-0.5 bg-[#f0f2f5] text-[#54656f] text-[9px] rounded uppercase font-bold border border-[#eceff1] tracking-tight">Group</span>
-                                    )}
+                            ) : chatList.length === 0 ? (
+                                <div className="h-full flex items-center justify-center text-sm text-[#8696a0]">
+                                    No chats found.
                                 </div>
-                            </div>
+                            ) : chatListViewport.height > 0 ? (
+                                <List
+                                    style={{
+                                        height: chatListViewport.height,
+                                        width: chatListViewport.width || '100%'
+                                    }}
+                                    rowCount={chatList.length}
+                                    rowHeight={CHAT_ROW_HEIGHT}
+                                    rowProps={{}}
+                                    overscanCount={8}
+                                    rowComponent={(props: any) => {
+                                        const { index, style } = props as { index: number; style: React.CSSProperties };
+                                        const chat = chatList[index];
+                                        const assigneeName = contacts[chat.id]?.assigneeName || null;
+                                        const assigneeColor = contacts[chat.id]?.assigneeColor || '#6b7280';
+                                        return (
+                                            <div style={style}>
+                                                <div
+                                                    onClick={() => setSelectedChatId(chat.id)}
+                                                    className={`flex items-center px-3 py-2 cursor-pointer hover:bg-[#f5f6f6] transition-colors border-b border-[#fcfdfd] ${selectedChatId === chat.id ? 'bg-[#f0f2f5]' : ''}`}
+                                                >
+                                                    <div className="w-12 h-12 rounded-full bg-[#f0f2f5] mr-3 flex-shrink-0 flex items-center justify-center border border-[#eceff1]">
+                                                        {chat.id.endsWith('@g.us') ? (
+                                                            <Users className="text-[#54656f] w-5 h-5" />
+                                                        ) : (
+                                                            <User className="text-[#54656f] w-5 h-5" />
+                                                        )}
+                                                    </div>
+                                                    <div className="flex-1 min-w-0 border-b border-[#f5f6f6] pb-3 pt-1">
+                                                        <div className="flex justify-between items-baseline mb-0.5">
+                                                            <h3 className="font-bold text-[16px] truncate pr-2 text-[#111b21]">
+                                                                {chat.name}
+                                                            </h3>
+                                                            <span className="text-[11px] font-medium text-[#54656f]">
+                                                                {chat.timestamp ? new Date(chat.timestamp * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''}
+                                                            </span>
+                                                        </div>
+                                                        {(chat.id.endsWith('@s.whatsapp.net') || chat.id.endsWith('@lid')) &&
+                                                            getCleanId(chat.name) !== getCleanId(chat.id) && (
+                                                                <div className="text-[11px] text-[#00a884] font-bold leading-none mb-1">
+                                                                    {formatPhoneNumber(getCleanId(chat.id))}
+                                                                </div>
+                                                            )}
+                                                        <div className="flex items-center justify-between mt-0.5 gap-2">
+                                                            <p className="truncate text-[13px] text-[#54656f] font-medium leading-tight flex-1">
+                                                                {chat.lastMessage}
+                                                            </p>
+                                                            {assigneeName ? (
+                                                                <div className="ml-2">
+                                                                    <button
+                                                                        type="button"
+                                                                        onClick={(e) => {
+                                                                            e.stopPropagation();
+                                                                            if (!teamUsers.length && !teamUsersLoading) fetchTeamUsers();
+                                                                            setAssignMenuContactId(prev => (prev === chat.id ? null : chat.id));
+                                                                        }}
+                                                                        className="px-1.5 py-0.5 text-[9px] rounded uppercase font-bold border tracking-tight hover:opacity-85 transition-all"
+                                                                        style={{
+                                                                            backgroundColor: withHexAlpha(assigneeColor, '20', '#f3f4f6'),
+                                                                            borderColor: withHexAlpha(assigneeColor, '66', '#d1d5db'),
+                                                                            color: textColor(assigneeColor, '#374151')
+                                                                        }}
+                                                                    >
+                                                                        {assigneeName}
+                                                                    </button>
+                                                                </div>
+                                                            ) : chat.id.endsWith('@g.us') ? (
+                                                                <span className="ml-2 px-1.5 py-0.5 bg-[#f0f2f5] text-[#54656f] text-[9px] rounded uppercase font-bold border border-[#eceff1] tracking-tight">Group</span>
+                                                            ) : (
+                                                                <div className="ml-2">
+                                                                    <button
+                                                                        type="button"
+                                                                        onClick={(e) => {
+                                                                            e.stopPropagation();
+                                                                            if (!teamUsers.length && !teamUsersLoading) fetchTeamUsers();
+                                                                            setAssignMenuContactId(prev => (prev === chat.id ? null : chat.id));
+                                                                        }}
+                                                                        className="px-1.5 py-0.5 bg-[#f8f9fa] text-[#9ca3af] text-[9px] rounded uppercase font-bold border border-[#eceff1] tracking-tight hover:bg-[#f0f2f5] transition-all"
+                                                                    >
+                                                                        Unassigned
+                                                                    </button>
+                                                                </div>
+                                                            )}
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        );
+                                    }}
+                                />
+                            ) : null}
                         </div>
-                    ))}
+                    )}
                 </div>
             </div>
 
             {selectedChatId ? (
-                <div className="flex-1 flex flex-col bg-[#f0f2f5] relative">
+                <div className="flex-1 flex flex-col min-h-0 bg-[#f0f2f5] relative overflow-hidden">
                     <div className="absolute inset-0 opacity-[0.06] pointer-events-none bg-[url('https://web.whatsapp.com/img/bg-chat-tile-light_6860a4760a595861d83d.png')] bg-repeat" />
 
-                    <header className="h-[60px] bg-[#f0f2f5] px-3 flex items-center justify-between z-10 border-l border-[#eceff1]">
+                    <header className="h-[60px] shrink-0 bg-[#f0f2f5] px-3 flex items-center justify-between z-10 border-l border-[#eceff1]">
                         <div className="flex items-center gap-3 cursor-pointer" onClick={() => setShowContactInfo(true)}>
                             <div className="w-10 h-10 rounded-full bg-white flex items-center justify-center overflow-hidden border border-[#eceff1] shadow-sm">
                                 {selectedChat?.id.endsWith('@g.us') ? (
@@ -1867,6 +2649,37 @@ export default function App() {
                                             ) : (
                                                 <span className="ml-2 text-[11px] font-medium text-[#8a9aa1]">24h: no inbound</span>
                                             )}
+                                            {ctaFreeWindowOpen && (
+                                                <span className="ml-2 text-[11px] font-bold text-[#2563eb]">
+                                                    CTA free template: {formatRemaining(ctaFreeWindowRemainingMs || 0)}
+                                                </span>
+                                            )}
+                                            <span className="ml-2 inline-block">
+                                                <button
+                                                    type="button"
+                                                    onClick={(e) => {
+                                                        e.stopPropagation();
+                                                        if (!selectedChatId) return;
+                                                        if (!teamUsers.length && !teamUsersLoading) fetchTeamUsers();
+                                                        setAssignMenuContactId(prev => (prev === selectedChatId ? null : selectedChatId));
+                                                    }}
+                                                    className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold border hover:opacity-85 transition-all"
+                                                    style={{
+                                                        backgroundColor: selectedAssigneeName
+                                                            ? withHexAlpha(selectedAssigneeColor, '20', '#f3f4f6')
+                                                            : '#f8f9fa',
+                                                        borderColor: selectedAssigneeName
+                                                            ? withHexAlpha(selectedAssigneeColor, '66', '#d1d5db')
+                                                            : '#eceff1',
+                                                        color: selectedAssigneeName
+                                                            ? textColor(selectedAssigneeColor, '#374151')
+                                                            : '#9ca3af'
+                                                    }}
+                                                >
+                                                    {selectedAssigneeInitials}
+                                                    <span>{selectedAssigneeName || 'Unassigned'}</span>
+                                                </button>
+                                            </span>
                                         </>
                                     )}
                                 </p>
@@ -1883,7 +2696,7 @@ export default function App() {
                         </div>
                     </header>
 
-                    <div className="flex-1 overflow-y-auto px-16 py-6 space-y-1 custom-scrollbar z-10 flex flex-col">
+                    <div className="flex-1 min-h-0 px-16 py-6 z-10 flex flex-col">
                         {lastProfileError && (
                             <div className="self-center sticky top-2 z-20 mb-2 flex items-center gap-3 bg-[#fff4e5] border border-[#ffd9b3] text-[#7a4b00] px-3 py-2 rounded-xl text-[11px] font-bold shadow-sm">
                                 <span className="flex-1">{lastProfileError}</span>
@@ -1895,320 +2708,396 @@ export default function App() {
                                 </button>
                             </div>
                         )}
-                        {(() => {
-                            let lastDateKey = '';
-                            return currentChatMessages.map((msg, idx) => {
-                                const msgMs = (msg.messageTimestamp || 0) * 1000;
-                                const dateKey = msgMs ? new Date(msgMs).toDateString() : '';
-                                const showDate = !!dateKey && dateKey !== lastDateKey;
-                                if (showDate) lastDateKey = dateKey;
-                                const dateLabel = showDate ? formatDateLabel(msgMs) : '';
-                                const key = msg.key.id || `${msg.key.remoteJid || 'msg'}-${idx}`;
-                                const buttonsMessage = msg.message?.buttonsMessage;
-                                const listMessage = msg.message?.listMessage;
-                                const messageText =
-                                    msg.message?.conversation ||
-                                    msg.message?.extendedTextMessage?.text ||
-                                    buttonsMessage?.contentText ||
-                                    listMessage?.description ||
-                                    '';
-                                const buttons = Array.isArray(buttonsMessage?.buttons) ? buttonsMessage?.buttons : [];
-                                const listSections = Array.isArray(listMessage?.sections) ? listMessage?.sections : [];
-
-                                return (
-                                    <React.Fragment key={key}>
-                                        {showDate && (
-                                            <div className="self-center sticky top-2 z-10 px-3 py-1 rounded-full bg-[#e9edef] text-[11px] font-bold text-[#54656f] shadow-sm border border-[#d7dfe5]">
-                                                {dateLabel}
-                                            </div>
-                                        )}
-                                        <div
-                                            className={`max-w-[85%] flex flex-col ${msg.key.fromMe ? 'self-end' : 'self-start'}`}
-                                        >
-                                            <div className={`
-                                                px-3 py-1.5 rounded-xl text-[14px] shadow-[0_1px_0.5px_rgba(0,0,0,0.1)] relative mb-1 tracking-tight
-                                                ${msg.key.fromMe ? 'bg-[#d9fdd3] text-[#111b21] rounded-tr-none' : 'bg-white text-[#111b21] rounded-tl-none'}
-                                            `}>
-                                                {messageText && (
-                                                    <p className="leading-relaxed whitespace-pre-wrap break-words pr-14">
-                                                        {messageText}
-                                                    </p>
-                                                )}
-
-                                                {buttons.length > 0 && (
-                                                    <div className="mt-2 space-y-1">
-                                                        {buttons.map((button: any, btnIdx: number) => (
-                                                            <div
-                                                                key={`${key}-btn-${btnIdx}`}
-                                                                className="px-3 py-2 rounded-lg border border-[#e2e8f0] bg-white/70 text-[13px] font-semibold text-[#111b21]"
-                                                            >
-                                                                {button?.buttonText?.displayText || button?.buttonId || `Button ${btnIdx + 1}`}
-                                                            </div>
-                                                        ))}
-                                                    </div>
-                                                )}
-                                                {buttonsMessage?.footerText && (
-                                                    <div className="mt-1 text-[11px] text-[#54656f] font-medium">
-                                                        {buttonsMessage.footerText}
-                                                    </div>
-                                                )}
-
-                                                {listMessage && (
-                                                    <div className="mt-2 space-y-2">
-                                                        {listMessage.title && (
-                                                            <div className="text-[12px] font-bold text-[#111b21]">
-                                                                {listMessage.title}
-                                                            </div>
-                                                        )}
-                                                        {listMessage.buttonText && (
-                                                            <div className="px-3 py-2 rounded-lg bg-[#f0f2f5] text-[12px] font-bold text-[#111b21] border border-[#eceff1]">
-                                                                {listMessage.buttonText}
-                                                            </div>
-                                                        )}
-                                                        {listSections.map((section: any, sectionIdx: number) => {
-                                                            const rows = Array.isArray(section?.rows) ? section.rows : [];
-                                                            return (
-                                                                <div key={`${key}-section-${sectionIdx}`} className="space-y-1">
-                                                                    {section?.title && (
-                                                                        <div className="text-[11px] font-bold uppercase tracking-tight text-[#54656f]">
-                                                                            {section.title}
-                                                                        </div>
-                                                                    )}
-                                                                    {rows.map((row: any, rowIdx: number) => (
-                                                                        <div key={`${key}-row-${sectionIdx}-${rowIdx}`} className="px-3 py-2 rounded-lg bg-white/70 border border-[#eceff1]">
-                                                                            <div className="text-[13px] font-semibold text-[#111b21]">
-                                                                                {row?.title || row?.rowId || `Option ${rowIdx + 1}`}
-                                                                            </div>
-                                                                            {row?.description && (
-                                                                                <div className="text-[11px] text-[#54656f] mt-0.5">
-                                                                                    {row.description}
-                                                                                </div>
-                                                                            )}
-                                                                        </div>
-                                                                    ))}
-                                                                </div>
-                                                            );
-                                                        })}
-                                                        {listMessage.footerText && (
-                                                            <div className="text-[11px] text-[#54656f]">
-                                                                {listMessage.footerText}
-                                                            </div>
-                                                        )}
-                                                    </div>
-                                                )}
-
-                                    {/* Media Rendering */}
-                                    {msg.message?.imageMessage && (
-                                        <div className="mt-1 mb-1 max-w-sm rounded-lg overflow-hidden cursor-pointer bg-[#fcfdfd] min-h-[100px] flex items-center justify-center relative border border-[#eceff1]">
-                                            {(() => {
-                                                const mediaId = msg.message?.imageMessage?.mediaId;
-                                                const cacheEntry = mediaCache[msg.key.id!] || (mediaId ? mediaCache[mediaId] : undefined);
-                                                return cacheEntry ? (
-                                                    <img
-                                                        src={`data:${cacheEntry.mimetype};base64,${cacheEntry.data}`}
-                                                        alt="WhatsApp Attachment"
-                                                        className="max-w-full h-auto block"
-                                                    />
-                                                ) : (
-                                                    <div className="p-4 text-center" onClick={() => handleDownloadMedia(msg)}>
-                                                        <p className="text-xs text-[#54656f] font-bold">Loading image…</p>
-                                                    </div>
-                                                );
-                                            })()}
-                                        </div>
-                                    )}
-
-                                    {msg.message?.documentMessage && (() => {
-                                        const doc = msg.message.documentMessage;
-                                        const mediaId = doc.mediaId;
-                                        const cacheEntry = mediaCache[msg.key.id!] || (mediaId ? mediaCache[mediaId] : undefined);
-                                        const docName = doc.fileName || '';
-                                        const docMime = doc.mimetype || '';
-                                        const isImageDoc = Boolean(
-                                            docMime.startsWith('image/') ||
-                                            /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(docName)
-                                        );
-
-                                        if (isImageDoc) {
+                        <div className="flex-1 min-h-0 overflow-hidden custom-scrollbar" ref={messageViewportRef}>
+                            {messageRows.length === 0 ? (
+                                <div className="h-full flex items-center justify-center text-sm text-[#8696a0]">
+                                    No messages yet.
+                                </div>
+                            ) : messageViewport.height > 0 ? (
+                                <List
+                                    listRef={messageListRef}
+                                    style={{
+                                        height: messageViewport.height,
+                                        width: messageViewport.width || '100%'
+                                    }}
+                                    rowCount={messageRows.length}
+                                    rowHeight={messageRowHeight}
+                                    rowProps={{}}
+                                    overscanCount={8}
+                                    className="custom-scrollbar"
+                                    rowComponent={(props: any) => {
+                                        const { index, style } = props as { index: number; style: React.CSSProperties };
+                                        const row = messageRows[index];
+                                        if (!row) return null;
+                                        if (row.kind === 'date') {
                                             return (
-                                                <div
-                                                    className="mt-1 mb-1 max-w-sm rounded-lg overflow-hidden cursor-pointer bg-[#fcfdfd] min-h-[100px] flex items-center justify-center relative border border-[#eceff1]"
-                                                    onClick={() => {
-                                                        if (!cacheEntry) {
-                                                            handleDownloadMedia(msg);
-                                                        }
-                                                    }}
-                                                >
-                                                    {cacheEntry ? (
-                                                        <img
-                                                            src={`data:${cacheEntry.mimetype};base64,${cacheEntry.data}`}
-                                                            alt={docName || 'Image'}
-                                                            className="max-w-full h-auto block"
-                                                        />
-                                                    ) : (
-                                                        <div className="p-4 text-center">
-                                                            <p className="text-xs text-[#54656f] font-bold">Loading image…</p>
-                                                        </div>
-                                                    )}
+                                                <div style={style} className="flex items-center justify-center">
+                                                    <div className="px-3 py-1 rounded-full bg-[#e9edef] text-[11px] font-bold text-[#54656f] shadow-sm border border-[#d7dfe5]">
+                                                        {row.label}
+                                                    </div>
                                                 </div>
                                             );
                                         }
 
-                                        return (
-                                            <div
-                                                className="mt-1 mb-1 p-3 bg-[#f8f9fa] rounded-xl flex items-center gap-3 cursor-pointer hover:bg-white transition-all border border-[#eceff1]"
-                                                onClick={() => {
-                                                    if (cacheEntry) {
-                                                        const link = document.createElement('a');
-                                                        link.href = `data:${cacheEntry.mimetype};base64,${cacheEntry.data}`;
-                                                        link.download = doc.fileName || 'document';
-                                                        link.click();
-                                                    } else {
-                                                        handleDownloadMedia(msg);
-                                                    }
-                                                }}
-                                            >
-                                                <div className="p-2 bg-[#00a884]/10 rounded-lg text-[#00a884]">
-                                                    <Paperclip className="w-5 h-5" />
-                                                </div>
-                                                <div className="flex-1 min-w-0">
-                                                    <p className="text-sm font-bold truncate text-[#111b21]">{doc.fileName || 'Document'}</p>
-                                                    <p className="text-[10px] text-[#54656f] font-bold uppercase tracking-tight">
-                                                        {Math.round((Number(doc.fileLength) || 0) / 1024)} KB • {doc.mimetype?.split('/')[1]?.toUpperCase() || 'FILE'}
-                                                    </p>
-                                                </div>
-                                            </div>
-                                        );
-                                    })()}
+                                        const msg = row.msg;
+                                        const key = row.id;
+                                        const buttonsMessage = msg.message?.buttonsMessage;
+                                        const listMessage = msg.message?.listMessage;
+                                        const messageText = getMessagePreviewText(msg);
+                                        const messageSenderName = msg.key.fromMe
+                                            ? (msg.workflowState ? 'Automation' : (msg.agent?.name || currentAgentName || 'You'))
+                                            : null;
+                                        const messageSenderColor = msg.workflowState ? '#2563eb' : (msg.agent?.color || '#6b7280');
+                                        const buttons = Array.isArray(buttonsMessage?.buttons) ? buttonsMessage?.buttons : [];
+                                        const listSections = Array.isArray(listMessage?.sections) ? listMessage?.sections : [];
 
-                                    {msg.message?.audioMessage && (() => {
-                                        const mediaId = msg.message?.audioMessage?.mediaId;
-                                        const cacheEntry = mediaCache[msg.key.id!] || (mediaId ? mediaCache[mediaId] : undefined);
                                         return (
-                                            <div className="mt-1 mb-1 p-3 bg-[#f8f9fa] rounded-xl border border-[#eceff1] w-[260px]">
-                                                {cacheEntry ? (
-                                                    <audio
-                                                        controls
-                                                        className="w-full"
-                                                        src={`data:${cacheEntry.mimetype};base64,${cacheEntry.data}`}
-                                                    />
-                                                ) : (
-                                                    <div className="text-xs text-[#54656f] font-bold">
-                                                        Loading voice note…
+                                            <div style={style} className="w-full px-1">
+                                                <div className={`w-full flex ${msg.key.fromMe ? 'justify-end' : 'justify-start'}`}>
+                                                    <div className="max-w-[85%] flex flex-col">
+                                                        <div className={`
+                                                            px-3 py-1.5 rounded-xl text-[14px] shadow-[0_1px_0.5px_rgba(0,0,0,0.1)] relative mb-1 tracking-tight
+                                                            ${msg.key.fromMe ? 'bg-[#d9fdd3] text-[#111b21] rounded-tr-none' : 'bg-white text-[#111b21] rounded-tl-none'}
+                                                        `}>
+                                                            {messageText && (
+                                                                <p className="leading-relaxed whitespace-pre-wrap break-words pr-14">
+                                                                    {messageText}
+                                                                </p>
+                                                            )}
+
+                                                            {buttons.length > 0 && (
+                                                                <div className="mt-2 space-y-1">
+                                                                    {buttons.map((button: any, btnIdx: number) => (
+                                                                        <div
+                                                                            key={`${key}-btn-${btnIdx}`}
+                                                                            className="px-3 py-2 rounded-lg border border-[#e2e8f0] bg-white/70 text-[13px] font-semibold text-[#111b21]"
+                                                                        >
+                                                                            {button?.buttonText?.displayText || button?.buttonId || `Button ${btnIdx + 1}`}
+                                                                        </div>
+                                                                    ))}
+                                                                </div>
+                                                            )}
+                                                            {buttonsMessage?.footerText && (
+                                                                <div className="mt-1 text-[11px] text-[#54656f] font-medium">
+                                                                    {buttonsMessage.footerText}
+                                                                </div>
+                                                            )}
+
+                                                            {listMessage && (
+                                                                <div className="mt-2 space-y-2">
+                                                                    {listMessage.title && (
+                                                                        <div className="text-[12px] font-bold text-[#111b21]">
+                                                                            {listMessage.title}
+                                                                        </div>
+                                                                    )}
+                                                                    {listMessage.buttonText && (
+                                                                        <div className="px-3 py-2 rounded-lg bg-[#f0f2f5] text-[12px] font-bold text-[#111b21] border border-[#eceff1]">
+                                                                            {listMessage.buttonText}
+                                                                        </div>
+                                                                    )}
+                                                                    {listSections.map((section: any, sectionIdx: number) => {
+                                                                        const rows = Array.isArray(section?.rows) ? section.rows : [];
+                                                                        return (
+                                                                            <div key={`${key}-section-${sectionIdx}`} className="space-y-1">
+                                                                                {section?.title && (
+                                                                                    <div className="text-[11px] font-bold uppercase tracking-tight text-[#54656f]">
+                                                                                        {section.title}
+                                                                                    </div>
+                                                                                )}
+                                                                                {rows.map((row: any, rowIdx: number) => (
+                                                                                    <div key={`${key}-row-${sectionIdx}-${rowIdx}`} className="px-3 py-2 rounded-lg bg-white/70 border border-[#eceff1]">
+                                                                                        <div className="text-[13px] font-semibold text-[#111b21]">
+                                                                                            {row?.title || row?.rowId || `Option ${rowIdx + 1}`}
+                                                                                        </div>
+                                                                                        {row?.description && (
+                                                                                            <div className="text-[11px] text-[#54656f] mt-0.5">
+                                                                                                {row.description}
+                                                                                            </div>
+                                                                                        )}
+                                                                                    </div>
+                                                                                ))}
+                                                                            </div>
+                                                                        );
+                                                                    })}
+                                                                    {listMessage.footerText && (
+                                                                        <div className="text-[11px] text-[#54656f]">
+                                                                            {listMessage.footerText}
+                                                                        </div>
+                                                                    )}
+                                                                </div>
+                                                            )}
+
+                                                            {msg.message?.imageMessage && (
+                                                                <div className="mt-1 mb-1 max-w-sm rounded-lg overflow-hidden cursor-pointer bg-[#fcfdfd] min-h-[100px] flex items-center justify-center relative border border-[#eceff1]">
+                                                                    {(() => {
+                                                                        const mediaId = msg.message?.imageMessage?.mediaId;
+                                                                        const cacheEntry = mediaCache[msg.key.id!] || (mediaId ? mediaCache[mediaId] : undefined);
+                                                                        return cacheEntry ? (
+                                                                            <img
+                                                                                src={`data:${cacheEntry.mimetype};base64,${cacheEntry.data}`}
+                                                                                alt="WhatsApp Attachment"
+                                                                                className="max-w-full h-auto block"
+                                                                            />
+                                                                        ) : (
+                                                                            <div className="p-4 text-center" onClick={() => handleDownloadMedia(msg)}>
+                                                                                <p className="text-xs text-[#54656f] font-bold">Loading image…</p>
+                                                                            </div>
+                                                                        );
+                                                                    })()}
+                                                                </div>
+                                                            )}
+
+                                                            {msg.message?.documentMessage && (() => {
+                                                                const doc = msg.message.documentMessage;
+                                                                const mediaId = doc.mediaId;
+                                                                const cacheEntry = mediaCache[msg.key.id!] || (mediaId ? mediaCache[mediaId] : undefined);
+                                                                const docName = doc.fileName || '';
+                                                                const docMime = doc.mimetype || '';
+                                                                const isImageDoc = Boolean(
+                                                                    docMime.startsWith('image/') ||
+                                                                    /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(docName)
+                                                                );
+
+                                                                if (isImageDoc) {
+                                                                    return (
+                                                                        <div
+                                                                            className="mt-1 mb-1 max-w-sm rounded-lg overflow-hidden cursor-pointer bg-[#fcfdfd] min-h-[100px] flex items-center justify-center relative border border-[#eceff1]"
+                                                                            onClick={() => {
+                                                                                if (!cacheEntry) {
+                                                                                    handleDownloadMedia(msg);
+                                                                                }
+                                                                            }}
+                                                                        >
+                                                                            {cacheEntry ? (
+                                                                                <img
+                                                                                    src={`data:${cacheEntry.mimetype};base64,${cacheEntry.data}`}
+                                                                                    alt={docName || 'Image'}
+                                                                                    className="max-w-full h-auto block"
+                                                                                />
+                                                                            ) : (
+                                                                                <div className="p-4 text-center">
+                                                                                    <p className="text-xs text-[#54656f] font-bold">Loading image…</p>
+                                                                                </div>
+                                                                            )}
+                                                                        </div>
+                                                                    );
+                                                                }
+
+                                                                return (
+                                                                    <div
+                                                                        className="mt-1 mb-1 p-3 bg-[#f8f9fa] rounded-xl flex items-center gap-3 cursor-pointer hover:bg-white transition-all border border-[#eceff1]"
+                                                                        onClick={() => {
+                                                                            if (cacheEntry) {
+                                                                                const link = document.createElement('a');
+                                                                                link.href = `data:${cacheEntry.mimetype};base64,${cacheEntry.data}`;
+                                                                                link.download = doc.fileName || 'document';
+                                                                                link.click();
+                                                                            } else {
+                                                                                handleDownloadMedia(msg);
+                                                                            }
+                                                                        }}
+                                                                    >
+                                                                        <div className="p-2 bg-[#00a884]/10 rounded-lg text-[#00a884]">
+                                                                            <Paperclip className="w-5 h-5" />
+                                                                        </div>
+                                                                        <div className="flex-1 min-w-0">
+                                                                            <p className="text-sm font-bold truncate text-[#111b21]">{doc.fileName || 'Document'}</p>
+                                                                            <p className="text-[10px] text-[#54656f] font-bold uppercase tracking-tight">
+                                                                                {Math.round((Number(doc.fileLength) || 0) / 1024)} KB • {doc.mimetype?.split('/')[1]?.toUpperCase() || 'FILE'}
+                                                                            </p>
+                                                                        </div>
+                                                                    </div>
+                                                                );
+                                                            })()}
+
+                                                            {msg.message?.audioMessage && (() => {
+                                                                const mediaId = msg.message?.audioMessage?.mediaId;
+                                                                const cacheEntry = mediaCache[msg.key.id!] || (mediaId ? mediaCache[mediaId] : undefined);
+                                                                return (
+                                                                    <div className="mt-1 mb-1 p-3 bg-[#f8f9fa] rounded-xl border border-[#eceff1] w-[260px]">
+                                                                        {cacheEntry ? (
+                                                                            <audio
+                                                                                controls
+                                                                                className="w-full"
+                                                                                src={`data:${cacheEntry.mimetype};base64,${cacheEntry.data}`}
+                                                                            />
+                                                                        ) : (
+                                                                            <div className="text-xs text-[#54656f] font-bold">
+                                                                                Loading voice note…
+                                                                            </div>
+                                                                        )}
+                                                                    </div>
+                                                                );
+                                                            })()}
+
+                                                            <div className="absolute bottom-1 right-2 flex items-center gap-1">
+                                                                <span className="text-[10px] text-[#54656f]/70 font-bold">
+                                                                    {msg.messageTimestamp ? new Date(msg.messageTimestamp * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false }) : ''}
+                                                                </span>
+                                                                {renderMessageStatus(msg)}
+                                                            </div>
+                                                        </div>
+                                                        {messageSenderName && (
+                                                            <div
+                                                                className="mt-0.5 px-1 text-[10px] font-medium text-right"
+                                                                style={{ color: textColor(messageSenderColor, '#6b7280') }}
+                                                            >
+                                                                {messageSenderName}
+                                                            </div>
+                                                        )}
                                                     </div>
-                                                )}
-                                            </div>
-                                        );
-                                    })()}
-
-                                                <div className="absolute bottom-1 right-2 flex items-center gap-1">
-                                                    <span className="text-[10px] text-[#54656f]/70 font-bold">
-                                                        {msg.messageTimestamp ? new Date(msg.messageTimestamp * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false }) : ''}
-                                                    </span>
-                                                    {renderMessageStatus(msg)}
                                                 </div>
                                             </div>
-                                        </div>
-                                    </React.Fragment>
-                                );
-                            });
-                        })()}
-                        <div ref={chatEndRef} />
+                                        );
+                                    }}
+                                />
+                            ) : null}
+                        </div>
                     </div>
 
-                    <footer className="bg-[#f0f2f5] px-4 py-3 flex items-center gap-2 z-10 min-h-[62px]">
-                        {canSendText ? (
-                            <>
-                                <div className="flex items-center text-[#54656f]">
-                                    <div className="p-2 hover:bg-white rounded-xl transition-all cursor-pointer"><Smile className="w-6 h-6" /></div>
-                                    <div className="p-2 hover:bg-white rounded-xl transition-all cursor-pointer"><Paperclip className="w-6 h-6 -rotate-45" /></div>
-                                </div>
-                                {workflowStarter}
-                                <div className="flex-1 mx-2 relative">
-                                    {quickReplyQuery !== null && (
-                                        <div className="absolute bottom-[58px] left-0 right-0 bg-white border border-[#eceff1] rounded-2xl shadow-xl z-20 max-h-56 overflow-y-auto">
-                                            {quickRepliesLoading ? (
-                                                <div className="px-4 py-3 text-sm text-[#54656f]">Loading quick replies…</div>
-                                            ) : quickReplySuggestions.length === 0 ? (
-                                                <div className="px-4 py-3 text-sm text-[#54656f]">No quick replies found.</div>
-                                            ) : (
-                                                quickReplySuggestions.map((item, idx) => (
-                                                    <button
-                                                        type="button"
-                                                        key={`${item.id || 'quick'}-${idx}`}
-                                                        onClick={() => handleQuickReplyPick(item)}
-                                                        className="w-full text-left px-4 py-3 hover:bg-[#f6f8f9] transition-all border-b border-[#f1f3f4] last:border-b-0"
-                                                    >
-                                                        <div className="text-xs font-bold uppercase tracking-widest text-[#00a884]">/{normalizeQuickReplyShortcut(item.shortcut)}</div>
-                                                        <div className="text-sm text-[#111b21] mt-1 max-h-10 overflow-hidden">
-                                                            {item.text}
-                                                        </div>
-                                                    </button>
-                                                ))
-                                            )}
-                                        </div>
-                                    )}
-                                    <input
-                                        ref={messageInputRef}
-                                        type="text"
-                                        placeholder="Type a message"
-                                        value={messageText}
-                                        onChange={(e) => setMessageText(e.target.value)}
-                                        onKeyDown={(e) => {
-                                            if (e.key === 'Enter') {
-                                                if (quickReplyQuery !== null && quickReplySuggestions.length > 0) {
-                                                    e.preventDefault();
-                                                    handleQuickReplyPick(quickReplySuggestions[0]);
-                                                    return;
-                                                }
-                                                handleSendMessage();
-                                            }
-                                            if (e.key === 'Tab' && quickReplyQuery !== null && quickReplySuggestions.length > 0) {
-                                                e.preventDefault();
-                                                handleQuickReplyPick(quickReplySuggestions[0]);
-                                            }
-                                        }}
-                                        className="w-full bg-white border border-[#eceff1] rounded-xl px-4 py-3 text-[15px] focus:outline-none focus:ring-1 focus:ring-[#00a884]/20 placeholder:text-[#54656f]/50 text-[#111b21]"
-                                    />
-                                </div>
-                                <div className="text-[#54656f] flex items-center">
-                                    {messageText.trim() ? (
-                                        <div onClick={handleSendMessage} className="p-3 bg-[#00a884] shadow-sm rounded-xl cursor-pointer text-white transition-transform active:scale-95"><Send className="w-5 h-5" /></div>
-                                    ) : (
-                                        <div className="p-2 hover:bg-white rounded-xl transition-all cursor-pointer"><Mic className="w-6 h-6" /></div>
-                                    )}
-                                </div>
-                            </>
-                        ) : (
-                            <div className="flex-1 flex items-center gap-3">
-                                <div className="px-3 py-2 rounded-xl bg-[#fff3e0] text-[#a16207] text-xs font-bold border border-[#fde68a]">
+                    <footer className="shrink-0 bg-[#f0f2f5] px-4 py-3 flex items-center gap-2 z-10 min-h-[62px]">
+                        <div className="flex items-center text-[#54656f]">
+                            <button type="button" className="p-2 hover:bg-white rounded-xl transition-all cursor-pointer">
+                                <Smile className="w-6 h-6" />
+                            </button>
+                            <button type="button" className="p-2 hover:bg-white rounded-xl transition-all cursor-pointer" title="Photo">
+                                <ImageIcon className="w-5 h-5" />
+                            </button>
+                            <button type="button" className="p-2 hover:bg-white rounded-xl transition-all cursor-pointer" title="Document">
+                                <FileIcon className="w-5 h-5" />
+                            </button>
+                            <button type="button" className="p-2 hover:bg-white rounded-xl transition-all cursor-pointer" title="Attachment">
+                                <Paperclip className="w-6 h-6 -rotate-45" />
+                            </button>
+                        </div>
+                        {workflowStarter}
+                        <div className="flex-1 mx-2 relative">
+                            {!canSendText && (
+                                <div className="absolute -top-8 left-0 px-3 py-1.5 rounded-lg bg-[#fff3e0] text-[#a16207] text-[11px] font-bold border border-[#fde68a]">
                                     24h window closed. Send a template.
                                 </div>
+                            )}
+                            {canSendText && quickReplyQuery !== null && (
+                                <div className="absolute bottom-[58px] left-0 right-0 bg-white border border-[#eceff1] rounded-2xl shadow-xl z-20 max-h-56 overflow-y-auto">
+                                    {quickRepliesLoading ? (
+                                        <div className="px-4 py-3 text-sm text-[#54656f]">Loading quick replies…</div>
+                                    ) : quickReplySuggestions.length === 0 ? (
+                                        <div className="px-4 py-3 text-sm text-[#54656f]">No quick replies found.</div>
+                                    ) : (
+                                        quickReplySuggestions.map((item, idx) => (
+                                            <button
+                                                type="button"
+                                                key={`${item.id || 'quick'}-${idx}`}
+                                                onClick={() => handleQuickReplyPick(item)}
+                                                className="w-full text-left px-4 py-3 hover:bg-[#f6f8f9] transition-all border-b border-[#f1f3f4] last:border-b-0"
+                                            >
+                                                <div className="text-xs font-bold uppercase tracking-widest text-[#00a884]">/{normalizeQuickReplyShortcut(item.shortcut)}</div>
+                                                <div className="text-sm text-[#111b21] mt-1 max-h-10 overflow-hidden">
+                                                    {item.text}
+                                                </div>
+                                            </button>
+                                        ))
+                                    )}
+                                </div>
+                            )}
                                 <input
+                                    ref={messageInputRef}
                                     type="text"
-                                    placeholder="Template name"
-                                    value={templateName}
-                                    onChange={(e) => setTemplateName(e.target.value)}
-                                    className="flex-1 bg-white border border-[#eceff1] rounded-xl px-3 py-2 text-xs font-bold focus:outline-none focus:ring-1 focus:ring-[#00a884]/20 text-[#111b21]"
-                                />
-                                <input
-                                    type="text"
-                                    placeholder="Language (e.g. en_US)"
-                                    value={templateLanguage}
-                                    onChange={(e) => setTemplateLanguage(e.target.value)}
-                                    className="w-40 bg-white border border-[#eceff1] rounded-xl px-3 py-2 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-[#00a884]/20 text-[#111b21]"
-                                />
-                                <input
-                                    type="text"
-                                    placeholder='Components JSON (optional)'
-                                    value={templateComponents}
-                                    onChange={(e) => setTemplateComponents(e.target.value)}
-                                    className="flex-[1.2] bg-white border border-[#eceff1] rounded-xl px-3 py-2 text-[11px] font-mono focus:outline-none focus:ring-1 focus:ring-[#00a884]/20 text-[#111b21]"
-                                />
-                                <div onClick={handleSendTemplate} className="p-3 bg-[#00a884] shadow-sm rounded-xl cursor-pointer text-white transition-transform active:scale-95"><Send className="w-5 h-5" /></div>
-                                {workflowStarter}
+                                    placeholder={canSendText ? 'Type a message' : 'Type a message (24h closed - use template)'}
+                                    value={messageText}
+                                    disabled={!canSendText}
+                                    onChange={(e) => setMessageTextWithDraft(e.target.value)}
+                                    onKeyDown={(e) => {
+                                    if (e.key === 'Enter') {
+                                        if (!canSendText) {
+                                            e.preventDefault();
+                                            setShowTemplateComposer(true);
+                                            return;
+                                        }
+                                        if (quickReplyQuery !== null && quickReplySuggestions.length > 0) {
+                                            e.preventDefault();
+                                            handleQuickReplyPick(quickReplySuggestions[0]);
+                                            return;
+                                        }
+                                        handleSendMessage();
+                                    }
+                                    if (canSendText && e.key === 'Tab' && quickReplyQuery !== null && quickReplySuggestions.length > 0) {
+                                        e.preventDefault();
+                                        handleQuickReplyPick(quickReplySuggestions[0]);
+                                    }
+                                }}
+                                className={`w-full border border-[#eceff1] rounded-xl px-4 py-3 text-[15px] focus:outline-none focus:ring-1 focus:ring-[#00a884]/20 placeholder:text-[#54656f]/50 ${canSendText ? 'bg-white text-[#111b21]' : 'bg-[#f8f9fa] text-[#9ca3af] cursor-not-allowed'}`}
+                            />
+                        </div>
+                        <div className="text-[#54656f] flex items-center gap-2">
+                            <div className="relative">
+                                <button
+                                    type="button"
+                                    onClick={() => setShowTemplateComposer(prev => !prev)}
+                                    className={`p-2 rounded-xl transition-all ${showTemplateComposer || !canSendText ? 'bg-[#00a884]/10 text-[#00a884]' : 'hover:bg-white'}`}
+                                    title="Send template message"
+                                >
+                                    <FileText className="w-5 h-5" />
+                                </button>
+                                {showTemplateComposer && (
+                                    <div className="absolute bottom-[52px] right-0 w-[460px] max-w-[90vw] bg-white border border-[#eceff1] rounded-2xl shadow-xl z-30 p-3 space-y-2">
+                                        <div className="text-[11px] font-bold uppercase tracking-widest text-[#54656f]">Send Template Message</div>
+                                        <input
+                                            type="text"
+                                            placeholder="Template name"
+                                            value={templateName}
+                                            onChange={(e) => setTemplateName(e.target.value)}
+                                            className="w-full bg-[#f8f9fa] border border-[#eceff1] rounded-xl px-3 py-2 text-xs font-bold focus:outline-none focus:ring-1 focus:ring-[#00a884]/20 text-[#111b21]"
+                                        />
+                                        <input
+                                            type="text"
+                                            placeholder="Language (e.g. en_US)"
+                                            value={templateLanguage}
+                                            onChange={(e) => setTemplateLanguage(e.target.value)}
+                                            className="w-full bg-[#f8f9fa] border border-[#eceff1] rounded-xl px-3 py-2 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-[#00a884]/20 text-[#111b21]"
+                                        />
+                                        <input
+                                            type="text"
+                                            placeholder='Components JSON (optional)'
+                                            value={templateComponents}
+                                            onChange={(e) => setTemplateComponents(e.target.value)}
+                                            className="w-full bg-[#f8f9fa] border border-[#eceff1] rounded-xl px-3 py-2 text-[11px] font-mono focus:outline-none focus:ring-1 focus:ring-[#00a884]/20 text-[#111b21]"
+                                        />
+                                        <div className="flex justify-end gap-2">
+                                            <button
+                                                type="button"
+                                                onClick={() => setShowTemplateComposer(false)}
+                                                className="px-3 py-2 rounded-xl text-xs font-bold text-[#54656f] hover:bg-[#f0f2f5]"
+                                            >
+                                                Close
+                                            </button>
+                                            <button
+                                                type="button"
+                                                onClick={handleSendTemplate}
+                                                className="px-3 py-2 rounded-xl bg-[#00a884] text-white text-xs font-bold hover:bg-[#008f6f]"
+                                            >
+                                                Send Template
+                                            </button>
+                                        </div>
+                                    </div>
+                                )}
                             </div>
-                        )}
+                            {canSendText ? (
+                                messageText.trim() ? (
+                                    <div onClick={handleSendMessage} className="p-3 bg-[#00a884] shadow-sm rounded-xl cursor-pointer text-white transition-transform active:scale-95"><Send className="w-5 h-5" /></div>
+                                ) : (
+                                    <div className="p-2 hover:bg-white rounded-xl transition-all cursor-pointer"><Mic className="w-6 h-6" /></div>
+                                )
+                            ) : (
+                                <button
+                                    type="button"
+                                    onClick={() => setShowTemplateComposer(true)}
+                                    className="px-3 py-2 rounded-xl bg-[#00a884] text-white text-xs font-bold hover:bg-[#008f6f]"
+                                >
+                                    Template
+                                </button>
+                            )}
+                        </div>
                     </footer>
 
                     {/* Contact Info Sidebar */}
@@ -2268,6 +3157,38 @@ export default function App() {
                                         </span>
                                     </div>
                                     <div className="flex flex-col gap-1 pt-3 border-t border-[#eceff1]">
+                                        <span className="text-[10px] text-[#00a884] font-bold uppercase tracking-wider">Assignee</span>
+                                        {selectedChat?.id.endsWith('@g.us') ? (
+                                            <span className="text-[13px] text-[#54656f] font-medium leading-relaxed">Group chat</span>
+                                        ) : (
+                                            <div className="w-fit">
+                                                <button
+                                                    type="button"
+                                                    onClick={() => {
+                                                        if (!selectedChatId) return;
+                                                        if (!teamUsers.length && !teamUsersLoading) fetchTeamUsers();
+                                                        setAssignMenuContactId(prev => (prev === selectedChatId ? null : selectedChatId));
+                                                    }}
+                                                    className="inline-flex w-fit items-center gap-1 px-2 py-1 rounded-full border text-[12px] font-bold hover:opacity-85 transition-all"
+                                                    style={{
+                                                        backgroundColor: selectedAssigneeName
+                                                            ? withHexAlpha(selectedAssigneeColor, '20', '#f3f4f6')
+                                                            : '#f8f9fa',
+                                                        borderColor: selectedAssigneeName
+                                                            ? withHexAlpha(selectedAssigneeColor, '66', '#d1d5db')
+                                                            : '#eceff1',
+                                                        color: selectedAssigneeName
+                                                            ? textColor(selectedAssigneeColor, '#374151')
+                                                            : '#9ca3af'
+                                                    }}
+                                                >
+                                                    {selectedAssigneeInitials}
+                                                    <span>{selectedAssigneeName || 'Unassigned'}</span>
+                                                </button>
+                                            </div>
+                                        )}
+                                    </div>
+                                    <div className="flex flex-col gap-1 pt-3 border-t border-[#eceff1]">
                                         <span className="text-[10px] text-[#00a884] font-bold uppercase tracking-wider">24h Window</span>
                                         {lastInboundMs ? (
                                             <span className="text-[13px] text-[#54656f] font-medium leading-relaxed">
@@ -2275,6 +3196,16 @@ export default function App() {
                                             </span>
                                         ) : (
                                             <span className="text-[13px] text-[#54656f] font-medium leading-relaxed">No inbound message yet</span>
+                                        )}
+                                    </div>
+                                    <div className="flex flex-col gap-1 pt-3 border-t border-[#eceff1]">
+                                        <span className="text-[10px] text-[#2563eb] font-bold uppercase tracking-wider">CTA Free Entry</span>
+                                        {ctaFreeWindowOpen ? (
+                                            <span className="text-[13px] text-[#54656f] font-medium leading-relaxed">
+                                                Active ({formatRemaining(ctaFreeWindowRemainingMs || 0)} left for free template sends)
+                                            </span>
+                                        ) : (
+                                            <span className="text-[13px] text-[#54656f] font-medium leading-relaxed">Not active</span>
                                         )}
                                     </div>
                                     <div className="flex flex-col gap-1 pt-3 border-t border-[#eceff1]">
@@ -2633,20 +3564,22 @@ export default function App() {
                                                     </div>
                                                     {workflowEditorMode === 'visual' ? (
                                                         <div className="border border-[#eceff1] rounded-2xl overflow-hidden bg-white min-h-[560px] h-[70vh]">
-                                                            <FlowCanvas
-                                                                flow={wf.builder || buildBuilderFromActions(wf.actions || [], wf.id)}
-                                                                onSave={(nextFlow) => {
-                                                                    const { actions } = buildActionsFromBuilder(nextFlow);
-                                                                    const nextWorkflows = workflows.map(item =>
-                                                                        item.id === wf.id ? { ...item, actions, builder: nextFlow } : item
-                                                                    );
-                                                                    const nextDrafts = { ...workflowDrafts, [wf.id]: JSON.stringify(actions, null, 2) };
-                                                                    setWorkflows(nextWorkflows);
-                                                                    setWorkflowDrafts(nextDrafts);
-                                                                    // Persist immediately so visual builder Save works as expected.
-                                                                    handleSaveWorkflows(nextWorkflows, nextDrafts);
-                                                                }}
-                                                            />
+                                                            <Suspense fallback={<div className="h-full flex items-center justify-center text-sm text-[#54656f]">Loading flow editor…</div>}>
+                                                                <LazyFlowCanvas
+                                                                    flow={wf.builder || buildBuilderFromActions(wf.actions || [], wf.id)}
+                                                                    onSave={(nextFlow) => {
+                                                                        const { actions } = buildActionsFromBuilder(nextFlow);
+                                                                        const nextWorkflows = workflows.map(item =>
+                                                                            item.id === wf.id ? { ...item, actions, builder: nextFlow } : item
+                                                                        );
+                                                                        const nextDrafts = { ...workflowDrafts, [wf.id]: JSON.stringify(actions, null, 2) };
+                                                                        setWorkflows(nextWorkflows);
+                                                                        setWorkflowDrafts(nextDrafts);
+                                                                        // Persist immediately so visual builder Save works as expected.
+                                                                        handleSaveWorkflows(nextWorkflows, nextDrafts);
+                                                                    }}
+                                                                />
+                                                            </Suspense>
                                                         </div>
                                                     ) : (
                                                         <div className="flex flex-col gap-2">
@@ -2706,18 +3639,43 @@ export default function App() {
                                 </button>
                             </div>
                         </header>
-                        <div className="flex-1 overflow-y-auto">
-                            <WebhookView
-                                profileId={activeProfileId || ''}
-                                sessionToken={session?.access_token || null}
-                                isAdmin={isAdmin}
-                                quickReplies={quickReplies}
-                                quickRepliesLoading={quickRepliesLoading}
-                                quickRepliesSaving={quickRepliesSaving}
-                                quickRepliesError={quickRepliesError}
-                                onRefreshQuickReplies={fetchQuickReplies}
-                                onSaveQuickReplies={saveQuickReplies}
-                            />
+                        <div className="flex-1 flex overflow-hidden">
+                            <aside className="w-64 bg-white border-r border-[#eceff1] px-5 py-6 overflow-y-auto">
+                                <p className="text-[10px] font-black uppercase tracking-widest text-[#54656f] mb-4">Settings</p>
+                                <div className="space-y-6">
+                                    {settingsNav.map(section => (
+                                        <div key={section.group}>
+                                            <p className="text-[10px] font-black uppercase tracking-widest text-[#8696a0] mb-2">{section.group}</p>
+                                            <div className="flex flex-col gap-2">
+                                                {section.items.map(item => (
+                                                    <button
+                                                        key={item.id}
+                                                        onClick={() => scrollToSettingsSection(item.id)}
+                                                        className="text-left px-3 py-2 rounded-xl text-sm font-bold text-[#111b21] hover:bg-[#f0f2f5] transition-all"
+                                                    >
+                                                        {item.label}
+                                                    </button>
+                                                ))}
+                                            </div>
+                                        </div>
+                                    ))}
+                                </div>
+                            </aside>
+                            <div className="flex-1 overflow-y-auto">
+                                <Suspense fallback={<div className="p-8 text-sm text-[#54656f]">Loading settings…</div>}>
+                                    <LazyWebhookView
+                                        profileId={activeProfileId || ''}
+                                        sessionToken={session?.access_token || null}
+                                        isAdmin={isAdmin}
+                                        quickReplies={quickReplies}
+                                        quickRepliesLoading={quickRepliesLoading}
+                                        quickRepliesSaving={quickRepliesSaving}
+                                        quickRepliesError={quickRepliesError}
+                                        onRefreshQuickReplies={fetchQuickReplies}
+                                        onSaveQuickReplies={saveQuickReplies}
+                                    />
+                                </Suspense>
+                            </div>
                         </div>
                     </div>
                 )
@@ -2837,6 +3795,48 @@ export default function App() {
             {/* Admin View is handled above - deleting redundant block if any */}
 
             <div className="fixed bottom-6 right-6 z-[200] flex flex-col items-end gap-3">
+                {import.meta.env.DEV && (
+                    <DebugButton
+                        payload={{
+                            ts: new Date().toISOString(),
+                            env: {
+                                mode: import.meta.env.MODE,
+                                socketUrl: SOCKET_URL
+                            },
+                            session: {
+                                userId: session.user.id,
+                                email: session.user.email || null,
+                                companyId:
+                                    (session.user.user_metadata as any)?.company_id ||
+                                    (session.user.app_metadata as any)?.company_id ||
+                                    null,
+                                expiresAt: session.expires_at || null,
+                                accessToken: redactSecret(session.access_token)
+                            },
+                            socket: {
+                                connected: Boolean(socket?.connected),
+                                id: socket?.id || null
+                            },
+                            state: {
+                                isAdmin,
+                                activeView,
+                                activeProfileId: activeProfileId || null,
+                                connectionStatus,
+                                selectedChatId: selectedChatId || null,
+                                windowOpen,
+                                forceTemplateMode,
+                                lastProfileError
+                            },
+                            counts: {
+                                profiles: profiles.length,
+                                chats: chatList.length,
+                                messages: allMessages.length,
+                                logs: logEntries.length
+                            },
+                            serverStats
+                        }}
+                    />
+                )}
                 {logOpen && (
                     <div className="w-[360px] max-h-[60vh] bg-white border border-[#eceff1] rounded-2xl shadow-[0_12px_40px_rgba(0,0,0,0.12)] overflow-hidden">
                         <div className="px-4 py-3 border-b border-[#eceff1] flex items-center gap-2">
@@ -2938,6 +3938,280 @@ export default function App() {
                 
                 * { font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important; }
             ` }} />
-        </div>
+                </div>
+            ) : workspaceSection === 'broadcast' ? (
+                <div className="h-screen pt-[72px] bg-[#f1f3f6] text-[#111b21] font-sans">
+                    <div className="h-full flex">
+                        <aside className="w-72 bg-white border-r border-[#eceff1] p-5">
+                            <div className="mb-4">
+                                <h2 className="text-xl font-black text-[#111b21]">Broadcast</h2>
+                                <p className="text-xs text-[#6b7280] mt-1">Campaign and template workspace</p>
+                            </div>
+                            <div className="space-y-2">
+                                {broadcastNav.map((item) => (
+                                    <button
+                                        key={item.id}
+                                        onClick={() => setBroadcastSection(item.id)}
+                                        className={`w-full text-left px-3 py-2.5 rounded-xl text-sm font-bold transition-all ${broadcastSection === item.id
+                                            ? 'bg-[#00a884]/10 text-[#00a884]'
+                                            : 'text-[#111b21] hover:bg-[#f3f4f6]'
+                                            }`}
+                                    >
+                                        {item.label}
+                                    </button>
+                                ))}
+                            </div>
+                        </aside>
+
+                        <main className="flex-1 overflow-hidden">
+                            {broadcastSection === 'template-library' && (
+                                <Suspense fallback={<div className="p-8 text-sm text-[#54656f]">Loading template builder…</div>}>
+                                    <LazyBroadcastTemplateBuilder
+                                        profileId={activeProfileId || ''}
+                                        sessionToken={session?.access_token || null}
+                                        onClose={() => setBroadcastSection('my-templates')}
+                                        embedded
+                                    />
+                                </Suspense>
+                            )}
+                            {broadcastSection === 'my-templates' && (
+                                <Suspense fallback={<div className="p-8 text-sm text-[#54656f]">Loading templates…</div>}>
+                                    <LazyBroadcastTemplatesList
+                                        profileId={activeProfileId || ''}
+                                        sessionToken={session?.access_token || null}
+                                        title="My Templates"
+                                    />
+                                </Suspense>
+                            )}
+                            {broadcastSection === 'broadcast-history' && (
+                                <div className="h-full p-6 overflow-y-auto custom-scrollbar">
+                                    <div className="bg-white rounded-3xl border border-[#eceff1] p-8 shadow-[0_10px_30px_rgba(0,0,0,0.05)]">
+                                        <h3 className="text-2xl font-black text-[#111b21] mb-2">Broadcast History</h3>
+                                        <p className="text-sm text-[#54656f]">
+                                            Broadcast send logs will appear here once you start campaigns.
+                                        </p>
+                                    </div>
+                                </div>
+                            )}
+                            {broadcastSection === 'scheduled-broadcasts' && (
+                                <div className="h-full p-6 overflow-y-auto custom-scrollbar">
+                                    <div className="bg-white rounded-3xl border border-[#eceff1] p-8 shadow-[0_10px_30px_rgba(0,0,0,0.05)]">
+                                        <h3 className="text-2xl font-black text-[#111b21] mb-2">Scheduled Broadcasts</h3>
+                                        <p className="text-sm text-[#54656f]">
+                                            Upcoming scheduled broadcasts will appear here.
+                                        </p>
+                                    </div>
+                                </div>
+                            )}
+                        </main>
+                    </div>
+                </div>
+            ) : workspaceSection === 'contacts' ? (
+                <div className="h-screen pt-[72px] bg-[#f8f9fa] text-[#111b21] font-sans">
+                    <div className="h-full flex flex-col p-6 gap-4 overflow-hidden">
+                        <div className="bg-white border border-[#eceff1] rounded-3xl p-5 shadow-[0_10px_30px_rgba(0,0,0,0.05)]">
+                            <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+                                <div>
+                                    <h2 className="text-2xl font-black text-[#111b21]">Saved Contacts</h2>
+                                    <p className="text-sm text-[#54656f] mt-1">
+                                        New contacts are auto-saved when messages are received or sent.
+                                    </p>
+                                    <p className="text-[11px] text-[#8696a0] mt-1">
+                                        {teamUsersLoading ? 'Loading staff…' : `${teamUsers.length} staff available for assignment`}
+                                    </p>
+                                </div>
+                                <div className="w-full md:w-[360px] bg-[#f0f2f5] rounded-xl flex items-center px-4 py-2.5 focus-within:bg-white focus-within:ring-1 focus-within:ring-[#00a884]/20 transition-all">
+                                    <Search className="w-4 h-4 text-[#54656f] mr-3" />
+                                    <input
+                                        type="text"
+                                        placeholder="Search contact, phone or tag"
+                                        value={contactsSearchQuery}
+                                        onChange={(e) => setContactsSearchQuery(e.target.value)}
+                                        className="bg-transparent border-none text-[14px] w-full focus:outline-none placeholder:text-[#54656f]"
+                                    />
+                                </div>
+                            </div>
+                        </div>
+
+                        <div className="flex-1 min-h-0 bg-white border border-[#eceff1] rounded-3xl shadow-[0_10px_30px_rgba(0,0,0,0.05)] overflow-hidden">
+                            {contactsList.length === 0 ? (
+                                <div className="h-full flex flex-col items-center justify-center text-center px-6">
+                                    <Users className="w-12 h-12 text-[#aebac1] mb-3" />
+                                    <p className="text-[#111b21] font-bold">No saved contacts</p>
+                                    <p className="text-sm text-[#8696a0] mt-1">
+                                        Contacts will appear here automatically when conversations happen.
+                                    </p>
+                                </div>
+                            ) : (
+                                <div className="h-full overflow-y-auto custom-scrollbar">
+                                    <div className="grid grid-cols-[minmax(260px,1.5fr)_minmax(180px,1fr)_120px_140px_190px_120px] sticky top-0 z-10 bg-[#f8f9fa] border-b border-[#eceff1] text-[10px] font-black uppercase tracking-widest text-[#54656f]">
+                                        <div className="px-4 py-3">Contact</div>
+                                        <div className="px-4 py-3">Tags</div>
+                                        <div className="px-4 py-3">Messages</div>
+                                        <div className="px-4 py-3">Assignee</div>
+                                        <div className="px-4 py-3">Last Inbound</div>
+                                        <div className="px-4 py-3">Action</div>
+                                    </div>
+                                    {contactsList.map((row) => (
+                                        <div key={row.id} className="grid grid-cols-[minmax(260px,1.5fr)_minmax(180px,1fr)_120px_140px_190px_120px] border-b border-[#f0f2f5] hover:bg-[#fcfdfd] transition-colors">
+                                            <div className="px-4 py-3 min-w-0">
+                                                <div className="font-bold text-[#111b21] truncate">{row.name}</div>
+                                                <div className="text-[12px] text-[#00a884] font-bold mt-0.5">{row.phone}</div>
+                                            </div>
+                                            <div className="px-4 py-3 min-w-0">
+                                                {row.tags.length === 0 ? (
+                                                    <span className="text-[12px] text-[#9ca3af]">-</span>
+                                                ) : (
+                                                    <div className="flex flex-wrap gap-1">
+                                                        {row.tags.slice(0, 3).map((tag) => (
+                                                            <span key={tag} className="px-2 py-0.5 rounded-full bg-[#f0f2f5] border border-[#eceff1] text-[10px] font-bold text-[#54656f]">
+                                                                {tag}
+                                                            </span>
+                                                        ))}
+                                                        {row.tags.length > 3 && (
+                                                            <span className="text-[11px] text-[#8696a0] font-bold">+{row.tags.length - 3}</span>
+                                                        )}
+                                                    </div>
+                                                )}
+                                            </div>
+                                            <div className="px-4 py-3 text-[13px] font-bold text-[#111b21]">{row.totalMessages}</div>
+                                            <div className="px-4 py-3 min-w-0">
+                                                <button
+                                                    type="button"
+                                                    onClick={() => {
+                                                        if (!teamUsers.length && !teamUsersLoading) fetchTeamUsers();
+                                                        setAssignMenuContactId(prev => (prev === row.id ? null : row.id));
+                                                    }}
+                                                    disabled={assigningContactId === row.id}
+                                                    className="inline-flex max-w-full items-center gap-1 px-2 py-1 rounded-full border text-[10px] font-bold hover:opacity-85 transition-all disabled:opacity-60"
+                                                    style={{
+                                                        backgroundColor: row.assigneeName
+                                                            ? withHexAlpha(row.assigneeColor, '20', '#f3f4f6')
+                                                            : '#f8f9fa',
+                                                        borderColor: row.assigneeName
+                                                            ? withHexAlpha(row.assigneeColor, '66', '#d1d5db')
+                                                            : '#eceff1',
+                                                        color: row.assigneeName
+                                                            ? textColor(row.assigneeColor, '#374151')
+                                                            : '#9ca3af'
+                                                    }}
+                                                >
+                                                    <span>{getInitials(row.assigneeName || 'Unassigned')}</span>
+                                                    <span className="truncate">{row.assigneeName || 'Unassigned'}</span>
+                                                </button>
+                                            </div>
+                                            <div className="px-4 py-3 text-[12px] text-[#54656f] font-medium">
+                                                {row.lastInboundAt ? new Date(row.lastInboundAt).toLocaleString() : '-'}
+                                            </div>
+                                            <div className="px-4 py-3">
+                                                <button
+                                                    onClick={() => {
+                                                        setSelectedChatId(row.id);
+                                                        setWorkspaceSection('team-inbox');
+                                                    }}
+                                                    className="px-3 py-1.5 rounded-lg bg-[#00a884] text-white text-[10px] font-bold uppercase tracking-wider hover:bg-[#008f6f] transition-all"
+                                                >
+                                                    Open Chat
+                                                </button>
+                                            </div>
+                                        </div>
+                                    ))}
+                                </div>
+                            )}
+                        </div>
+                    </div>
+                </div>
+            ) : (
+                <div className="h-screen pt-[72px] bg-[#f8f9fa] text-[#111b21] font-sans">
+                    <div className="h-full flex items-center justify-center p-6">
+                        <div className="w-full max-w-xl bg-white border border-[#eceff1] rounded-3xl p-8 shadow-[0_12px_40px_rgba(0,0,0,0.06)]">
+                            <h2 className="text-2xl font-black text-[#111b21] mb-3">{activeWorkspaceLabel}</h2>
+                            <p className="text-sm text-[#54656f] leading-relaxed mb-6">
+                                This section is not enabled yet. Open Team Inbox to continue using the current interface.
+                            </p>
+                            <button
+                                onClick={() => setWorkspaceSection('team-inbox')}
+                                className="px-5 py-3 rounded-xl bg-[#00a884] text-white text-sm font-bold hover:bg-[#008f6f] transition-all"
+                            >
+                                Open Team Inbox
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {assignMenuContactId && !assignMenuContactId.endsWith('@g.us') && (
+                <div
+                    className="fixed inset-0 z-[260] bg-black/30 backdrop-blur-[1px] flex items-center justify-center p-4"
+                    onClick={() => setAssignMenuContactId(null)}
+                >
+                    <div
+                        className="w-full max-w-md bg-white border border-[#eceff1] rounded-2xl shadow-[0_18px_60px_rgba(0,0,0,0.2)] overflow-hidden"
+                        onClick={(e) => e.stopPropagation()}
+                    >
+                        <div className="px-4 py-3 border-b border-[#eceff1] flex items-center gap-3">
+                            <div className="w-9 h-9 rounded-full bg-[#f0f2f5] border border-[#eceff1] flex items-center justify-center">
+                                <User className="w-4 h-4 text-[#54656f]" />
+                            </div>
+                            <div className="flex-1 min-w-0">
+                                <div className="text-sm font-bold text-[#111b21] truncate">{assignTargetName || 'Contact'}</div>
+                                <div className="text-[11px] text-[#00a884] font-bold">{assignTargetPhone || '-'}</div>
+                            </div>
+                            <button
+                                type="button"
+                                onClick={() => setAssignMenuContactId(null)}
+                                className="p-1.5 rounded-lg text-[#8696a0] hover:bg-[#f0f2f5] hover:text-[#111b21]"
+                            >
+                                <X className="w-4 h-4" />
+                            </button>
+                        </div>
+
+                        <div className="px-4 py-3 border-b border-[#eceff1] text-[12px] text-[#54656f]">
+                            Current assignee:{' '}
+                            <span className="font-bold text-[#111b21]">
+                                {assignTargetContact?.assigneeName || 'Unassigned'}
+                            </span>
+                        </div>
+
+                        <div className="max-h-[52vh] overflow-y-auto custom-scrollbar p-2">
+                            <button
+                                type="button"
+                                onClick={() => handleAssignContact(assignMenuContactId, null)}
+                                disabled={assigningContactId === assignMenuContactId}
+                                className={`w-full text-left px-3 py-2 rounded-xl text-[12px] font-bold transition-all ${!assignTargetAssigneeUserId ? 'bg-[#f8f9fa] text-[#111b21]' : 'hover:bg-[#f8f9fa] text-[#6b7280]'} disabled:opacity-60`}
+                            >
+                                Unassign
+                            </button>
+                            <div className="h-px bg-[#f0f2f5] my-2" />
+                            {teamUsersLoading && teamUsers.length === 0 ? (
+                                <div className="px-3 py-3 text-[12px] text-[#9ca3af]">Loading staff…</div>
+                            ) : teamUsers.length === 0 ? (
+                                <div className="px-3 py-3 text-[12px] text-[#9ca3af]">No staff found</div>
+                            ) : (
+                                teamUsers.map((member) => {
+                                    const active = assignTargetAssigneeUserId === member.id;
+                                    return (
+                                        <button
+                                            key={`assign-modal-${assignMenuContactId}-${member.id}`}
+                                            type="button"
+                                            onClick={() => handleAssignContact(assignMenuContactId, member.id)}
+                                            disabled={assigningContactId === assignMenuContactId}
+                                            className={`w-full text-left px-3 py-2 rounded-xl text-[12px] font-semibold hover:bg-[#f8f9fa] transition-all disabled:opacity-60 ${active ? 'bg-[#f0f7ff]' : ''}`}
+                                        >
+                                            <span
+                                                className="inline-block w-2 h-2 rounded-full mr-2 align-middle"
+                                                style={{ backgroundColor: member.color || '#6b7280' }}
+                                            />
+                                            <span className="align-middle">{member.name}</span>
+                                            <span className="ml-2 text-[10px] uppercase tracking-wide text-[#9ca3af]">{member.role}</span>
+                                        </button>
+                                    );
+                                })
+                            )}
+                        </div>
+                    </div>
+                </div>
+            )}
+        </>
     );
 }

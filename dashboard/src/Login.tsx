@@ -1,6 +1,8 @@
 
 import React, { useState, useEffect } from 'react'
+import type { Session } from '@supabase/supabase-js'
 import { supabase } from './supabase'
+import DebugButton from './DebugButton'
 import {
     MessageSquare,
     Zap,
@@ -12,7 +14,7 @@ import {
     CheckCircle2
 } from 'lucide-react'
 
-export default function Login({ onLogin }: { onLogin: () => void }) {
+export default function Login({ onLogin }: { onLogin: (session: Session) => void }) {
     const [loading, setLoading] = useState(false)
     const [email, setEmail] = useState('')
     const [password, setPassword] = useState('')
@@ -32,33 +34,29 @@ export default function Login({ onLogin }: { onLogin: () => void }) {
 
         try {
             const trimmedCompany = companyId.trim()
+            const normalizeCompanyId = (value: string) => value.trim().toLowerCase()
             if (!trimmedCompany) {
                 throw new Error('Company ID is required.')
             }
             if (mode === 'signup') {
-                const { error } = await supabase.auth.signUp({
-                    email,
-                    password,
-                    options: {
-                        data: { company_id: trimmedCompany }
-                    }
-                })
-                if (error) throw error
-                setMsg('Success! Check your email for confirmation link.')
+                throw new Error('Self-signup is disabled. Ask your admin to invite you from Team Users settings.')
             } else {
                 const { data, error } = await supabase.auth.signInWithPassword({ email, password })
                 if (error) throw error
-                const metaCompany = data?.user?.user_metadata?.company_id || data?.user?.app_metadata?.company_id
+                if (!data?.session || !data?.user) {
+                    throw new Error('Login succeeded but no session was created. Please confirm your email or disable email confirmations in Supabase Auth settings.')
+                }
+                const metaCompany = data.user.user_metadata?.company_id || data.user.app_metadata?.company_id
                 if (!metaCompany) {
                     const { error: updateError } = await supabase.auth.updateUser({
                         data: { company_id: trimmedCompany }
                     })
                     if (updateError) throw updateError
-                } else if (metaCompany !== trimmedCompany) {
+                } else if (normalizeCompanyId(metaCompany) !== normalizeCompanyId(trimmedCompany)) {
                     await supabase.auth.signOut()
-                    throw new Error('Company ID does not match this account.')
+                    throw new Error(`Company ID does not match this account. Use "${metaCompany}".`)
                 }
-                onLogin()
+                onLogin(data.session)
             }
         } catch (error: any) {
             setMsg(error.message)
@@ -169,7 +167,7 @@ export default function Login({ onLogin }: { onLogin: () => void }) {
                                 onClick={() => setMode('signup')}
                                 className={`flex-1 py-3 rounded-xl text-sm font-bold transition-all duration-300 ${mode === 'signup' ? 'bg-white text-[#00a884] shadow-sm' : 'text-[#54656f] hover:text-[#111b21]'}`}
                             >
-                                Sign Up
+                                Invite Only
                             </button>
                         </div>
 
@@ -239,6 +237,32 @@ export default function Login({ onLogin }: { onLogin: () => void }) {
                     </p>
                 </div>
             </div>
+
+            {import.meta.env.DEV && (
+                <div className="fixed bottom-6 right-6 z-[200] flex flex-col items-end gap-3">
+                    <DebugButton
+                        payload={{
+                            ts: new Date().toISOString(),
+                            env: {
+                                mode: import.meta.env.MODE,
+                                socketUrl: import.meta.env.VITE_SOCKET_URL || 'http://localhost:3000'
+                            },
+                            supabase: {
+                                url: (supabase as any)?.supabaseUrl || import.meta.env.VITE_SUPABASE_URL || 'unknown'
+                            },
+                            auth: {
+                                mode,
+                                loading,
+                                email,
+                                companyId,
+                                hasPassword: Boolean(password)
+                            },
+                            lastMessage: msg || null,
+                            location: typeof window !== 'undefined' ? window.location.href : null
+                        }}
+                    />
+                </div>
+            )}
 
             <style dangerouslySetInnerHTML={{
                 __html: `

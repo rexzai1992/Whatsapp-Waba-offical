@@ -1,9 +1,16 @@
+import crypto from 'crypto'
+
 const DEFAULT_API_VERSION = process.env.WABA_API_VERSION || 'v19.0'
 
 export type GraphTokenResponse = {
     access_token: string
     token_type?: string
     expires_in?: number
+}
+
+export type GraphClientBusinessResponse = {
+    client_business_id?: string
+    id?: string
 }
 
 export type GraphListResponse<T> = {
@@ -102,6 +109,47 @@ export async function exchangeForLongLivedToken(params: {
     })
 
     return graphRequest(url, { method: 'GET' })
+}
+
+export async function fetchClientBusinessId(accessToken: string, apiVersion?: string) {
+    return graphRequest('me', {
+        apiVersion,
+        accessToken,
+        params: { fields: 'client_business_id' }
+    }) as Promise<GraphClientBusinessResponse>
+}
+
+function buildAppSecretProof(accessToken: string, appSecret: string) {
+    return crypto.createHmac('sha256', appSecret).update(accessToken).digest('hex')
+}
+
+export async function fetchBusinessIntegrationSystemUserToken(params: {
+    clientBusinessId: string
+    accessToken: string
+    appSecret: string
+    apiVersion?: string
+    fetchOnly?: boolean
+    systemUserId?: string
+    assetIds?: string[]
+    scopeIds?: string[]
+    expiresIn60Days?: boolean
+}): Promise<GraphTokenResponse> {
+    const query: Record<string, string> = {
+        access_token: params.accessToken,
+        appsecret_proof: buildAppSecretProof(params.accessToken, params.appSecret)
+    }
+
+    if (params.fetchOnly) query.fetch_only = 'true'
+    if (params.systemUserId) query.system_user_id = params.systemUserId
+    if (params.assetIds && params.assetIds.length) query.asset = params.assetIds.join(',')
+    if (params.scopeIds && params.scopeIds.length) query.scope = params.scopeIds.join(',')
+    if (params.expiresIn60Days) query.set_token_expires_in_60_days = 'true'
+
+    return graphRequest(`${params.clientBusinessId}/system_user_access_tokens`, {
+        apiVersion: params.apiVersion,
+        method: 'POST',
+        params: query
+    }) as Promise<GraphTokenResponse>
 }
 
 export async function fetchBusinesses(accessToken: string, apiVersion?: string) {

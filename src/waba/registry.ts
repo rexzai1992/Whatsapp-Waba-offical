@@ -11,6 +11,7 @@ type WabaConfigRow = {
     app_id?: string | null
     phone_number_id?: string
     business_id?: string | null
+    client_business_id?: string | null
     waba_id?: string | null
     business_account_id?: string | null
     access_token?: string
@@ -35,6 +36,9 @@ function rowToConfig(row: WabaConfigRow | null): WabaConfig | null {
     const apiVersion = row.api_version || DEFAULT_API_VERSION
     const wabaId = row.waba_id || row.business_account_id || undefined
     const rawToken = row.system_user_token || row.access_token
+    const tokenSource = row.system_user_token
+        ? ((row.token_source as WabaConfig['tokenSource'] | null) || 'system_user')
+        : ((row.token_source as WabaConfig['tokenSource'] | null) || 'user')
 
     if (!row.phone_number_id || !rawToken || !verifyToken) return null
 
@@ -52,12 +56,13 @@ function rowToConfig(row: WabaConfigRow | null): WabaConfig | null {
         appId: appId || undefined,
         phoneNumberId: row.phone_number_id,
         businessId: row.business_id || undefined,
+        clientBusinessId: row.client_business_id || undefined,
         wabaId,
         businessAccountId: wabaId,
         accessToken,
         accessTokenType: row.access_token_type || undefined,
         accessTokenExpiresAt: row.access_token_expires_at || null,
-        tokenSource: row.system_user_token ? 'system_user' : (row.token_source as 'user' | 'system_user' | null) || undefined,
+        tokenSource,
         verifyToken,
         appSecret: appSecret || undefined,
         apiVersion,

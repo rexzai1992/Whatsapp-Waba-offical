@@ -1,5 +1,5 @@
 import type { WabaClient } from '../waba/client'
-import { findOrCreateUser, getCompanyFallbackSettings, getLastMessage, getWorkflowById, getWorkflows, insertMessage, updateMessageWorkflowState, updateUserLastInbound, updateUserTags } from '../services/wa-store'
+import { extractCtaReferralSource, findOrCreateUser, getCompanyFallbackSettings, getLastMessage, getWorkflowById, getWorkflows, insertMessage, updateMessageWorkflowState, updateUserCtaReferral, updateUserLastInbound, updateUserTags } from '../services/wa-store'
 import type { User } from '../services/wa-store'
 import { sendWhatsAppMessage } from '../services/whatsapp'
 import type { WorkflowAction, WorkflowState } from './types'
@@ -21,6 +21,16 @@ export type InboundContext = {
         file_size?: number
     }
     raw?: any
+}
+
+function extractInboundReferral(raw: any): any | null {
+    if (raw && typeof raw === 'object') {
+        if (raw.referral && typeof raw.referral === 'object') return raw.referral
+        if (raw.context && typeof raw.context === 'object' && raw.context.referral && typeof raw.context.referral === 'object') {
+            return raw.context.referral
+        }
+    }
+    return null
 }
 
 function normalizeText(text?: string) {
@@ -106,10 +116,19 @@ export class WorkflowEngine {
         if (!user) return {}
 
         const inboundTimestamp = ctx.raw?.timestamp ? Number(ctx.raw.timestamp) * 1000 : null
+        const inboundIso = inboundTimestamp && !Number.isNaN(inboundTimestamp)
+            ? new Date(inboundTimestamp).toISOString()
+            : new Date().toISOString()
         if (inboundTimestamp && !Number.isNaN(inboundTimestamp)) {
-            await updateUserLastInbound(user.id, new Date(inboundTimestamp).toISOString())
+            await updateUserLastInbound(user.id, inboundIso)
         } else {
             await updateUserLastInbound(user.id)
+        }
+
+        const referral = extractInboundReferral(ctx.raw)
+        if (referral) {
+            const referralSource = extractCtaReferralSource(referral)
+            await updateUserCtaReferral(user.id, inboundIso, referralSource)
         }
 
         const lastMessage = await getLastMessage(user.id)
@@ -129,6 +148,7 @@ export class WorkflowEngine {
                 caption: ctx.media?.caption,
                 filename: ctx.media?.filename,
                 file_size: ctx.media?.file_size,
+                referral: referral || null,
                 raw: ctx.raw
             },
             workflowState: currentState

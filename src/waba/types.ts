@@ -4,12 +4,13 @@ export type WabaConfig = {
     appId?: string
     phoneNumberId: string
     businessId?: string
+    clientBusinessId?: string
     wabaId?: string
     businessAccountId?: string
     accessToken: string
     accessTokenType?: string
     accessTokenExpiresAt?: string | null
-    tokenSource?: 'user' | 'system_user'
+    tokenSource?: 'user' | 'system_user' | 'business_integration'
     verifyToken: string
     appSecret?: string
     apiVersion: string
@@ -44,6 +45,19 @@ export type WabaInboundMessage = {
     document?: WabaMedia
     audio?: WabaMedia
     video?: WabaMedia
+    referral?: {
+        source_url?: string
+        source_type?: string
+        source_id?: string
+        headline?: string
+        body?: string
+        media_type?: string
+        image_url?: string
+        video_url?: string
+        thumbnail_url?: string
+        ctwa_clid?: string
+        [key: string]: any
+    } | null
     contactName?: string
     buttonReplyId?: string
     buttonReplyTitle?: string

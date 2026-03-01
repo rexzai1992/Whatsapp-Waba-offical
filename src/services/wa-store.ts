@@ -16,6 +16,14 @@ export type User = {
     tags?: string[] | null
     last_inbound_at?: string | null
     last_window_reminder_at?: string | null
+    assigned_to_user_id?: string | null
+    assigned_to_name?: string | null
+    assigned_to_color?: string | null
+    assigned_at?: string | null
+    cta_referral_at?: string | null
+    cta_referral_source?: string | null
+    cta_free_window_started_at?: string | null
+    cta_free_window_expires_at?: string | null
 }
 
 export type MessageRecord = {
@@ -26,6 +34,9 @@ export type MessageRecord = {
     workflow_state: any | null
     created_at: string
 }
+
+const CTA_REPLY_WINDOW_MS = 24 * 60 * 60 * 1000
+const CTA_FREE_WINDOW_MS = 72 * 60 * 60 * 1000
 
 export function normalizePhoneNumber(input: string | null | undefined): string {
     if (!input) return ''
@@ -186,6 +197,133 @@ export async function getUserByPhone(companyId: string, phoneNumber: string): Pr
     return exact as User
 }
 
+export async function getUserById(userId: string): Promise<User | null> {
+    if (!userId) return null
+    const { data, error } = await supabase
+        .from('users')
+        .select('*')
+        .eq('id', userId)
+        .maybeSingle()
+
+    if (error) {
+        console.warn('[DB] Failed to fetch user by id:', error.message)
+        return null
+    }
+
+    return (data || null) as User | null
+}
+
+function toIsoOrNow(value?: string | null): string {
+    if (!value) return new Date().toISOString()
+    const parsed = new Date(value).getTime()
+    if (Number.isNaN(parsed)) return new Date().toISOString()
+    return new Date(parsed).toISOString()
+}
+
+export function extractCtaReferralSource(referral: any): string | null {
+    if (!referral || typeof referral !== 'object') return null
+    const sourceId = typeof referral.source_id === 'string' ? referral.source_id.trim() : ''
+    const sourceType = typeof referral.source_type === 'string' ? referral.source_type.trim() : ''
+    const ctwaClid = typeof referral.ctwa_clid === 'string' ? referral.ctwa_clid.trim() : ''
+    if (sourceType && sourceId) return `${sourceType}:${sourceId}`
+    if (sourceId) return sourceId
+    if (ctwaClid) return ctwaClid
+    return sourceType || null
+}
+
+export async function updateUserCtaReferral(
+    userId: string,
+    referralAt?: string | null,
+    referralSource?: string | null
+): Promise<void> {
+    if (!userId) return
+    const timestamp = toIsoOrNow(referralAt)
+    const { error } = await supabase
+        .from('users')
+        .update({
+            cta_referral_at: timestamp,
+            cta_referral_source: referralSource || null,
+            cta_free_window_started_at: null,
+            cta_free_window_expires_at: null
+        })
+        .eq('id', userId)
+
+    if (error) {
+        console.warn('[DB] Failed to update CTA referral state:', error.message)
+    }
+}
+
+export async function shouldMarkCtaReplyCandidate(userId: string, sentAt?: string | null): Promise<boolean> {
+    if (!userId) return false
+    const user = await getUserById(userId)
+    if (!user?.cta_referral_at) return false
+
+    const sentTime = new Date(toIsoOrNow(sentAt)).getTime()
+    const referralTime = new Date(user.cta_referral_at).getTime()
+    if (Number.isNaN(sentTime) || Number.isNaN(referralTime)) return false
+
+    // If free window already started for this referral, no need to mark again.
+    if (user.cta_free_window_started_at) {
+        const started = new Date(user.cta_free_window_started_at).getTime()
+        if (!Number.isNaN(started) && started >= referralTime) {
+            return false
+        }
+    }
+
+    return sentTime <= referralTime + CTA_REPLY_WINDOW_MS
+}
+
+export async function activateUserCtaFreeWindow(
+    userId: string,
+    deliveredAt?: string | null
+): Promise<{ startedAt: string; expiresAt: string } | null> {
+    if (!userId) return null
+    const user = await getUserById(userId)
+    if (!user?.cta_referral_at) return null
+
+    const startedAt = toIsoOrNow(deliveredAt)
+    const startedMs = new Date(startedAt).getTime()
+    const referralMs = new Date(user.cta_referral_at).getTime()
+    if (Number.isNaN(startedMs) || Number.isNaN(referralMs)) return null
+
+    // Keep idempotent for the same referral cycle.
+    if (user.cta_free_window_started_at) {
+        const existingStartedMs = new Date(user.cta_free_window_started_at).getTime()
+        if (!Number.isNaN(existingStartedMs) && existingStartedMs >= referralMs) {
+            const existingExpires = user.cta_free_window_expires_at || new Date(existingStartedMs + CTA_FREE_WINDOW_MS).toISOString()
+            return {
+                startedAt: user.cta_free_window_started_at,
+                expiresAt: existingExpires
+            }
+        }
+    }
+
+    const expiresAt = new Date(startedMs + CTA_FREE_WINDOW_MS).toISOString()
+    const { error } = await supabase
+        .from('users')
+        .update({
+            cta_free_window_started_at: startedAt,
+            cta_free_window_expires_at: expiresAt
+        })
+        .eq('id', userId)
+
+    if (error) {
+        console.warn('[DB] Failed to activate CTA free window:', error.message)
+        return null
+    }
+
+    return { startedAt, expiresAt }
+}
+
+export async function getCtaFreeWindowExpiresAt(userId: string): Promise<string | null> {
+    const user = await getUserById(userId)
+    if (!user?.cta_free_window_expires_at) return null
+    const expiresMs = new Date(user.cta_free_window_expires_at).getTime()
+    if (Number.isNaN(expiresMs)) return null
+    if (expiresMs <= Date.now()) return null
+    return user.cta_free_window_expires_at
+}
+
 export async function deleteMessagesForUser(userId: string): Promise<boolean> {
     const { error } = await supabase
         .from('messages')
@@ -250,6 +388,73 @@ export async function updateUserName(userId: string, name: string): Promise<void
     if (error) {
         console.warn('[DB] Failed to update user name:', error.message)
     }
+}
+
+export async function assignUserToAgentIfUnassigned(
+    userId: string,
+    agent: { userId: string; name: string; color: string }
+): Promise<User | null> {
+    if (!userId || !agent?.userId) return getUserById(userId)
+    const agentName = (agent.name || '').trim() || agent.userId
+    const agentColor = (agent.color || '').trim() || '#6b7280'
+    const assignedAt = new Date().toISOString()
+
+    const { data, error } = await supabase
+        .from('users')
+        .update({
+            assigned_to_user_id: agent.userId,
+            assigned_to_name: agentName,
+            assigned_to_color: agentColor,
+            assigned_at: assignedAt
+        })
+        .eq('id', userId)
+        .is('assigned_to_user_id', null)
+        .select('*')
+        .maybeSingle()
+
+    if (error) {
+        console.warn('[DB] Failed to assign user to agent:', error.message)
+        return null
+    }
+
+    if (data) return data as User
+    return getUserById(userId)
+}
+
+export async function setUserAssignee(
+    userId: string,
+    agent: { userId: string; name?: string; color?: string } | null
+): Promise<User | null> {
+    if (!userId) return null
+
+    const updates = agent?.userId
+        ? {
+            assigned_to_user_id: agent.userId,
+            assigned_to_name: (agent.name || '').trim() || agent.userId,
+            assigned_to_color: (agent.color || '').trim() || '#6b7280',
+            assigned_at: new Date().toISOString()
+        }
+        : {
+            assigned_to_user_id: null,
+            assigned_to_name: null,
+            assigned_to_color: null,
+            assigned_at: null
+        }
+
+    const { data, error } = await supabase
+        .from('users')
+        .update(updates)
+        .eq('id', userId)
+        .select('*')
+        .maybeSingle()
+
+    if (error) {
+        console.warn('[DB] Failed to set user assignee:', error.message)
+        return null
+    }
+
+    if (data) return data as User
+    return getUserById(userId)
 }
 
 export async function insertMessage(record: {

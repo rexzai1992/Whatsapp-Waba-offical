@@ -1,6 +1,6 @@
 
 import React, { useState, useEffect } from 'react';
-import { Plus, Trash2, Key, Globe, Shield } from 'lucide-react';
+import { Plus, Trash2, Globe, Shield } from 'lucide-react';
 
 const SOCKET_URL = import.meta.env.VITE_SOCKET_URL || 'http://localhost:3000';
 const ADMIN_PASS = 'admin123';
@@ -9,6 +9,18 @@ type QuickReply = {
     id?: string;
     shortcut: string;
     text: string;
+};
+
+type TeamRole = 'owner' | 'admin' | 'agent';
+
+type TeamUser = {
+    id: string;
+    email?: string | null;
+    name: string;
+    role: TeamRole;
+    color?: string | null;
+    createdAt?: string | null;
+    lastSignInAt?: string | null;
 };
 
 type WebhookViewProps = {
@@ -35,7 +47,6 @@ export default function WebhookView({
     onSaveQuickReplies
 }: WebhookViewProps) {
     const [webhooks, setWebhooks] = useState<any[]>([]);
-    const [apiKeys, setApiKeys] = useState<any>({});
     const [newUrl, setNewUrl] = useState('');
     const [newEvents, setNewEvents] = useState<string[]>(['message_received']);
     const [loading, setLoading] = useState(false);
@@ -82,11 +93,61 @@ export default function WebhookView({
     const [clientConnections, setClientConnections] = useState<any[]>([]);
     const [clientLoading, setClientLoading] = useState(false);
     const [clientError, setClientError] = useState<string | null>(null);
+    const [teamUsers, setTeamUsers] = useState<TeamUser[]>([]);
+    const [teamLoading, setTeamLoading] = useState(false);
+    const [teamError, setTeamError] = useState<string | null>(null);
+    const [teamCurrentRole, setTeamCurrentRole] = useState<TeamRole>('agent');
+    const [teamCurrentUserId, setTeamCurrentUserId] = useState<string | null>(null);
+    const [inviteEmail, setInviteEmail] = useState('');
+    const [inviteRole, setInviteRole] = useState<TeamRole>('agent');
+    const [inviteLoading, setInviteLoading] = useState(false);
+    const [inviteError, setInviteError] = useState<string | null>(null);
+    const [inviteSuccess, setInviteSuccess] = useState<string | null>(null);
+    const [roleSavingUserId, setRoleSavingUserId] = useState<string | null>(null);
+    const [manualConfig, setManualConfig] = useState({
+        wabaId: '',
+        phoneNumberId: '',
+        accessToken: '',
+        businessId: '',
+        verifyToken: '',
+        appId: '',
+        appSecret: '',
+        apiVersion: ''
+    });
+    const [manualLoading, setManualLoading] = useState(false);
+    const [manualError, setManualError] = useState<string | null>(null);
+    const [manualSuccess, setManualSuccess] = useState<string | null>(null);
+    const [registrationConfig, setRegistrationConfig] = useState<any | null>(null);
+    const [registrationLoading, setRegistrationLoading] = useState(false);
+    const [registrationError, setRegistrationError] = useState<string | null>(null);
+    const [registrationNumbers, setRegistrationNumbers] = useState<any[]>([]);
+    const [registrationNumbersLoading, setRegistrationNumbersLoading] = useState(false);
+    const [registrationNumbersError, setRegistrationNumbersError] = useState<string | null>(null);
+    const [showRegistrationWizard, setShowRegistrationWizard] = useState(false);
+    const [registrationStep, setRegistrationStep] = useState<1 | 2 | 3 | 4>(1);
+    const [registrationRequestSent, setRegistrationRequestSent] = useState(false);
+    const [registrationVerified, setRegistrationVerified] = useState(false);
+    const [registrationRegistered, setRegistrationRegistered] = useState(false);
+    const [registrationProfileUpdated, setRegistrationProfileUpdated] = useState(false);
+    const [registrationWabaId, setRegistrationWabaId] = useState('');
+    const [registrationPhoneNumberId, setRegistrationPhoneNumberId] = useState('');
+    const [registrationCodeMethod, setRegistrationCodeMethod] = useState<'SMS' | 'VOICE'>('SMS');
+    const [registrationLocale, setRegistrationLocale] = useState('en_US');
+    const [registrationCode, setRegistrationCode] = useState('');
+    const [registrationPin, setRegistrationPin] = useState('');
+    const [registrationProfileJson, setRegistrationProfileJson] = useState(`{
+  "about": "Tell customers about your business",
+  "address": "123 Main Street",
+  "description": "Fast support via WhatsApp",
+  "email": "support@example.com",
+  "websites": ["https://example.com"],
+  "vertical": "OTHER"
+}`);
+    const [registrationBusy, setRegistrationBusy] = useState<null | 'request' | 'verify' | 'register' | 'profile'>(null);
 
     useEffect(() => {
         if (!profileId) return;
         fetchWebhooks();
-        fetchApiKeys();
         fetchAutomation();
         fetchWindowReminder();
         fetchFallbackSettings();
@@ -94,8 +155,24 @@ export default function WebhookView({
             fetchConnectedBusinesses();
             fetchClientConnections();
         }
+        if (sessionToken) {
+            fetchRegistrationConfig();
+            fetchTeamUsers();
+        }
         onRefreshQuickReplies();
-    }, [profileId, onRefreshQuickReplies, isAdmin]);
+    }, [profileId, onRefreshQuickReplies, isAdmin, sessionToken]);
+
+    useEffect(() => {
+        if (!sessionToken) return;
+        const params = new URLSearchParams(window.location.search);
+        if (params.get('waba') === 'connected') {
+            openRegistrationWizard();
+            params.delete('waba');
+            const next = params.toString();
+            const nextUrl = `${window.location.pathname}${next ? `?${next}` : ''}`;
+            window.history.replaceState({}, '', nextUrl);
+        }
+    }, [sessionToken]);
 
     useEffect(() => {
         setQuickRepliesDraft(quickReplies.map(item => ({ ...item })));
@@ -146,6 +223,249 @@ export default function WebhookView({
             setConnectError(err?.message || 'Failed to start embedded signup');
         } finally {
             setConnectLoading(false);
+        }
+    };
+
+    const handleManualConfigSave = async () => {
+        if (!sessionToken) {
+            setManualError('You must be logged in to save a manual configuration.');
+            return;
+        }
+        setManualLoading(true);
+        setManualError(null);
+        setManualSuccess(null);
+        try {
+            const res = await fetch(`${SOCKET_URL}/api/waba/manual-config`, {
+                method: 'POST',
+                headers: {
+                    Authorization: `Bearer ${sessionToken}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    profileId,
+                    wabaId: manualConfig.wabaId.trim(),
+                    phoneNumberId: manualConfig.phoneNumberId.trim(),
+                    accessToken: manualConfig.accessToken.trim(),
+                    businessId: manualConfig.businessId.trim() || null,
+                    verifyToken: manualConfig.verifyToken.trim() || null,
+                    appId: manualConfig.appId.trim() || null,
+                    appSecret: manualConfig.appSecret.trim() || null,
+                    apiVersion: manualConfig.apiVersion.trim() || null
+                })
+            });
+            const data = await res.json();
+            if (!res.ok || !data?.success) {
+                throw new Error(data?.error || 'Manual config failed');
+            }
+            setManualSuccess(data?.subscribeError ? `Saved. Webhook subscription failed: ${data.subscribeError}` : 'Saved and subscribed.');
+        } catch (err: any) {
+            setManualError(err?.message || 'Manual config failed');
+        } finally {
+            setManualLoading(false);
+        }
+    };
+
+    const openRegistrationWizard = () => {
+        setRegistrationStep(1);
+        setRegistrationRequestSent(false);
+        setRegistrationVerified(false);
+        setRegistrationRegistered(false);
+        setRegistrationProfileUpdated(false);
+        setRegistrationError(null);
+        setRegistrationNumbersError(null);
+        setRegistrationCode('');
+        setRegistrationPin('');
+        setShowRegistrationWizard(true);
+        if (sessionToken) {
+            fetchRegistrationConfig();
+            fetchRegistrationNumbers();
+        }
+    };
+
+    const closeRegistrationWizard = () => {
+        setShowRegistrationWizard(false);
+    };
+
+    const fetchRegistrationConfig = () => {
+        if (!sessionToken || !profileId) return;
+        setRegistrationLoading(true);
+        setRegistrationError(null);
+        fetch(`${SOCKET_URL}/api/waba/registration/config?profileId=${encodeURIComponent(profileId)}`, {
+            headers: { Authorization: `Bearer ${sessionToken}` }
+        })
+            .then(async res => {
+                const text = await res.text();
+                try {
+                    return JSON.parse(text);
+                } catch {
+                    return null;
+                }
+            })
+            .then(data => {
+                if (data?.success) {
+                    const cfg = data.data || {};
+                    setRegistrationConfig(cfg);
+                    setRegistrationWabaId(cfg.wabaId || '');
+                    setRegistrationPhoneNumberId(cfg.phoneNumberId || '');
+                    setRegistrationError(null);
+                } else {
+                    setRegistrationConfig(null);
+                    setRegistrationError(data?.error || 'Failed to load registration config');
+                }
+            })
+            .finally(() => setRegistrationLoading(false));
+    };
+
+    const fetchRegistrationNumbers = () => {
+        if (!sessionToken || !profileId) return;
+        setRegistrationNumbersLoading(true);
+        setRegistrationNumbersError(null);
+        const params = new URLSearchParams();
+        params.set('profileId', profileId);
+        if (registrationWabaId.trim()) params.set('wabaId', registrationWabaId.trim());
+        fetch(`${SOCKET_URL}/api/waba/registration/phone-numbers?${params.toString()}`, {
+            headers: { Authorization: `Bearer ${sessionToken}` }
+        })
+            .then(async res => {
+                const text = await res.text();
+                try {
+                    return JSON.parse(text);
+                } catch {
+                    return null;
+                }
+            })
+            .then(data => {
+                if (data?.success) {
+                    const payload = data.data?.data || data.data || {};
+                    const list = Array.isArray(payload.data) ? payload.data : Array.isArray(payload) ? payload : [];
+                    setRegistrationNumbers(list);
+                    if (!registrationPhoneNumberId && list[0]?.id) {
+                        setRegistrationPhoneNumberId(list[0].id);
+                    }
+                    setRegistrationNumbersError(null);
+                } else {
+                    setRegistrationNumbers([]);
+                    setRegistrationNumbersError(data?.error || 'Failed to load phone numbers');
+                }
+            })
+            .finally(() => setRegistrationNumbersLoading(false));
+    };
+
+    const handleRequestVerificationCode = async () => {
+        if (!sessionToken || !profileId) return;
+        setRegistrationBusy('request');
+        setRegistrationError(null);
+        try {
+            const res = await fetch(`${SOCKET_URL}/api/waba/registration/request-code`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    Authorization: `Bearer ${sessionToken}`
+                },
+                body: JSON.stringify({
+                    profileId,
+                    phoneNumberId: registrationPhoneNumberId.trim(),
+                    codeMethod: registrationCodeMethod,
+                    locale: registrationLocale.trim() || 'en_US'
+                })
+            });
+            const data = await res.json().catch(() => null);
+            if (!res.ok || !data?.success) {
+                throw new Error(data?.error || 'Failed to request verification code');
+            }
+            setRegistrationRequestSent(true);
+        } catch (err: any) {
+            setRegistrationError(err?.message || 'Failed to request verification code');
+        } finally {
+            setRegistrationBusy(null);
+        }
+    };
+
+    const handleVerifyCode = async () => {
+        if (!sessionToken || !profileId) return;
+        setRegistrationBusy('verify');
+        setRegistrationError(null);
+        try {
+            const res = await fetch(`${SOCKET_URL}/api/waba/registration/verify-code`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    Authorization: `Bearer ${sessionToken}`
+                },
+                body: JSON.stringify({
+                    profileId,
+                    phoneNumberId: registrationPhoneNumberId.trim(),
+                    code: registrationCode.trim()
+                })
+            });
+            const data = await res.json().catch(() => null);
+            if (!res.ok || !data?.success) {
+                throw new Error(data?.error || 'Failed to verify code');
+            }
+            setRegistrationVerified(true);
+        } catch (err: any) {
+            setRegistrationError(err?.message || 'Failed to verify code');
+        } finally {
+            setRegistrationBusy(null);
+        }
+    };
+
+    const handleRegisterNumber = async () => {
+        if (!sessionToken || !profileId) return;
+        setRegistrationBusy('register');
+        setRegistrationError(null);
+        try {
+            const res = await fetch(`${SOCKET_URL}/api/waba/registration/register`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    Authorization: `Bearer ${sessionToken}`
+                },
+                body: JSON.stringify({
+                    profileId,
+                    phoneNumberId: registrationPhoneNumberId.trim(),
+                    pin: registrationPin.trim()
+                })
+            });
+            const data = await res.json().catch(() => null);
+            if (!res.ok || !data?.success) {
+                throw new Error(data?.error || 'Failed to register number');
+            }
+            setRegistrationRegistered(true);
+        } catch (err: any) {
+            setRegistrationError(err?.message || 'Failed to register number');
+        } finally {
+            setRegistrationBusy(null);
+        }
+    };
+
+    const handleUpdateProfile = async () => {
+        if (!sessionToken || !profileId) return;
+        setRegistrationBusy('profile');
+        setRegistrationError(null);
+        try {
+            const parsed = JSON.parse(registrationProfileJson);
+            const res = await fetch(`${SOCKET_URL}/api/waba/registration/profile`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    Authorization: `Bearer ${sessionToken}`
+                },
+                body: JSON.stringify({
+                    profileId,
+                    phoneNumberId: registrationPhoneNumberId.trim(),
+                    profile: parsed
+                })
+            });
+            const data = await res.json().catch(() => null);
+            if (!res.ok || !data?.success) {
+                throw new Error(data?.error || 'Failed to update business profile');
+            }
+            setRegistrationProfileUpdated(true);
+        } catch (err: any) {
+            setRegistrationError(err?.message || 'Failed to update business profile');
+        } finally {
+            setRegistrationBusy(null);
         }
     };
 
@@ -232,22 +552,6 @@ export default function WebhookView({
             });
     };
 
-    const fetchApiKeys = () => {
-        fetch(`${SOCKET_URL}/api/admin/api-keys?adminPassword=${ADMIN_PASS}`)
-            .then(async res => {
-                const text = await res.text();
-                try {
-                    return JSON.parse(text);
-                } catch {
-                    console.error('API key fetch failed:', text);
-                    return null;
-                }
-            })
-            .then(data => {
-                if (data?.success) setApiKeys(data.data || {});
-            });
-    };
-
     const handleAddWebhook = () => {
         if (!newUrl) return;
         setLoading(true);
@@ -298,20 +602,6 @@ export default function WebhookView({
                 }
             })
             .then(() => fetchWebhooks());
-    };
-
-    const generateApiKey = () => {
-        const name = prompt('Key Name:');
-        if (!name) return;
-        fetch(`${SOCKET_URL}/api/admin/api-keys`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                profileId,
-                adminPassword: ADMIN_PASS,
-                name
-            })
-        }).then(() => fetchApiKeys());
     };
 
     const fetchAutomation = () => {
@@ -556,8 +846,94 @@ export default function WebhookView({
             .finally(() => setConnectedLoading(false));
     };
 
+    const fetchTeamUsers = async () => {
+        if (!sessionToken) return;
+        setTeamLoading(true);
+        setTeamError(null);
+        try {
+            const res = await fetch(`${SOCKET_URL}/api/company/team-users`, {
+                headers: {
+                    Authorization: `Bearer ${sessionToken}`
+                }
+            });
+            const data = await res.json().catch(() => null);
+            if (!res.ok || !data?.success) {
+                throw new Error(data?.error || 'Failed to load team users');
+            }
+            setTeamUsers(Array.isArray(data?.data?.users) ? data.data.users : []);
+            setTeamCurrentRole((data?.data?.currentUserRole || 'agent') as TeamRole);
+            setTeamCurrentUserId(data?.data?.currentUserId || null);
+        } catch (err: any) {
+            setTeamError(err?.message || 'Failed to load team users');
+            setTeamUsers([]);
+        } finally {
+            setTeamLoading(false);
+        }
+    };
+
+    const canManageTeam = teamCurrentRole === 'owner' || teamCurrentRole === 'admin';
+
+    const handleInviteTeamUser = async () => {
+        if (!sessionToken) return;
+        setInviteLoading(true);
+        setInviteError(null);
+        setInviteSuccess(null);
+        try {
+            const email = inviteEmail.trim().toLowerCase();
+            if (!email) throw new Error('Email is required');
+
+            const res = await fetch(`${SOCKET_URL}/api/company/team-users/invite`, {
+                method: 'POST',
+                headers: {
+                    Authorization: `Bearer ${sessionToken}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    email,
+                    role: inviteRole
+                })
+            });
+            const data = await res.json().catch(() => null);
+            if (!res.ok || !data?.success) {
+                throw new Error(data?.error || 'Failed to invite user');
+            }
+            setInviteSuccess(`Invite sent to ${email}`);
+            setInviteEmail('');
+            await fetchTeamUsers();
+        } catch (err: any) {
+            setInviteError(err?.message || 'Failed to invite user');
+        } finally {
+            setInviteLoading(false);
+        }
+    };
+
+    const handleUpdateTeamRole = async (userId: string, role: TeamRole) => {
+        if (!sessionToken) return;
+        setRoleSavingUserId(userId);
+        setTeamError(null);
+        try {
+            const res = await fetch(`${SOCKET_URL}/api/company/team-users/${encodeURIComponent(userId)}/role`, {
+                method: 'PATCH',
+                headers: {
+                    Authorization: `Bearer ${sessionToken}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ role })
+            });
+            const data = await res.json().catch(() => null);
+            if (!res.ok || !data?.success) {
+                throw new Error(data?.error || 'Failed to update role');
+            }
+            await fetchTeamUsers();
+        } catch (err: any) {
+            setTeamError(err?.message || 'Failed to update role');
+        } finally {
+            setRoleSavingUserId(null);
+        }
+    };
+
     return (
-        <div className="flex-1 bg-[#fcfdfd] p-10 overflow-y-auto text-[#111b21] h-screen font-sans">
+        <div className="flex-1 bg-[#fcfdfd] p-10 overflow-y-auto text-[#111b21] h-full font-sans">
             <h2 className="text-3xl font-black mb-10 flex items-center gap-4 tracking-tight">
                 <Globe className="text-[#00a884] w-8 h-8" /> API & Connectivity
                 <span className="text-xs bg-[#f0f2f5] px-4 py-1.5 rounded-full text-[#54656f] font-bold border border-[#eceff1] uppercase tracking-widest">Active profile: {profileId}</span>
@@ -565,7 +941,7 @@ export default function WebhookView({
 
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-10">
                 {/* Embedded Signup Section */}
-                <div className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)]">
+                <div id="settings-connect" className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)]">
                     <div className="flex items-center gap-3 mb-4">
                         <Shield className="w-6 h-6 text-[#00a884]" />
                         <h3 className="text-xl text-[#111b21] font-bold">Connect WhatsApp Business</h3>
@@ -589,8 +965,127 @@ export default function WebhookView({
                     )}
                 </div>
 
+                {/* Manual Setup Section */}
+                <div id="settings-manual" className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)]">
+                    <div className="flex items-center gap-3 mb-4">
+                        <Shield className="w-6 h-6 text-[#00a884]" />
+                        <h3 className="text-xl text-[#111b21] font-bold">Manual WABA Setup</h3>
+                    </div>
+                    <p className="text-sm text-[#54656f] mb-6 font-medium">
+                        Self‑service fallback when Embedded Signup permissions are not available. Paste WABA IDs and token from Meta UI.
+                    </p>
+                    <div className="space-y-4">
+                        <div>
+                            <label className="text-xs font-bold text-[#54656f] uppercase tracking-widest">WABA ID</label>
+                            <input
+                                className="w-full bg-[#f8f9fa] border border-[#eceff1] rounded-2xl px-5 py-4 text-sm focus:outline-none focus:ring-2 focus:ring-[#00a884]/20 focus:border-[#00a884] text-[#111b21] font-bold placeholder-[#aebac1]"
+                                placeholder="WhatsApp Business Account ID"
+                                value={manualConfig.wabaId}
+                                onChange={e => setManualConfig(prev => ({ ...prev, wabaId: e.target.value }))}
+                            />
+                        </div>
+                        <div>
+                            <label className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Phone Number ID</label>
+                            <input
+                                className="w-full bg-[#f8f9fa] border border-[#eceff1] rounded-2xl px-5 py-4 text-sm focus:outline-none focus:ring-2 focus:ring-[#00a884]/20 focus:border-[#00a884] text-[#111b21] font-bold placeholder-[#aebac1]"
+                                placeholder="Business phone number ID"
+                                value={manualConfig.phoneNumberId}
+                                onChange={e => setManualConfig(prev => ({ ...prev, phoneNumberId: e.target.value }))}
+                            />
+                        </div>
+                        <div>
+                            <label className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Access Token</label>
+                            <textarea
+                                className="w-full bg-[#f8f9fa] border border-[#eceff1] rounded-2xl px-5 py-4 text-xs focus:outline-none focus:ring-2 focus:ring-[#00a884]/20 focus:border-[#00a884] text-[#111b21] font-mono placeholder-[#aebac1] min-h-[120px]"
+                                placeholder="System user access token"
+                                value={manualConfig.accessToken}
+                                onChange={e => setManualConfig(prev => ({ ...prev, accessToken: e.target.value }))}
+                            />
+                        </div>
+                        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                            <div>
+                                <label className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Business ID (optional)</label>
+                                <input
+                                    className="w-full bg-[#f8f9fa] border border-[#eceff1] rounded-2xl px-5 py-4 text-sm focus:outline-none focus:ring-2 focus:ring-[#00a884]/20 focus:border-[#00a884] text-[#111b21] font-bold placeholder-[#aebac1]"
+                                    placeholder="Meta business ID"
+                                    value={manualConfig.businessId}
+                                    onChange={e => setManualConfig(prev => ({ ...prev, businessId: e.target.value }))}
+                                />
+                            </div>
+                            <div>
+                                <label className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Verify Token (optional)</label>
+                                <input
+                                    className="w-full bg-[#f8f9fa] border border-[#eceff1] rounded-2xl px-5 py-4 text-sm focus:outline-none focus:ring-2 focus:ring-[#00a884]/20 focus:border-[#00a884] text-[#111b21] font-bold placeholder-[#aebac1]"
+                                    placeholder="Webhook verify token"
+                                    value={manualConfig.verifyToken}
+                                    onChange={e => setManualConfig(prev => ({ ...prev, verifyToken: e.target.value }))}
+                                />
+                            </div>
+                            <div>
+                                <label className="text-xs font-bold text-[#54656f] uppercase tracking-widest">App ID (optional)</label>
+                                <input
+                                    className="w-full bg-[#f8f9fa] border border-[#eceff1] rounded-2xl px-5 py-4 text-sm focus:outline-none focus:ring-2 focus:ring-[#00a884]/20 focus:border-[#00a884] text-[#111b21] font-bold placeholder-[#aebac1]"
+                                    placeholder="Meta App ID"
+                                    value={manualConfig.appId}
+                                    onChange={e => setManualConfig(prev => ({ ...prev, appId: e.target.value }))}
+                                />
+                            </div>
+                            <div>
+                                <label className="text-xs font-bold text-[#54656f] uppercase tracking-widest">App Secret (optional)</label>
+                                <input
+                                    className="w-full bg-[#f8f9fa] border border-[#eceff1] rounded-2xl px-5 py-4 text-sm focus:outline-none focus:ring-2 focus:ring-[#00a884]/20 focus:border-[#00a884] text-[#111b21] font-bold placeholder-[#aebac1]"
+                                    placeholder="Meta App Secret"
+                                    value={manualConfig.appSecret}
+                                    onChange={e => setManualConfig(prev => ({ ...prev, appSecret: e.target.value }))}
+                                />
+                            </div>
+                            <div>
+                                <label className="text-xs font-bold text-[#54656f] uppercase tracking-widest">API Version (optional)</label>
+                                <input
+                                    className="w-full bg-[#f8f9fa] border border-[#eceff1] rounded-2xl px-5 py-4 text-sm focus:outline-none focus:ring-2 focus:ring-[#00a884]/20 focus:border-[#00a884] text-[#111b21] font-bold placeholder-[#aebac1]"
+                                    placeholder="v19.0"
+                                    value={manualConfig.apiVersion}
+                                    onChange={e => setManualConfig(prev => ({ ...prev, apiVersion: e.target.value }))}
+                                />
+                            </div>
+                        </div>
+                        <button
+                            onClick={handleManualConfigSave}
+                            disabled={manualLoading || !sessionToken}
+                            className="w-full bg-[#111b21] hover:bg-[#202c33] text-white font-black py-4 rounded-2xl transition-all flex items-center justify-center gap-3 shadow-[0_8px_20px_rgba(17,27,33,0.18)] disabled:opacity-50 active:scale-95"
+                        >
+                            {manualLoading ? <div className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin" /> : 'Save Manual Config'}
+                        </button>
+                        {manualError && <p className="text-sm text-rose-600 font-semibold">{manualError}</p>}
+                        {manualSuccess && <p className="text-sm text-emerald-600 font-semibold">{manualSuccess}</p>}
+                    </div>
+                </div>
+
+                {/* Number Registration Section */}
+                <div id="settings-register" className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)]">
+                    <div className="flex items-center gap-3 mb-4">
+                        <Shield className="w-6 h-6 text-[#00a884]" />
+                        <h3 className="text-xl text-[#111b21] font-bold">Register WhatsApp Number</h3>
+                    </div>
+                    <p className="text-sm text-[#54656f] mb-6 font-medium">
+                        Complete verification and registration in one guided flow. Display name changes must be handled in Meta Business Manager.
+                    </p>
+                    <button
+                        onClick={openRegistrationWizard}
+                        disabled={!sessionToken}
+                        className="w-full bg-[#111b21] hover:bg-[#202c33] text-white font-black py-4 rounded-2xl transition-all flex items-center justify-center gap-3 shadow-[0_8px_20px_rgba(17,27,33,0.18)] disabled:opacity-50 active:scale-95"
+                    >
+                        Launch Guided Setup
+                    </button>
+                    {(registrationError || registrationNumbersError) && (
+                        <p className="text-sm text-rose-600 mt-4 font-semibold">
+                            {registrationError || registrationNumbersError}
+                        </p>
+                    )}
+                </div>
+
                 {/* Webhooks Section */}
-                <div className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)]">
+                <div id="settings-webhooks" className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)]">
                     <h3 className="text-xl mb-2 text-[#111b21] font-bold">Outgoing Webhooks</h3>
                     <p className="text-sm text-[#54656f] mb-8 font-medium">Configure endpoints to receive real-time updates from this profile.</p>
 
@@ -655,123 +1150,10 @@ export default function WebhookView({
                     </div>
                 </div>
 
-                {/* API Keys Section */}
-                <div className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)]">
-                    <div className="flex items-center justify-between mb-8">
-                        <div>
-                            <h3 className="text-xl text-[#111b21] font-bold">Access Gateways</h3>
-                            <p className="text-sm text-[#54656f] font-medium mt-1">Manage API keys for server-side integration.</p>
-                        </div>
-                        <button onClick={generateApiKey} className="bg-[#111b21] text-white px-5 py-3 rounded-2xl flex items-center gap-2 font-bold hover:bg-[#202c33] transition-all shadow-lg text-xs">
-                            <Plus className="w-4 h-4" /> NEW KEY
-                        </button>
-                    </div>
-
-                    <div className="space-y-5 mb-10">
-                        {Object.entries(apiKeys).length === 0 && (
-                            <p className="text-sm text-[#aebac1] font-bold uppercase text-center italic py-4">No keys generated yet.</p>
-                        )}
-                        {Object.entries(apiKeys).map(([key, info]: [string, any]) => (
-                            <div key={key} className="bg-[#fcfdfd] p-6 rounded-2xl border border-[#eceff1] hover:border-[#aebac1] transition-all">
-                                <div className="flex justify-between items-center mb-4">
-                                    <div className="flex items-center gap-3">
-                                        <div className="w-8 h-8 rounded-full bg-[#00a884]/10 flex items-center justify-center">
-                                            <Key className="w-4 h-4 text-[#00a884]" />
-                                        </div>
-                                        <span className="font-bold text-base text-[#111b21]">{info.name}</span>
-                                    </div>
-                                    <span className="text-[10px] text-[#54656f] bg-[#f0f2f5] px-3 py-1 rounded-full border border-[#eceff1] font-black uppercase tracking-widest">{info.profileId}</span>
-                                </div>
-                                <div className="flex items-center gap-3 font-mono text-sm bg-white p-4 rounded-xl border border-[#eceff1] break-all select-all cursor-text text-[#54656f] shadow-inner">
-                                    <code className="flex-1 overflow-hidden text-ellipsis">{key}</code>
-                                </div>
-                            </div>
-                        ))}
-                    </div>
-
-                    <div className="p-6 bg-[#f8f9fa] rounded-3xl border border-[#eceff1]">
-                        <h4 className="text-sm font-bold text-[#111b21] mb-5 flex items-center gap-2 uppercase tracking-widest">
-                            <Shield className="w-5 h-5 text-[#00a884]" /> Developer Documentation
-                        </h4>
-
-                        <div className="space-y-4">
-                            {/* Send Message */}
-                            <div className="bg-white rounded-2xl border border-[#eceff1] overflow-hidden">
-                                <div className="p-4 flex items-center justify-between bg-[#fcfdfd]">
-                                    <span className="font-bold text-xs text-[#111b21]">POST <span className="text-[#00a884]">/addon/api/send-message</span></span>
-                                    <span className="bg-[#00a884]/10 text-[#00a884] px-2 py-0.5 rounded-full font-black text-[9px] uppercase">Send Text</span>
-                                </div>
-                                <div className="p-4 border-t border-[#f0f2f5] space-y-3">
-                                    <div className="text-[10px] text-[#54656f]">
-                                        <p className="font-bold text-[#111b21] mb-1">HEADERS</p>
-                                        <code className="block bg-[#f8f9fa] p-2 rounded">x-api-key: YOUR_KEY</code>
-                                    </div>
-                                    <div className="text-[10px] text-[#54656f]">
-                                        <p className="font-bold text-[#111b21] mb-1">BODY (JSON)</p>
-                                        <pre className="block bg-[#111b21] text-emerald-400 p-3 rounded font-mono leading-relaxed">
-                                            {`{
-  "to": "123456789@c.us",
-  "message": "Hello from API"
-}`}
-                                        </pre>
-                                    </div>
-                                </div>
-                            </div>
-
-                            {/* Fetch Messages */}
-                            <div className="bg-white rounded-2xl border border-[#eceff1] overflow-hidden">
-                                <div className="p-4 flex items-center justify-between bg-[#fcfdfd]">
-                                    <span className="font-bold text-xs text-[#111b21]">GET <span className="text-[#00a884]">/addon/api/messages</span></span>
-                                    <span className="bg-amber-100 text-amber-700 px-2 py-0.5 rounded-full font-black text-[9px] uppercase">History</span>
-                                </div>
-                                <div className="p-4 border-t border-[#f0f2f5] space-y-3">
-                                    <div className="text-[10px] text-[#54656f]">
-                                        <p className="font-bold text-[#111b21] mb-1">QUERY PARAMS</p>
-                                        <code className="block bg-[#f8f9fa] p-2 rounded">?limit=50&contact=123456789@c.us</code>
-                                    </div>
-                                    <div className="text-[10px] text-[#54656f]">
-                                        <p className="font-bold text-[#111b21] mb-1">EXAMPLE CURL</p>
-                                        <pre className="block bg-[#111b21] text-emerald-400 p-3 rounded font-mono whitespace-pre-wrap break-all">
-                                            curl -X GET "http://localhost:3001/addon/api/messages" -H "x-api-key: YOUR_KEY"
-                                        </pre>
-                                    </div>
-                                </div>
-                            </div>
-
-                            {/* Webhook Info */}
-                            <div className="bg-white rounded-2xl border border-[#eceff1] overflow-hidden">
-                                <div className="p-4 flex items-center justify-between bg-[#fcfdfd]">
-                                    <span className="font-bold text-xs text-[#111b21]">WEBHOOK <span className="text-[#00a884]">Payload Structure</span></span>
-                                    <span className="bg-indigo-100 text-indigo-700 px-2 py-0.5 rounded-full font-black text-[9px] uppercase">Events</span>
-                                </div>
-                                <div className="p-4 border-t border-[#f0f2f5]">
-                                    <div className="text-[10px] text-[#54656f]">
-                                        <p className="font-bold text-[#111b21] mb-1">INCOMING MESSAGE SCHEMA</p>
-                                        <pre className="block bg-[#111b21] text-emerald-400 p-3 rounded font-mono leading-relaxed">
-                                            {`{
-  "event": "message_received",
-  "data": {
-    "from": "123456789@c.us",
-    "body": "Hello world",
-    "timestamp": 1672531200
-  }
-}`}
-                                        </pre>
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
-
-                        <div className="pt-6 text-center">
-                            <p className="text-[11px] font-bold text-[#111b21] bg-white border border-[#eceff1] py-3 px-4 rounded-2xl shadow-sm">
-                                Use the <code className="text-[#00a884]">x-api-key</code> to authenticate external requests.
-                            </p>
-                        </div>
-                    </div>
-                </div>
+                {/* API Keys Section Removed */}
 
                 {/* Conversational Components */}
-                <div className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)] lg:col-span-2">
+                <div id="settings-conversational" className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)] lg:col-span-2">
                     <div className="flex items-center justify-between mb-6">
                         <div>
                             <h3 className="text-xl text-[#111b21] font-bold">Conversational Components</h3>
@@ -917,7 +1299,7 @@ export default function WebhookView({
                 </div>
 
                 {/* 24h Window Reminder */}
-                <div className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)] lg:col-span-2">
+                <div id="settings-reminder" className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)] lg:col-span-2">
                     <div className="flex items-center justify-between mb-6">
                         <div>
                             <h3 className="text-xl text-[#111b21] font-bold">24h Window Reminder</h3>
@@ -983,7 +1365,7 @@ export default function WebhookView({
                 </div>
 
                 {/* Global Fallback Settings */}
-                <div className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)] lg:col-span-2">
+                <div id="settings-fallback" className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)] lg:col-span-2">
                     <div className="flex items-center justify-between mb-6">
                         <div>
                             <h3 className="text-xl text-[#111b21] font-bold">Fallback Message</h3>
@@ -1048,7 +1430,7 @@ export default function WebhookView({
                 </div>
 
                 {/* Quick Replies */}
-                <div className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)] lg:col-span-2">
+                <div id="settings-quick-replies" className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)] lg:col-span-2">
                     <div className="flex items-center justify-between mb-6">
                         <div>
                             <h3 className="text-xl text-[#111b21] font-bold">Quick Replies</h3>
@@ -1128,8 +1510,133 @@ export default function WebhookView({
                     </div>
                 </div>
 
+                <div id="settings-team-users" className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)] lg:col-span-2">
+                    <div className="flex items-center justify-between mb-6">
+                        <div>
+                            <h3 className="text-xl text-[#111b21] font-bold">Team Users</h3>
+                            <p className="text-sm text-[#54656f] font-medium mt-1">
+                                Invite teammates with their own login to the same team inbox.
+                            </p>
+                        </div>
+                        <button
+                            onClick={fetchTeamUsers}
+                            disabled={teamLoading || !sessionToken}
+                            className="text-xs font-bold uppercase tracking-widest text-[#00a884] border border-[#00a884]/30 px-3 py-2 rounded-xl hover:bg-[#00a884]/5 transition-all disabled:opacity-50"
+                        >
+                            Refresh
+                        </button>
+                    </div>
+
+                    {teamError && (
+                        <div className="mb-4 bg-rose-50 border border-rose-200 text-rose-700 rounded-2xl px-4 py-3 text-sm font-medium">
+                            {teamError}
+                        </div>
+                    )}
+
+                    {canManageTeam && (
+                        <div className="mb-6 grid grid-cols-1 lg:grid-cols-5 gap-3 bg-[#fcfdfd] border border-[#eceff1] rounded-2xl p-4">
+                            <input
+                                className="lg:col-span-3 bg-white border border-[#eceff1] rounded-xl px-4 py-3 text-sm font-medium text-[#111b21] focus:outline-none focus:border-[#00a884]"
+                                placeholder="agent@company.com"
+                                value={inviteEmail}
+                                onChange={e => setInviteEmail(e.target.value)}
+                            />
+                            <select
+                                className="lg:col-span-1 bg-white border border-[#eceff1] rounded-xl px-3 py-3 text-sm font-bold text-[#111b21] focus:outline-none focus:border-[#00a884]"
+                                value={inviteRole}
+                                onChange={e => setInviteRole((e.target.value as TeamRole) || 'agent')}
+                            >
+                                <option value="agent">Agent</option>
+                                <option value="admin">Admin</option>
+                            </select>
+                            <button
+                                onClick={handleInviteTeamUser}
+                                disabled={inviteLoading || !inviteEmail.trim()}
+                                className="lg:col-span-1 bg-[#00a884] hover:bg-[#008f6f] text-white rounded-xl px-4 py-3 text-xs font-bold uppercase tracking-widest disabled:opacity-50"
+                            >
+                                {inviteLoading ? 'Sending…' : 'Invite'}
+                            </button>
+                            {inviteError && (
+                                <div className="lg:col-span-5 text-sm text-rose-600 font-medium">
+                                    {inviteError}
+                                </div>
+                            )}
+                            {inviteSuccess && (
+                                <div className="lg:col-span-5 text-sm text-emerald-600 font-medium">
+                                    {inviteSuccess}
+                                </div>
+                            )}
+                        </div>
+                    )}
+
+                    <div className="bg-[#fcfdfd] rounded-2xl border border-[#eceff1] overflow-hidden">
+                        <table className="w-full text-left">
+                            <thead className="bg-white text-[#54656f] text-[10px] uppercase font-black tracking-widest border-b border-[#eceff1]">
+                                <tr>
+                                    <th className="px-4 py-3">User</th>
+                                    <th className="px-4 py-3">Role</th>
+                                    <th className="px-4 py-3">Last Sign-In</th>
+                                    <th className="px-4 py-3">Joined</th>
+                                </tr>
+                            </thead>
+                            <tbody className="divide-y divide-[#f0f2f5]">
+                                {teamLoading ? (
+                                    <tr>
+                                        <td className="px-4 py-4 text-sm text-[#8696a0]" colSpan={4}>
+                                            Loading team users...
+                                        </td>
+                                    </tr>
+                                ) : teamUsers.length === 0 ? (
+                                    <tr>
+                                        <td className="px-4 py-4 text-sm text-[#8696a0]" colSpan={4}>
+                                            No team users found.
+                                        </td>
+                                    </tr>
+                                ) : (
+                                    teamUsers.map(item => {
+                                        const canChangeRole =
+                                            canManageTeam &&
+                                            item.id !== teamCurrentUserId &&
+                                            !(item.role === 'owner' && teamCurrentRole !== 'owner');
+                                        return (
+                                            <tr key={item.id} className="hover:bg-white transition-all">
+                                                <td className="px-4 py-3">
+                                                    <div className="text-sm font-bold text-[#111b21]">{item.name || item.email || item.id}</div>
+                                                    <div className="text-xs text-[#54656f] font-medium">{item.email || item.id}</div>
+                                                </td>
+                                                <td className="px-4 py-3">
+                                                    {canChangeRole ? (
+                                                        <select
+                                                            value={item.role}
+                                                            disabled={roleSavingUserId === item.id}
+                                                            onChange={(e) => handleUpdateTeamRole(item.id, (e.target.value as TeamRole) || 'agent')}
+                                                            className="bg-white border border-[#eceff1] rounded-lg px-2 py-1 text-xs font-bold text-[#111b21] focus:outline-none focus:border-[#00a884] disabled:opacity-50"
+                                                        >
+                                                            <option value="agent">Agent</option>
+                                                            <option value="admin">Admin</option>
+                                                            {teamCurrentRole === 'owner' && <option value="owner">Owner</option>}
+                                                        </select>
+                                                    ) : (
+                                                        <span className="text-xs font-bold uppercase tracking-widest text-[#54656f]">{item.role}</span>
+                                                    )}
+                                                </td>
+                                                <td className="px-4 py-3 text-xs text-[#54656f]">
+                                                    {item.lastSignInAt ? new Date(item.lastSignInAt).toLocaleString() : 'Never'}
+                                                </td>
+                                                <td className="px-4 py-3 text-xs text-[#54656f]">
+                                                    {item.createdAt ? new Date(item.createdAt).toLocaleDateString() : '—'}
+                                                </td>
+                                            </tr>
+                                        );
+                                    })
+                                )}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
                 {isAdmin && (
-                    <div className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)] lg:col-span-2">
+                    <div id="settings-connected-clients" className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)] lg:col-span-2">
                         <div className="flex items-center justify-between mb-6">
                             <div>
                                 <h3 className="text-xl text-[#111b21] font-bold">Connected Clients</h3>
@@ -1232,7 +1739,7 @@ export default function WebhookView({
                 )}
 
                 {isAdmin && (
-                    <div className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)] lg:col-span-2">
+                    <div id="settings-connected-businesses" className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)] lg:col-span-2">
                     <div className="flex items-center justify-between mb-6">
                         <div>
                             <h3 className="text-xl text-[#111b21] font-bold">Connected Businesses</h3>
@@ -1351,6 +1858,213 @@ export default function WebhookView({
                     </div>
                 )}
             </div>
+
+            {showRegistrationWizard && (
+                <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-6">
+                    <div className="bg-white w-full max-w-3xl rounded-3xl shadow-2xl border border-[#eceff1] overflow-hidden">
+                        <div className="flex items-center justify-between px-6 py-5 border-b border-[#eceff1]">
+                            <div>
+                                <p className="text-xs font-bold uppercase tracking-widest text-[#54656f]">Step {registrationStep} of 4</p>
+                                <h3 className="text-xl font-bold text-[#111b21]">WhatsApp Number Setup</h3>
+                            </div>
+                            <button onClick={closeRegistrationWizard} className="text-[#54656f] hover:text-[#111b21] font-bold text-sm">Close</button>
+                        </div>
+
+                        <div className="p-6 space-y-5">
+                            {registrationStep === 1 && (
+                                <>
+                                    <p className="text-sm text-[#54656f] font-medium">
+                                        Confirm the WABA and phone number you want to register.
+                                    </p>
+                                    <div className="grid grid-cols-1 gap-4">
+                                        <label className="text-xs font-bold text-[#54656f] uppercase tracking-widest">WABA ID</label>
+                                        <input
+                                            className="w-full bg-[#f8f9fa] border border-[#eceff1] rounded-2xl px-5 py-3 text-sm font-bold text-[#111b21]"
+                                            value={registrationWabaId}
+                                            onChange={e => setRegistrationWabaId(e.target.value)}
+                                            placeholder="WhatsApp Business Account ID"
+                                            readOnly={Boolean(registrationWabaId)}
+                                        />
+                                        {registrationWabaId && (
+                                            <p className="text-[11px] text-[#8696a0] -mt-2">Auto-selected from Meta Embedded Signup.</p>
+                                        )}
+                                        <label className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Phone Number ID</label>
+                                        <input
+                                            className="w-full bg-[#f8f9fa] border border-[#eceff1] rounded-2xl px-5 py-3 text-sm font-bold text-[#111b21]"
+                                            value={registrationPhoneNumberId}
+                                            onChange={e => setRegistrationPhoneNumberId(e.target.value)}
+                                            placeholder="Phone Number ID"
+                                        />
+                                    </div>
+                                    <div className="flex flex-wrap gap-3">
+                                        <button
+                                            onClick={fetchRegistrationNumbers}
+                                            disabled={registrationNumbersLoading || !sessionToken}
+                                            className="bg-[#00a884] hover:bg-[#008f6f] text-white font-black py-2.5 px-4 rounded-xl transition-all text-xs uppercase tracking-widest disabled:opacity-50"
+                                        >
+                                            {registrationNumbersLoading ? 'Loading...' : 'Fetch Phone Numbers'}
+                                        </button>
+                                        {registrationNumbers.length > 0 && (
+                                            <span className="text-xs text-[#54656f] font-semibold">
+                                                Found {registrationNumbers.length} number(s)
+                                            </span>
+                                        )}
+                                    </div>
+                                    {registrationNumbers.length > 0 && (
+                                        <div className="space-y-2 max-h-40 overflow-y-auto">
+                                            {registrationNumbers.map((num: any) => (
+                                                <button
+                                                    key={num.id}
+                                                    onClick={() => setRegistrationPhoneNumberId(num.id)}
+                                                    className={`w-full text-left p-3 rounded-2xl border text-xs font-mono ${registrationPhoneNumberId === num.id ? 'border-[#00a884] bg-[#00a884]/5 text-[#00a884]' : 'border-[#eceff1] bg-[#fcfdfd] text-[#54656f]'}`}
+                                                >
+                                                    {num.display_phone_number || '—'} · {num.verified_name || '—'} · {num.quality_rating || '—'} · {num.id}
+                                                </button>
+                                            ))}
+                                        </div>
+                                    )}
+                                </>
+                            )}
+
+                            {registrationStep === 2 && (
+                                <>
+                                    <p className="text-sm text-[#54656f] font-medium">
+                                        Send a verification code to the phone number via SMS or Voice.
+                                    </p>
+                                    <div className="grid grid-cols-1 gap-4">
+                                        <label className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Code Method</label>
+                                        <select
+                                            value={registrationCodeMethod}
+                                            onChange={e => setRegistrationCodeMethod(e.target.value as 'SMS' | 'VOICE')}
+                                            className="w-full bg-[#f8f9fa] border border-[#eceff1] rounded-2xl px-5 py-3 text-sm font-bold text-[#111b21]"
+                                        >
+                                            <option value="SMS">SMS</option>
+                                            <option value="VOICE">VOICE</option>
+                                        </select>
+                                        <label className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Locale</label>
+                                        <input
+                                            className="w-full bg-[#f8f9fa] border border-[#eceff1] rounded-2xl px-5 py-3 text-sm font-bold text-[#111b21]"
+                                            value={registrationLocale}
+                                            onChange={e => setRegistrationLocale(e.target.value)}
+                                            placeholder="en_US"
+                                        />
+                                    </div>
+                                    <button
+                                        onClick={handleRequestVerificationCode}
+                                        disabled={registrationBusy !== null || !sessionToken}
+                                        className="w-full bg-[#111b21] hover:bg-[#202c33] text-white font-black py-3 rounded-2xl transition-all text-xs uppercase tracking-widest disabled:opacity-50"
+                                    >
+                                        {registrationBusy === 'request' ? 'Requesting...' : 'Request Code'}
+                                    </button>
+                                    {registrationRequestSent && (
+                                        <p className="text-xs text-[#00a884] font-bold uppercase tracking-widest">Code sent</p>
+                                    )}
+                                </>
+                            )}
+
+                            {registrationStep === 3 && (
+                                <>
+                                    <p className="text-sm text-[#54656f] font-medium">
+                                        Enter the verification code received by the client.
+                                    </p>
+                                    <div className="grid grid-cols-1 gap-4">
+                                        <label className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Verification Code</label>
+                                        <input
+                                            className="w-full bg-[#f8f9fa] border border-[#eceff1] rounded-2xl px-5 py-3 text-sm font-bold text-[#111b21]"
+                                            value={registrationCode}
+                                            onChange={e => setRegistrationCode(e.target.value)}
+                                            placeholder="123456"
+                                        />
+                                    </div>
+                                    <button
+                                        onClick={handleVerifyCode}
+                                        disabled={registrationBusy !== null || !sessionToken}
+                                        className="w-full bg-[#00a884] hover:bg-[#008f6f] text-white font-black py-3 rounded-2xl transition-all text-xs uppercase tracking-widest disabled:opacity-50"
+                                    >
+                                        {registrationBusy === 'verify' ? 'Verifying...' : 'Verify Code'}
+                                    </button>
+                                    {registrationVerified && (
+                                        <p className="text-xs text-[#00a884] font-bold uppercase tracking-widest">Verified</p>
+                                    )}
+                                </>
+                            )}
+
+                            {registrationStep === 4 && (
+                                <>
+                                    <p className="text-sm text-[#54656f] font-medium">
+                                        Register the number with a 6-digit PIN and optionally set the business profile.
+                                    </p>
+                                    <div className="grid grid-cols-1 gap-4">
+                                        <label className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Two-Step PIN</label>
+                                        <input
+                                            className="w-full bg-[#f8f9fa] border border-[#eceff1] rounded-2xl px-5 py-3 text-sm font-bold text-[#111b21]"
+                                            value={registrationPin}
+                                            onChange={e => setRegistrationPin(e.target.value)}
+                                            placeholder="6 digits"
+                                        />
+                                        <label className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Business Profile JSON</label>
+                                        <textarea
+                                            className="w-full bg-[#f8f9fa] border border-[#eceff1] rounded-2xl px-5 py-3 text-xs font-mono text-[#111b21] min-h-[140px]"
+                                            value={registrationProfileJson}
+                                            onChange={e => setRegistrationProfileJson(e.target.value)}
+                                        />
+                                    </div>
+                                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                        <button
+                                            onClick={handleRegisterNumber}
+                                            disabled={registrationBusy !== null || !sessionToken}
+                                            className="bg-[#111b21] hover:bg-[#202c33] text-white font-black py-3 rounded-2xl transition-all text-xs uppercase tracking-widest disabled:opacity-50"
+                                        >
+                                            {registrationBusy === 'register' ? 'Registering...' : 'Register Number'}
+                                        </button>
+                                        <button
+                                            onClick={handleUpdateProfile}
+                                            disabled={registrationBusy !== null || !sessionToken}
+                                            className="bg-[#00a884] hover:bg-[#008f6f] text-white font-black py-3 rounded-2xl transition-all text-xs uppercase tracking-widest disabled:opacity-50"
+                                        >
+                                            {registrationBusy === 'profile' ? 'Saving...' : 'Update Profile'}
+                                        </button>
+                                    </div>
+                                    <div className="flex flex-wrap gap-3 text-xs font-bold uppercase tracking-widest text-[#54656f]">
+                                        {registrationRegistered && <span className="text-[#00a884]">Registered</span>}
+                                        {registrationProfileUpdated && <span className="text-[#00a884]">Profile Updated</span>}
+                                    </div>
+                                </>
+                            )}
+
+                            {(registrationError || registrationNumbersError) && (
+                                <p className="text-sm text-rose-600 font-semibold">
+                                    {registrationError || registrationNumbersError}
+                                </p>
+                            )}
+                        </div>
+
+                        <div className="flex items-center justify-between px-6 py-5 border-t border-[#eceff1]">
+                            <button
+                                onClick={() => setRegistrationStep(prev => (prev > 1 ? (prev - 1) as 1 | 2 | 3 | 4 : prev))}
+                                disabled={registrationStep === 1}
+                                className="text-xs font-bold uppercase tracking-widest text-[#54656f] disabled:opacity-40"
+                            >
+                                Back
+                            </button>
+                            <div className="flex gap-3">
+                                <button
+                                    onClick={() => setRegistrationStep(prev => (prev < 4 ? (prev + 1) as 1 | 2 | 3 | 4 : prev))}
+                                    disabled={
+                                        (registrationStep === 1 && !registrationPhoneNumberId) ||
+                                        (registrationStep === 2 && !registrationRequestSent) ||
+                                        (registrationStep === 3 && !registrationVerified) ||
+                                        registrationStep === 4
+                                    }
+                                    className="bg-[#111b21] hover:bg-[#202c33] text-white font-black py-3 px-6 rounded-2xl transition-all text-xs uppercase tracking-widest disabled:opacity-50"
+                                >
+                                    {registrationStep === 4 ? 'Done' : 'Next'}
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            )}
         </div>
     );
 }

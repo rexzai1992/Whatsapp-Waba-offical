@@ -50,6 +50,9 @@ export function parseWabaWebhook(payload: any): WabaWebhookParseResult {
             for (const msg of inboundMessages) {
                 if (!msg?.from || !msg?.id) continue
                 const contactName = contactMap.get(msg.from)
+                const referral =
+                    (msg?.referral && typeof msg.referral === 'object' ? msg.referral : null) ||
+                    (msg?.context?.referral && typeof msg.context.referral === 'object' ? msg.context.referral : null)
                 const buttonReplyId =
                     msg?.button?.payload ||
                     msg?.interactive?.button_reply?.id ||
@@ -73,6 +76,7 @@ export function parseWabaWebhook(payload: any): WabaWebhookParseResult {
                     document: msg.document,
                     audio: msg.audio,
                     video: msg.video,
+                    referral,
                     contactName,
                     buttonReplyId,
                     buttonReplyTitle,

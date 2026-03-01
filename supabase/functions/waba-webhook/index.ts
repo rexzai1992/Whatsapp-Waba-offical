@@ -4,6 +4,13 @@
 
 const VERIFY_TOKEN = Deno.env.get('WABA_VERIFY_TOKEN') || ''
 const APP_SECRET = Deno.env.get('WABA_APP_SECRET') || ''
+const APP_SECRETS = [
+  APP_SECRET,
+  ...(Deno.env.get('WABA_APP_SECRETS') || '')
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean)
+].filter(Boolean)
 const FORWARD_URL = Deno.env.get('WABA_FORWARD_URL') || ''
 
 function timingSafeEqual(a: string, b: string) {
@@ -15,25 +22,30 @@ function timingSafeEqual(a: string, b: string) {
   return result === 0
 }
 
-async function verifySignature(payload: string, signatureHeader: string, appSecret: string) {
-  if (!appSecret) return true
+async function verifySignature(payload: string, signatureHeader: string, appSecrets: string[]) {
+  if (!appSecrets || appSecrets.length === 0) return true
   if (!signatureHeader || !signatureHeader.startsWith('sha256=')) return false
 
   const signature = signatureHeader.replace('sha256=', '')
   const enc = new TextEncoder()
-  const key = await crypto.subtle.importKey(
-    'raw',
-    enc.encode(appSecret),
-    { name: 'HMAC', hash: 'SHA-256' },
-    false,
-    ['sign']
-  )
-  const mac = await crypto.subtle.sign('HMAC', key, enc.encode(payload))
-  const digest = Array.from(new Uint8Array(mac))
-    .map((b) => b.toString(16).padStart(2, '0'))
-    .join('')
 
-  return timingSafeEqual(digest, signature)
+  for (const appSecret of appSecrets) {
+    const key = await crypto.subtle.importKey(
+      'raw',
+      enc.encode(appSecret),
+      { name: 'HMAC', hash: 'SHA-256' },
+      false,
+      ['sign']
+    )
+    const mac = await crypto.subtle.sign('HMAC', key, enc.encode(payload))
+    const digest = Array.from(new Uint8Array(mac))
+      .map((b) => b.toString(16).padStart(2, '0'))
+      .join('')
+
+    if (timingSafeEqual(digest, signature)) return true
+  }
+
+  return false
 }
 
 Deno.serve(async (req) => {
@@ -45,7 +57,7 @@ Deno.serve(async (req) => {
     const challenge = url.searchParams.get('hub.challenge')
 
     if (mode === 'subscribe' && token && token === VERIFY_TOKEN) {
-      return new Response(challenge || '', { status: 200 })
+      return new Response(challenge || '123', { status: 200 })
     }
     return new Response('Verification failed', { status: 403 })
   }
@@ -56,7 +68,7 @@ Deno.serve(async (req) => {
 
   const bodyText = await req.text()
   const signature = req.headers.get('x-hub-signature-256') || ''
-  const ok = await verifySignature(bodyText, signature, APP_SECRET)
+  const ok = await verifySignature(bodyText, signature, APP_SECRETS)
   if (!ok) {
     return new Response('Invalid signature', { status: 401 })
   }
@@ -75,8 +87,16 @@ Deno.serve(async (req) => {
       },
       body: bodyText
     })
-    return new Response('OK', { status: resp.ok ? 200 : 502 })
-  } catch {
-    return new Response('Forward failed', { status: 502 })
+    if (!resp.ok) {
+      const errorText = await resp.text().catch(() => '')
+      return new Response(
+        errorText || `Forward target returned ${resp.status}`,
+        { status: resp.status }
+      )
+    }
+    return new Response('OK', { status: 200 })
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Forward failed'
+    return new Response(`Forward failed: ${message}`, { status: 502 })
   }
 })

@@ -1,5 +1,5 @@
 import type { WabaClient } from '../waba/client'
-import { getLastInboundTimestamp, insertMessage } from './wa-store'
+import { getLastInboundTimestamp, insertMessage, shouldMarkCtaReplyCandidate } from './wa-store'
 
 const WINDOW_MS = 24 * 60 * 60 * 1000
 
@@ -9,6 +9,11 @@ export type SendMessageInput = {
     to: string
     type: 'text' | 'buttons' | 'list' | 'cta_url' | 'template'
     content: any
+    actor?: {
+        user_id: string
+        name: string
+        color: string
+    } | null
     workflowState?: any | null
 }
 
@@ -28,9 +33,19 @@ export async function canReplyFreely(userId: string): Promise<boolean> {
 }
 
 export async function sendWhatsAppMessage(input: SendMessageInput) {
-    const { client, userId, to, type, workflowState } = input
+    const { client, userId, to, type, workflowState, actor } = input
     let { content } = input
+    const messageActor =
+        actor ||
+        (workflowState
+            ? {
+                user_id: 'automation',
+                name: 'Automation',
+                color: '#2563eb'
+            }
+            : null)
     const withinWindow = await canReplyFreely(userId)
+    const sentAtIso = new Date().toISOString()
 
     let response: any = null
 
@@ -81,6 +96,8 @@ export async function sendWhatsAppMessage(input: SendMessageInput) {
     if (!messageId) {
         throw new Error('WABA API response missing message ID')
     }
+
+    const ctaReplyCandidate = await shouldMarkCtaReplyCandidate(userId, sentAtIso)
     await insertMessage({
         userId,
         direction: 'out',
@@ -89,7 +106,10 @@ export async function sendWhatsAppMessage(input: SendMessageInput) {
             to,
             message_id: messageId,
             payload: content,
-            status: 'sent'
+            status: 'sent',
+            sent_at: sentAtIso,
+            cta_entry_candidate: ctaReplyCandidate,
+            agent: messageActor
         },
         workflowState: workflowState ?? null
     })
