@@ -3,6 +3,7 @@ import React, { useState, useEffect } from 'react'
 import type { Session } from '@supabase/supabase-js'
 import { supabase } from './supabase'
 import DebugButton from './DebugButton'
+import { getSocketUrl, resolveCompanyIdFromLocation } from './runtimeConfig'
 import {
     MessageSquare,
     Zap,
@@ -14,17 +15,29 @@ import {
     CheckCircle2
 } from 'lucide-react'
 
-export default function Login({ onLogin }: { onLogin: (session: Session) => void }) {
+export default function Login({
+    onLogin,
+    forcedMessage
+}: {
+    onLogin: (session: Session) => void;
+    forcedMessage?: string | null;
+}) {
+    const SOCKET_URL = getSocketUrl()
     const [loading, setLoading] = useState(false)
     const [email, setEmail] = useState('')
     const [password, setPassword] = useState('')
     const [companyId, setCompanyId] = useState('')
+    const [hostCompanyId, setHostCompanyId] = useState<string | null>(null)
     const [mode, setMode] = useState<'login' | 'signup'>('login')
     const [msg, setMsg] = useState('')
     const [isVisible, setIsVisible] = useState(false)
 
     useEffect(() => {
         setIsVisible(true)
+        const inferred = resolveCompanyIdFromLocation()
+        if (!inferred) return
+        setHostCompanyId(inferred)
+        setCompanyId(inferred)
     }, [])
 
     const handleAuth = async (e: React.FormEvent) => {
@@ -35,35 +48,43 @@ export default function Login({ onLogin }: { onLogin: (session: Session) => void
         try {
             const trimmedCompany = companyId.trim()
             const normalizeCompanyId = (value: string) => value.trim().toLowerCase()
+            const normalizedCompany = normalizeCompanyId(trimmedCompany)
+            const trimmedEmail = email.trim().toLowerCase()
             if (!trimmedCompany) {
                 throw new Error('Company ID is required.')
             }
+            if (!trimmedEmail) {
+                throw new Error('Email is required.')
+            }
+            if (hostCompanyId && normalizedCompany !== normalizeCompanyId(hostCompanyId)) {
+                throw new Error(`Company ID must match subdomain "${hostCompanyId}".`)
+            }
             if (mode === 'signup') {
                 throw new Error('Self-signup is disabled. Ask your admin to invite you from Team Users settings.')
-            } else {
-                const { data, error } = await supabase.auth.signInWithPassword({ email, password })
-                if (error) throw error
-                if (!data?.session || !data?.user) {
-                    throw new Error('Login succeeded but no session was created. Please confirm your email or disable email confirmations in Supabase Auth settings.')
-                }
-                const metaCompany = data.user.user_metadata?.company_id || data.user.app_metadata?.company_id
-                if (!metaCompany) {
-                    const { error: updateError } = await supabase.auth.updateUser({
-                        data: { company_id: trimmedCompany }
-                    })
-                    if (updateError) throw updateError
-                } else if (normalizeCompanyId(metaCompany) !== normalizeCompanyId(trimmedCompany)) {
-                    await supabase.auth.signOut()
-                    throw new Error(`Company ID does not match this account. Use "${metaCompany}".`)
-                }
-                onLogin(data.session)
             }
+
+            const { data, error } = await supabase.auth.signInWithPassword({ email: trimmedEmail, password })
+            if (error) throw error
+            if (!data?.session || !data?.user) {
+                throw new Error('Login succeeded but no session was created. Please confirm your email or disable email confirmations in Supabase Auth settings.')
+            }
+            const metaCompany = data.user.user_metadata?.company_id || data.user.app_metadata?.company_id
+            if (!metaCompany) {
+                await supabase.auth.signOut()
+                throw new Error('This account is not assigned to any company. Ask your admin to set up your account first.')
+            } else if (normalizeCompanyId(metaCompany) !== normalizeCompanyId(trimmedCompany)) {
+                await supabase.auth.signOut()
+                throw new Error(`Company ID does not match this account. Use "${metaCompany}".`)
+            }
+            onLogin(data.session)
         } catch (error: any) {
             setMsg(error.message)
         } finally {
             setLoading(false)
         }
     }
+
+    const activeMessage = msg || forcedMessage || ''
 
     const services = [
         {
@@ -182,6 +203,11 @@ export default function Login({ onLogin }: { onLogin: (session: Session) => void
                                     className="w-full bg-[#f8f9fa] border border-[#eceff1] text-[#111b21] px-4 py-4 rounded-xl focus:border-[#00a884] focus:bg-white outline-none transition-all placeholder:text-[#aebac1]"
                                     required
                                 />
+                                {hostCompanyId && (
+                                    <p className="text-xs text-[#54656f] px-1">
+                                        Subdomain detected: <span className="font-semibold text-[#111b21]">{hostCompanyId}</span>
+                                    </p>
+                                )}
                             </div>
                             <div className="space-y-2">
                                 <label className="text-xs font-bold text-[#54656f] uppercase tracking-wider ml-1">Email Address</label>
@@ -209,10 +235,10 @@ export default function Login({ onLogin }: { onLogin: (session: Session) => void
                                 />
                             </div>
 
-                            {msg && (
-                                <div className={`text-sm text-center p-4 rounded-xl border flex items-center gap-3 transition-all ${msg.includes('Success') || msg.includes('Check') ? 'bg-[#25d366]/10 border-[#25d366]/20 text-[#008069]' : 'bg-rose-500/10 border-rose-500/20 text-rose-500'}`}>
-                                    {msg.includes('Success') || msg.includes('Check') ? <CheckCircle2 className="w-5 h-5 flex-shrink-0" /> : <div className="w-5 h-5 rounded-full border-2 border-current flex items-center justify-center font-bold text-xs">!</div>}
-                                    <span className="leading-tight text-left">{msg}</span>
+                            {activeMessage && (
+                                <div className={`text-sm text-center p-4 rounded-xl border flex items-center gap-3 transition-all ${activeMessage.includes('Success') || activeMessage.includes('Check') ? 'bg-[#25d366]/10 border-[#25d366]/20 text-[#008069]' : 'bg-rose-500/10 border-rose-500/20 text-rose-500'}`}>
+                                    {activeMessage.includes('Success') || activeMessage.includes('Check') ? <CheckCircle2 className="w-5 h-5 flex-shrink-0" /> : <div className="w-5 h-5 rounded-full border-2 border-current flex items-center justify-center font-bold text-xs">!</div>}
+                                    <span className="leading-tight text-left">{activeMessage}</span>
                                 </div>
                             )}
 
@@ -224,7 +250,7 @@ export default function Login({ onLogin }: { onLogin: (session: Session) => void
                                     <div className="w-6 h-6 border-3 border-white/30 border-t-white rounded-full animate-spin"></div>
                                 ) : (
                                     <>
-                                        <span>{mode === 'login' ? 'Access Dashboard' : 'Create Admin Account'}</span>
+                                        <span>{mode === 'login' ? 'Access Dashboard' : 'Invite Only'}</span>
                                         <ArrowRight className="w-5 h-5 group-hover:translate-x-1 transition-transform" />
                                     </>
                                 )}
@@ -245,7 +271,7 @@ export default function Login({ onLogin }: { onLogin: (session: Session) => void
                             ts: new Date().toISOString(),
                             env: {
                                 mode: import.meta.env.MODE,
-                                socketUrl: import.meta.env.VITE_SOCKET_URL || 'http://localhost:3000'
+                                socketUrl: SOCKET_URL
                             },
                             supabase: {
                                 url: (supabase as any)?.supabaseUrl || import.meta.env.VITE_SUPABASE_URL || 'unknown'

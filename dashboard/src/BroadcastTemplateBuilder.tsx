@@ -1,7 +1,8 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowLeft, Bold, Italic, PlusCircle, Save, Send, Strikethrough, Trash2 } from 'lucide-react';
+import { getSocketUrl } from './runtimeConfig';
 
-const SOCKET_URL = import.meta.env.VITE_SOCKET_URL || 'http://localhost:3000';
+const SOCKET_URL = getSocketUrl();
 const DRAFT_STORAGE_KEY = 'waba-broadcast-template-draft-v1';
 
 type TemplateCategory = 'marketing' | 'utility';
@@ -15,16 +16,6 @@ type TemplateButton = {
     text: string;
     url: string;
     phoneNumber: string;
-};
-
-type TemplateGalleryItem = {
-    id: string;
-    name: string;
-    status: string;
-    category: string;
-    language: string;
-    quality?: string;
-    rejectedReason?: string;
 };
 
 type DraftState = {
@@ -80,6 +71,8 @@ const extractNamedVars = (text: string): string[] => {
     return Array.from(vars);
 };
 
+const MARKETING_NAMED_PARAM_REGEX = /^[a-z_][a-z0-9_]*$/;
+
 const formatTemplateCreateResult = (data: any): string => {
     const id = data?.id || data?.template_id || data?.message_template_id || '';
     const status = data?.status || data?.template_status || '';
@@ -87,19 +80,6 @@ const formatTemplateCreateResult = (data: any): string => {
     if (id) return `Template submitted. id=${id}`;
     if (status) return `Template submitted. status=${status}`;
     return 'Template submitted.';
-};
-
-const normalizeStatus = (value: unknown): string => {
-    if (typeof value !== 'string') return '';
-    return value.trim().toUpperCase();
-};
-
-const statusToneClass = (status: string): string => {
-    if (status === 'APPROVED') return 'bg-emerald-50 text-emerald-700 border-emerald-200';
-    if (status === 'PENDING') return 'bg-amber-50 text-amber-700 border-amber-200';
-    if (status === 'REJECTED' || status === 'DISABLED') return 'bg-rose-50 text-rose-700 border-rose-200';
-    if (status === 'PAUSED') return 'bg-orange-50 text-orange-700 border-orange-200';
-    return 'bg-slate-50 text-slate-700 border-slate-200';
 };
 
 const createTemplateButton = (type: TemplateButtonType): TemplateButton => ({
@@ -127,11 +107,6 @@ export default function BroadcastTemplateBuilder({
     const [parameterFormat, setParameterFormat] = useState<ParameterFormat>('positional');
     const [sampleValues, setSampleValues] = useState<Record<string, string>>({});
     const [buttons, setButtons] = useState<TemplateButton[]>([]);
-    const [galleryItems, setGalleryItems] = useState<TemplateGalleryItem[]>([]);
-    const [galleryFilter, setGalleryFilter] = useState<'ALL' | 'APPROVED' | 'PENDING' | 'REJECTED'>('ALL');
-    const [galleryQuery, setGalleryQuery] = useState('');
-    const [galleryLoading, setGalleryLoading] = useState(false);
-    const [galleryError, setGalleryError] = useState<string | null>(null);
     const [savingDraft, setSavingDraft] = useState(false);
     const [submitting, setSubmitting] = useState(false);
     const [error, setError] = useState<string | null>(null);
@@ -211,53 +186,6 @@ export default function BroadcastTemplateBuilder({
             return same ? prev : next;
         });
     }, [variableKeys, parameterFormat]);
-
-    const loadTemplateGallery = async (filter: 'ALL' | 'APPROVED' | 'PENDING' | 'REJECTED' = galleryFilter) => {
-        if (!profileId || !sessionToken) return;
-        setGalleryLoading(true);
-        setGalleryError(null);
-        try {
-            const params = new URLSearchParams();
-            params.set('profileId', profileId);
-            params.set('limit', '100');
-            if (filter !== 'ALL') params.set('status', filter);
-            const res = await fetch(`${SOCKET_URL}/api/waba/templates?${params.toString()}`, {
-                headers: {
-                    Authorization: `Bearer ${sessionToken}`
-                }
-            });
-            const data = await res.json().catch(() => null);
-            if (!res.ok || !data?.success) {
-                throw new Error(data?.error || 'Failed to load template gallery');
-            }
-
-            const rows = Array.isArray(data?.data?.data) ? data.data.data : [];
-            const mapped: TemplateGalleryItem[] = rows.map((row: any) => ({
-                id: typeof row?.id === 'string' ? row.id : '',
-                name: typeof row?.name === 'string' ? row.name : '',
-                status: normalizeStatus(row?.status),
-                category: typeof row?.category === 'string' ? row.category : '',
-                language: typeof row?.language === 'string' ? row.language : '',
-                quality: typeof row?.quality_score?.score === 'string'
-                    ? row.quality_score.score
-                    : typeof row?.quality_score === 'string'
-                        ? row.quality_score
-                        : '',
-                rejectedReason: typeof row?.rejected_reason === 'string' ? row.rejected_reason : ''
-            }));
-            setGalleryItems(mapped.filter((item) => item.id && item.name));
-        } catch (err: any) {
-            setGalleryError(err?.message || 'Failed to load template gallery');
-            setGalleryItems([]);
-        } finally {
-            setGalleryLoading(false);
-        }
-    };
-
-    useEffect(() => {
-        if (!profileId || !sessionToken) return;
-        loadTemplateGallery(galleryFilter);
-    }, [profileId, sessionToken, galleryFilter]);
 
     const previewBody = useMemo(() => {
         const raw = bodyText || 'Template message...';
@@ -343,41 +271,70 @@ export default function BroadcastTemplateBuilder({
             throw new Error('Template name is required. Use lowercase letters, numbers, and underscores.');
         }
 
+        const isMarketing = category === 'marketing';
+        const toComponentType = (value: string) => (isMarketing ? value.toLowerCase() : value.toUpperCase());
+        const toHeaderFormat = (value: string) => (isMarketing ? value.toLowerCase() : value.toUpperCase());
+        const toButtonType = (value: TemplateButtonType) => {
+            if (value === 'PHONE_NUMBER') return isMarketing ? 'phone_number' : 'PHONE_NUMBER';
+            if (value === 'QUICK_REPLY') return isMarketing ? 'quick_reply' : 'QUICK_REPLY';
+            return isMarketing ? 'url' : 'URL';
+        };
+
         const cleanLanguage = language.trim() || 'en_US';
         const cleanBody = bodyText.trim();
         if (!cleanBody) {
             throw new Error('Body is required.');
         }
+        if (cleanBody.length > 1024) {
+            throw new Error('Body must be 1024 characters or less.');
+        }
+
         const bodyNamedVars = extractNamedVars(cleanBody);
         const bodyPositionalVars = extractPositionalVars(cleanBody);
         if (bodyNamedVars.length > 0 && bodyPositionalVars.length > 0) {
             throw new Error('Use only one variable format in body: either named {{name}} or positional {{1}}.');
         }
+
+        bodyPositionalVars.forEach((value, index) => {
+            const parsed = Number.parseInt(value, 10);
+            if (!Number.isFinite(parsed) || parsed !== index + 1) {
+                throw new Error('Positional variables must be sequential: {{1}}, {{2}}, {{3}}.');
+            }
+        });
+
         const effectiveParameterFormat: ParameterFormat =
             bodyNamedVars.length > 0 ? 'named' : bodyPositionalVars.length > 0 ? 'positional' : parameterFormat;
         const effectiveVariableKeys = effectiveParameterFormat === 'named' ? bodyNamedVars : bodyPositionalVars;
+
+        if (isMarketing && effectiveParameterFormat === 'named') {
+            const invalidNamed = bodyNamedVars.find((key) => !MARKETING_NAMED_PARAM_REGEX.test(key));
+            if (invalidNamed) {
+                throw new Error(`Marketing named parameters must be lowercase and underscores only: {{${invalidNamed}}}`);
+            }
+        }
 
         const components: any[] = [];
 
         if (headerType === 'text') {
             const cleanHeader = headerText.trim();
             if (!cleanHeader) throw new Error('Header text is required when header type is text.');
-            components.push({ type: 'HEADER', format: 'TEXT', text: cleanHeader });
+            if (cleanHeader.length > 60) throw new Error('Header text must be 60 characters or less.');
+            components.push({ type: toComponentType('HEADER'), format: toHeaderFormat('TEXT'), text: cleanHeader });
         }
 
         if (headerType === 'image' || headerType === 'video' || headerType === 'document') {
             const cleanHandle = headerHandle.trim();
             if (!cleanHandle) throw new Error('Header handle is required for media headers.');
             components.push({
-                type: 'HEADER',
-                format: headerType.toUpperCase(),
+                type: toComponentType('HEADER'),
+                format: toHeaderFormat(headerType),
                 example: {
                     header_handle: [cleanHandle]
                 }
             });
         }
 
-        const bodyComponent: any = { type: 'BODY', text: cleanBody };
+        const bodyComponent: any = { type: toComponentType('BODY'), text: cleanBody };
         if (effectiveVariableKeys.length > 0) {
             if (effectiveParameterFormat === 'named') {
                 bodyComponent.example = {
@@ -398,7 +355,8 @@ export default function BroadcastTemplateBuilder({
 
         const cleanFooter = footerText.trim();
         if (cleanFooter) {
-            components.push({ type: 'FOOTER', text: cleanFooter });
+            if (cleanFooter.length > 60) throw new Error('Footer text must be 60 characters or less.');
+            components.push({ type: toComponentType('FOOTER'), text: cleanFooter });
         }
 
         if (buttons.length > 10) {
@@ -418,7 +376,7 @@ export default function BroadcastTemplateBuilder({
                 const url = button.url.trim();
                 if (!url) throw new Error(`Button ${index + 1} URL is required.`);
                 return {
-                    type: 'URL',
+                    type: toButtonType('URL'),
                     text,
                     url
                 };
@@ -429,21 +387,21 @@ export default function BroadcastTemplateBuilder({
                 if (!phone) throw new Error(`Button ${index + 1} phone number is required.`);
                 if (phone.length > 20) throw new Error(`Button ${index + 1} phone number must be 20 characters or less.`);
                 return {
-                    type: 'PHONE_NUMBER',
+                    type: toButtonType('PHONE_NUMBER'),
                     text,
                     phone_number: phone
                 };
             }
 
             return {
-                type: 'QUICK_REPLY',
+                type: toButtonType('QUICK_REPLY'),
                 text
             };
         });
 
         if (cleanButtons.length > 0) {
             components.push({
-                type: 'BUTTONS',
+                type: toComponentType('BUTTONS'),
                 buttons: cleanButtons
             });
         }
@@ -525,7 +483,6 @@ export default function BroadcastTemplateBuilder({
             }
 
             setResult(formatTemplateCreateResult(data?.data));
-            void loadTemplateGallery(galleryFilter);
         } catch (err: any) {
             setError(err?.message || 'Template creation failed');
         } finally {
@@ -536,17 +493,6 @@ export default function BroadcastTemplateBuilder({
     const saveDisabled = savingDraft || submitting;
     const submitDisabled = submitting || !sessionToken;
     const bodyChars = bodyText.length;
-    const filteredGalleryItems = useMemo(() => {
-        const query = galleryQuery.trim().toLowerCase();
-        if (!query) return galleryItems;
-        return galleryItems.filter((item) => {
-            return (
-                item.name.toLowerCase().includes(query) ||
-                item.id.toLowerCase().includes(query) ||
-                item.language.toLowerCase().includes(query)
-            );
-        });
-    }, [galleryItems, galleryQuery]);
 
     return (
         <div className={embedded ? 'h-full bg-[#f1f3f6] flex flex-col' : 'fixed inset-0 z-[220] bg-[#f1f3f6] flex flex-col'}>
@@ -556,7 +502,7 @@ export default function BroadcastTemplateBuilder({
                     className="flex items-center gap-3 text-[#111b21] hover:text-[#00a884] transition-colors"
                 >
                     <ArrowLeft className="w-5 h-5" />
-                    <span className="text-3xl font-black tracking-tight">New Templates</span>
+                    <span className="text-3xl font-black tracking-tight">Create Template</span>
                 </button>
                 <div className="flex items-center gap-3">
                     <button
@@ -579,7 +525,7 @@ export default function BroadcastTemplateBuilder({
             </header>
 
             <div className="flex-1 overflow-hidden p-5">
-                <div className="h-full grid grid-cols-1 xl:grid-cols-[1fr_460px] gap-5">
+                <div className="h-full grid grid-cols-1 lg:grid-cols-[1fr_460px] gap-5">
                     <section className="bg-white rounded-2xl border border-[#e5e7eb] p-6 overflow-y-auto custom-scrollbar">
                         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                             <div>
@@ -610,6 +556,11 @@ export default function BroadcastTemplateBuilder({
                                     <option value="marketing">Marketing</option>
                                     <option value="utility">Utility</option>
                                 </select>
+                                {category === 'marketing' && (
+                                    <p className="mt-1 text-[11px] text-[#6b7280]">
+                                        Marketing template: up to 1 header, 1 required body, 1 footer, and up to 10 buttons.
+                                    </p>
+                                )}
                             </div>
                             <div>
                                 <label className="block text-sm font-bold text-[#1f2937] mb-2">Language</label>
@@ -867,88 +818,6 @@ export default function BroadcastTemplateBuilder({
                             )}
                         </div>
 
-                        <div className="mt-8 pt-6 border-t border-[#e5e7eb]">
-                            <div className="flex items-center justify-between gap-3 flex-wrap">
-                                <h3 className="text-2xl font-black text-[#111b21]">Template Gallery</h3>
-                                <button
-                                    type="button"
-                                    onClick={() => void loadTemplateGallery(galleryFilter)}
-                                    disabled={galleryLoading}
-                                    className="px-3 py-2 rounded-xl border border-[#e5e7eb] bg-white text-xs font-bold text-[#111b21] hover:bg-[#f9fafb] disabled:opacity-50"
-                                >
-                                    {galleryLoading ? 'Refreshing...' : 'Refresh'}
-                                </button>
-                            </div>
-                            <p className="text-[#4b5563] mt-2 font-medium">View approved and pending templates on this WABA profile.</p>
-
-                            <div className="mt-4 flex flex-wrap items-center gap-2">
-                                {(['ALL', 'APPROVED', 'PENDING', 'REJECTED'] as const).map((status) => (
-                                    <button
-                                        key={status}
-                                        type="button"
-                                        onClick={() => setGalleryFilter(status)}
-                                        className={`px-3 py-2 rounded-xl border text-xs font-bold ${galleryFilter === status
-                                            ? 'bg-[#111b21] text-white border-[#111b21]'
-                                            : 'bg-white text-[#111b21] border-[#e5e7eb] hover:bg-[#f9fafb]'
-                                            }`}
-                                    >
-                                        {status}
-                                    </button>
-                                ))}
-                                <input
-                                    value={galleryQuery}
-                                    onChange={(e) => setGalleryQuery(e.target.value)}
-                                    placeholder="Search name / id / language"
-                                    className="ml-auto min-w-[240px] flex-1 max-w-[360px] bg-white border border-[#e5e7eb] rounded-xl px-3 py-2 text-sm text-[#111b21] focus:outline-none focus:border-[#00a884]"
-                                />
-                            </div>
-
-                            <div className="mt-4 border border-[#e5e7eb] rounded-xl overflow-hidden">
-                                <div className="max-h-[280px] overflow-y-auto custom-scrollbar">
-                                    {galleryLoading ? (
-                                        <div className="px-4 py-4 text-sm text-[#6b7280]">Loading templates...</div>
-                                    ) : galleryError ? (
-                                        <div className="px-4 py-4 text-sm text-rose-700 bg-rose-50 border-b border-rose-200">{galleryError}</div>
-                                    ) : filteredGalleryItems.length === 0 ? (
-                                        <div className="px-4 py-4 text-sm text-[#6b7280]">No templates found for this filter.</div>
-                                    ) : (
-                                        <table className="w-full text-left">
-                                            <thead className="sticky top-0 bg-[#f9fafb] border-b border-[#e5e7eb]">
-                                                <tr className="text-[10px] uppercase tracking-widest text-[#6b7280] font-black">
-                                                    <th className="px-3 py-2">Name</th>
-                                                    <th className="px-3 py-2">Status</th>
-                                                    <th className="px-3 py-2">Category</th>
-                                                    <th className="px-3 py-2">Lang</th>
-                                                    <th className="px-3 py-2">Quality</th>
-                                                </tr>
-                                            </thead>
-                                            <tbody>
-                                                {filteredGalleryItems.map((item) => (
-                                                    <tr key={item.id} className="border-b border-[#f1f5f9] last:border-b-0">
-                                                        <td className="px-3 py-2">
-                                                            <div className="text-sm font-semibold text-[#111b21]">{item.name}</div>
-                                                            <div className="text-[11px] text-[#64748b] font-mono">{item.id}</div>
-                                                            {item.rejectedReason && (
-                                                                <div className="text-[11px] text-rose-600 mt-1">{item.rejectedReason}</div>
-                                                            )}
-                                                        </td>
-                                                        <td className="px-3 py-2">
-                                                            <span className={`inline-flex px-2 py-1 rounded-full border text-[10px] font-black ${statusToneClass(item.status)}`}>
-                                                                {item.status || 'UNKNOWN'}
-                                                            </span>
-                                                        </td>
-                                                        <td className="px-3 py-2 text-xs font-semibold text-[#334155]">{item.category || '-'}</td>
-                                                        <td className="px-3 py-2 text-xs font-semibold text-[#334155]">{item.language || '-'}</td>
-                                                        <td className="px-3 py-2 text-xs font-semibold text-[#334155]">{item.quality || '-'}</td>
-                                                    </tr>
-                                                ))}
-                                            </tbody>
-                                        </table>
-                                    )}
-                                </div>
-                            </div>
-                        </div>
-
                         {(error || result) && (
                             <div className={`mt-6 rounded-xl px-4 py-3 text-sm font-semibold ${error ? 'bg-rose-50 text-rose-700 border border-rose-200' : 'bg-emerald-50 text-emerald-700 border border-emerald-200'}`}>
                                 {error || result}
@@ -956,7 +825,7 @@ export default function BroadcastTemplateBuilder({
                         )}
                     </section>
 
-                    <aside className="bg-[#eeeff3] rounded-2xl border border-[#d8dbe2] p-6 flex flex-col items-center justify-start overflow-y-auto custom-scrollbar">
+                    <aside className="hidden lg:flex bg-[#eeeff3] rounded-2xl border border-[#d8dbe2] p-6 flex-col items-center justify-start overflow-y-auto custom-scrollbar">
                         <h3 className="text-5xl font-black text-[#111b21] mb-4">Preview</h3>
                         <div className="w-[325px] max-w-full bg-white rounded-[42px] p-3 border border-[#dfe3ea] shadow-[0_20px_60px_rgba(0,0,0,0.16)]">
                             <div className="rounded-[34px] overflow-hidden border border-[#dfe3ea] bg-[#e9ddd0]">

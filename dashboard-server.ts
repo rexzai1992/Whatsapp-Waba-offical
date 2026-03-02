@@ -44,6 +44,11 @@ const io = new Server(httpServer, {
 })
 
 type TeamRole = 'owner' | 'admin' | 'agent'
+type TeamDepartment = 'finance' | 'sales' | 'marketing' | 'production' | 'custom'
+
+const TENANT_ROOT_DOMAIN = String(process.env.TENANT_ROOT_DOMAIN || '2fast.xyz').trim().toLowerCase()
+const RESERVED_TENANT_SUBDOMAINS = new Set(['www', 'admin', 'myadmin'])
+const TEAM_DEPARTMENTS = new Set<TeamDepartment>(['finance', 'sales', 'marketing', 'production', 'custom'])
 
 const TEAM_ROLE_ORDER: Record<TeamRole, number> = {
     agent: 1,
@@ -68,6 +73,49 @@ function normalizeTeamRole(input: any): TeamRole {
     const value = typeof input === 'string' ? input.trim().toLowerCase() : ''
     if (value === 'owner' || value === 'admin' || value === 'agent') return value
     return 'agent'
+}
+
+function normalizeTeamDepartment(input: any): TeamDepartment {
+    const value = typeof input === 'string' ? input.trim().toLowerCase() : ''
+    if (TEAM_DEPARTMENTS.has(value as TeamDepartment)) return value as TeamDepartment
+    return 'custom'
+}
+
+function normalizeTeamCustomDepartment(input: any): string | null {
+    const value = typeof input === 'string' ? input.trim() : ''
+    if (!value) return null
+    return value.slice(0, 64)
+}
+
+function parseHostnameFromHeaderValue(value: any): string {
+    const raw = Array.isArray(value) ? String(value[0] || '') : typeof value === 'string' ? value : ''
+    const first = raw.split(',')[0]?.trim().toLowerCase() || ''
+    if (!first) return ''
+    return first.replace(/:\d+$/, '')
+}
+
+function getHostnameFromHeaders(headers: any): string {
+    return parseHostnameFromHeaderValue(headers?.['x-forwarded-host']) || parseHostnameFromHeaderValue(headers?.host)
+}
+
+function resolveCompanyIdFromHostname(hostname: string): string | null {
+    if (!hostname) return null
+    if (hostname === TENANT_ROOT_DOMAIN) return null
+    if (hostname === 'localhost' || hostname === '127.0.0.1' || /^[0-9.]+$/.test(hostname)) return null
+
+    const suffix = `.${TENANT_ROOT_DOMAIN}`
+    if (!hostname.endsWith(suffix)) return null
+
+    const label = hostname.slice(0, -suffix.length)
+    if (!label || label.includes('.')) return null
+    if (RESERVED_TENANT_SUBDOMAINS.has(label)) return null
+    if (!/^[a-z0-9-]+$/.test(label)) return null
+    return label
+}
+
+function normalizeCompanyId(value: any): string {
+    const raw = typeof value === 'string' ? value.trim() : value ? String(value).trim() : ''
+    return raw.toLowerCase()
 }
 
 function hasRoleAtLeast(role: TeamRole, minimum: TeamRole): boolean {
@@ -325,11 +373,34 @@ async function getCompanyIdForProfileOrProfileTable(profileId: string) {
     return getCompanyIdForProfile(profileId)
 }
 
+async function findConflictingActivePhoneNumberConfig(phoneNumberId: string, profileId: string): Promise<{ profileId: string; companyId: string | null } | null> {
+    const { data, error } = await supabase
+        .from('waba_configs')
+        .select('profile_id, company_id')
+        .eq('phone_number_id', phoneNumberId)
+        .eq('enabled', true)
+        .neq('profile_id', profileId)
+        .limit(1)
+        .maybeSingle()
+
+    if (error) {
+        throw new Error(error.message)
+    }
+
+    if (!data?.profile_id) return null
+    return {
+        profileId: String(data.profile_id),
+        companyId: data.company_id ? String(data.company_id) : null
+    }
+}
+
 function hashOAuthState(state: string) {
     return createHash('sha256').update(state).digest('hex')
 }
 
 async function getSupabaseUserFromRequest(req: any, res: any) {
+    const requestHostname = getHostnameFromHeaders(req?.headers)
+    const hostCompanyId = resolveCompanyIdFromHostname(requestHostname)
     const rawAuth = req.headers['authorization'] || ''
     const token = typeof rawAuth === 'string' && rawAuth.startsWith('Bearer ')
         ? rawAuth.slice(7)
@@ -346,7 +417,31 @@ async function getSupabaseUserFromRequest(req: any, res: any) {
         return null
     }
 
+    const directCompanyId = normalizeCompanyId(getUserCompanyId(user))
+    if (hostCompanyId && !directCompanyId) {
+        res.status(403).json({
+            success: false,
+            error: 'This account is not assigned to any company. Ask your admin to set up your account first.'
+        })
+        return null
+    }
+    if (hostCompanyId && directCompanyId && directCompanyId !== hostCompanyId) {
+        res.status(403).json({
+            success: false,
+            error: `This account belongs to "${directCompanyId}" and cannot access "${hostCompanyId}.${TENANT_ROOT_DOMAIN}".`
+        })
+        return null
+    }
+
     const { user: ensuredUser } = await ensureUserCompanyId(user)
+    const ensuredCompanyId = normalizeCompanyId(getUserCompanyId(ensuredUser))
+    if (hostCompanyId && ensuredCompanyId !== hostCompanyId) {
+        res.status(403).json({
+            success: false,
+            error: `Company mismatch for this subdomain. Expected "${hostCompanyId}".`
+        })
+        return null
+    }
     return ensuredUser
 }
 
@@ -676,6 +771,8 @@ function extractNamedVars(text: string): string[] {
     return Array.from(vars)
 }
 
+const MARKETING_NAMED_PARAM_REGEX = /^[a-z_][a-z0-9_]*$/
+
 function hasBodyExamples(bodyComponent: any): boolean {
     if (!isObject(bodyComponent)) return false
     const example = bodyComponent.example
@@ -713,6 +810,28 @@ function hasHeaderHandle(component: any): boolean {
     if (typeof exampleHandle === 'string' && exampleHandle.trim()) return true
     if (Array.isArray(exampleHandle) && exampleHandle.some((item: any) => typeof item === 'string' && item.trim())) return true
     return false
+}
+
+function extractHeaderHandle(component: any): string {
+    if (!isObject(component)) return ''
+
+    const topLevelHandle = component.header_handle
+    if (typeof topLevelHandle === 'string' && topLevelHandle.trim()) return topLevelHandle.trim()
+    if (Array.isArray(topLevelHandle)) {
+        const first = topLevelHandle.find((item: any) => typeof item === 'string' && item.trim())
+        if (typeof first === 'string') return first.trim()
+    }
+
+    const example = component.example
+    if (!isObject(example)) return ''
+    const exampleHandle = example.header_handle
+    if (typeof exampleHandle === 'string' && exampleHandle.trim()) return exampleHandle.trim()
+    if (Array.isArray(exampleHandle)) {
+        const first = exampleHandle.find((item: any) => typeof item === 'string' && item.trim())
+        if (typeof first === 'string') return first.trim()
+    }
+
+    return ''
 }
 
 function normalizeTemplateCreationComponents(raw: any[]): any[] {
@@ -924,12 +1043,248 @@ function validateMarketingTemplateInput(input: any): { payload: any | null; erro
     if (rawComponents.length === 0) errors.push('components array is required')
     const components = normalizeTemplateCreationComponents(rawComponents)
 
+    const headerComponents = components.filter((component: any) => component.type === 'HEADER')
     const bodyComponents = components.filter((component: any) => component.type === 'BODY')
-    if (bodyComponents.length === 0) errors.push('at least one BODY component is required')
+    const footerComponents = components.filter((component: any) => component.type === 'FOOTER')
+    const buttonComponents = components.filter((component: any) => component.type === 'BUTTONS')
+
+    if (headerComponents.length > 1) errors.push('only one HEADER component is allowed')
+    if (bodyComponents.length !== 1) errors.push('exactly one BODY component is required')
+    if (footerComponents.length > 1) errors.push('only one FOOTER component is allowed')
+    if (buttonComponents.length > 1) errors.push('only one BUTTONS component is allowed')
 
     const bodyComponent = bodyComponents[0]
-    if (bodyComponent && readTrimmed(bodyComponent.text).length > 1024) {
-        errors.push('BODY.text must be <= 1024 characters')
+    const bodyText = bodyComponent ? readTrimmed(bodyComponent.text) : ''
+    const bodyNamedVars = bodyText ? extractNamedVars(bodyText) : []
+    const bodyPositionalVars = bodyText ? extractPositionalVars(bodyText) : []
+    let normalizedBodyNamedExamples: Array<{ param_name: string; example: string }> = []
+    let normalizedBodyPositionalExamples: string[] = []
+
+    if (bodyComponent) {
+        if (!bodyText) {
+            errors.push('BODY.text is required')
+        } else {
+            if (bodyText.length > 1024) errors.push('BODY.text must be <= 1024 characters')
+            if (bodyNamedVars.length > 0 && bodyPositionalVars.length > 0) {
+                errors.push('BODY cannot mix named and positional variables')
+            }
+
+            bodyPositionalVars.forEach((value, index) => {
+                const expected = index + 1
+                if (value !== expected) errors.push('BODY positional variables must be sequential like {{1}}, {{2}}, {{3}}')
+            })
+
+            bodyNamedVars.forEach((name) => {
+                if (!MARKETING_NAMED_PARAM_REGEX.test(name)) {
+                    errors.push(`BODY named variable "${name}" must use lowercase letters, numbers, and underscores`)
+                }
+            })
+
+            if (parameterFormat === 'named' && bodyPositionalVars.length > 0) {
+                errors.push('BODY uses positional variables but parameter_format is named')
+            }
+            if (parameterFormat === 'positional' && bodyNamedVars.length > 0) {
+                errors.push('BODY uses named variables but parameter_format is positional')
+            }
+
+            const bodyExample = isObject(bodyComponent.example) ? bodyComponent.example : null
+            if (parameterFormat === 'named' && bodyNamedVars.length > 0) {
+                const rawNamedExamples = Array.isArray(bodyExample?.body_text_named_params) ? bodyExample?.body_text_named_params : []
+                if (rawNamedExamples.length === 0) {
+                    errors.push('BODY.example.body_text_named_params is required for named variables')
+                }
+
+                const seenNames = new Set<string>()
+                rawNamedExamples.forEach((entry: any, index: number) => {
+                    if (!isObject(entry)) {
+                        errors.push(`BODY.example.body_text_named_params[${index}] must be an object`)
+                        return
+                    }
+
+                    const rawParam = readTrimmed(entry.param_name)
+                    const unwrapped = rawParam.replace(/^{{\s*|\s*}}$/g, '')
+                    if (!unwrapped) {
+                        errors.push(`BODY.example.body_text_named_params[${index}].param_name is required`)
+                        return
+                    }
+                    if (!MARKETING_NAMED_PARAM_REGEX.test(unwrapped)) {
+                        errors.push(`BODY.example.body_text_named_params[${index}].param_name must use lowercase letters, numbers, and underscores`)
+                        return
+                    }
+                    if (seenNames.has(unwrapped)) {
+                        errors.push(`BODY.example.body_text_named_params duplicate param_name: ${unwrapped}`)
+                        return
+                    }
+
+                    const exampleValue = readTrimmed(entry.example)
+                    if (!exampleValue) {
+                        errors.push(`BODY.example.body_text_named_params[${index}].example is required`)
+                        return
+                    }
+
+                    seenNames.add(unwrapped)
+                    normalizedBodyNamedExamples.push({
+                        param_name: unwrapped,
+                        example: exampleValue
+                    })
+                })
+
+                bodyNamedVars.forEach((name) => {
+                    if (!seenNames.has(name)) {
+                        errors.push(`BODY.example.body_text_named_params missing example for ${name}`)
+                    }
+                })
+            }
+
+            if (parameterFormat === 'positional' && bodyPositionalVars.length > 0) {
+                const rows = Array.isArray(bodyExample?.body_text) ? bodyExample?.body_text : []
+                const firstRow = Array.isArray(rows[0]) ? rows[0] : []
+                if (firstRow.length === 0) {
+                    errors.push('BODY.example.body_text[0] is required for positional variables')
+                }
+                normalizedBodyPositionalExamples = firstRow
+                    .map((value: any) => readTrimmed(value))
+                    .filter(Boolean)
+
+                if (normalizedBodyPositionalExamples.length < bodyPositionalVars.length) {
+                    errors.push(`BODY example count (${normalizedBodyPositionalExamples.length}) is less than positional variable count (${bodyPositionalVars.length})`)
+                }
+            }
+        }
+    }
+
+    const headerComponent = headerComponents[0]
+    const normalizedMarketingComponents: any[] = []
+
+    if (headerComponent) {
+        const format = readTrimmed(headerComponent.format).toUpperCase()
+        const allowedFormats = new Set(['TEXT', 'IMAGE', 'VIDEO', 'DOCUMENT', 'LOCATION'])
+        if (!format || !allowedFormats.has(format)) {
+            errors.push('HEADER.format must be one of text, image, video, document, location')
+        } else if (format === 'TEXT') {
+            const text = readTrimmed(headerComponent.text)
+            if (!text) errors.push('HEADER.text is required when HEADER.format is text')
+            if (text.length > 60) errors.push('HEADER.text must be <= 60 characters')
+            normalizedMarketingComponents.push({
+                type: 'header',
+                format: 'text',
+                text
+            })
+        } else if (format === 'IMAGE' || format === 'VIDEO' || format === 'DOCUMENT') {
+            const handle = extractHeaderHandle(headerComponent)
+            if (!handle) {
+                errors.push(`HEADER.format ${format.toLowerCase()} requires example.header_handle`)
+            }
+            normalizedMarketingComponents.push({
+                type: 'header',
+                format: format.toLowerCase(),
+                example: {
+                    header_handle: handle ? [handle] : []
+                }
+            })
+        } else {
+            normalizedMarketingComponents.push({
+                type: 'header',
+                format: 'location'
+            })
+        }
+    }
+
+    if (bodyComponent) {
+        const normalizedBody: any = {
+            type: 'body',
+            text: bodyText
+        }
+
+        if (parameterFormat === 'named' && bodyNamedVars.length > 0) {
+            if (normalizedBodyNamedExamples.length > 0) {
+                normalizedBody.example = {
+                    body_text_named_params: normalizedBodyNamedExamples
+                }
+            }
+        } else if (parameterFormat === 'positional' && bodyPositionalVars.length > 0) {
+            if (normalizedBodyPositionalExamples.length > 0) {
+                normalizedBody.example = {
+                    body_text: [normalizedBodyPositionalExamples]
+                }
+            }
+        }
+
+        normalizedMarketingComponents.push(normalizedBody)
+    }
+
+    const footerComponent = footerComponents[0]
+    if (footerComponent) {
+        const footerText = readTrimmed(footerComponent.text)
+        if (!footerText) errors.push('FOOTER.text is required when FOOTER exists')
+        if (footerText.length > 60) errors.push('FOOTER.text must be <= 60 characters')
+        normalizedMarketingComponents.push({
+            type: 'footer',
+            text: footerText
+        })
+    }
+
+    const buttonsComponent = buttonComponents[0]
+    if (buttonsComponent) {
+        const buttons = Array.isArray(buttonsComponent.buttons) ? buttonsComponent.buttons : []
+        if (buttons.length === 0) errors.push('BUTTONS.buttons must contain at least one button')
+        if (buttons.length > 10) errors.push('BUTTONS supports up to 10 buttons')
+
+        const normalizedButtons: any[] = []
+        buttons.forEach((button: any, index: number) => {
+            if (!isObject(button)) {
+                errors.push(`BUTTONS.buttons[${index}] must be an object`)
+                return
+            }
+
+            const rawType = readTrimmed(button.type)
+            const type = rawType.toLowerCase().replace(/-/g, '_')
+            if (!type) {
+                errors.push(`BUTTONS.buttons[${index}].type is required`)
+                return
+            }
+
+            const text = readTrimmed(button.text || button.title)
+            if (text.length > 25) {
+                errors.push(`BUTTONS.buttons[${index}] label must be <= 25 characters`)
+            }
+
+            if (type === 'url' || type === 'phone_number' || type === 'quick_reply') {
+                if (!text) {
+                    errors.push(`BUTTONS.buttons[${index}] label is required`)
+                }
+            }
+
+            const nextButton: any = {
+                type
+            }
+            if (text) nextButton.text = text
+
+            if (type === 'url') {
+                const url = readTrimmed(button.url)
+                if (!url) errors.push(`BUTTONS.buttons[${index}].url is required`)
+                nextButton.url = url
+            }
+
+            if (type === 'phone_number') {
+                const phone = readTrimmed(button.phone_number || button.phoneNumber)
+                if (!phone) {
+                    errors.push(`BUTTONS.buttons[${index}].phone_number is required`)
+                } else if (phone.length > 20) {
+                    errors.push(`BUTTONS.buttons[${index}].phone_number must be <= 20 characters`)
+                }
+                nextButton.phone_number = phone
+            }
+
+            normalizedButtons.push(nextButton)
+        })
+
+        if (normalizedButtons.length > 0) {
+            normalizedMarketingComponents.push({
+                type: 'buttons',
+                buttons: normalizedButtons
+            })
+        }
     }
 
     if (errors.length > 0) return { payload: null, errors }
@@ -937,10 +1292,10 @@ function validateMarketingTemplateInput(input: any): { payload: any | null; erro
     return {
         payload: {
             name,
-            category: 'MARKETING',
+            category: 'marketing',
             language,
-            parameter_format: parameterFormat.toUpperCase(),
-            components
+            parameter_format: parameterFormat,
+            components: normalizedMarketingComponents
         },
         errors: []
     }
@@ -1330,7 +1685,7 @@ function resolveOauthMode(configId?: string | null) {
     return configId ? 'business_integration' : 'user'
 }
 
-app.get('/', (req: any, res: any) => {
+app.get('/health', (req: any, res: any) => {
     res.send('Dashboard Server Running')
 })
 
@@ -1551,8 +1906,7 @@ function loadApiKeys() {
             return {}
         }
     }
-    // Default API key for testing
-    return { 'default-api-key': { profileId: 'default', name: 'Default Key' } }
+    return {}
 }
 
 function saveApiKeys(keys: any) {
@@ -1560,33 +1914,6 @@ function saveApiKeys(keys: any) {
 }
 
 let apiKeys = loadApiKeys()
-
-function resolveProfileIdFromRequest(req: any, res: any): string | null {
-    const adminPassword = req.query?.adminPassword || req.body?.adminPassword
-    if (adminPassword === ADMIN_PASSWORD) {
-        return req.query?.profileId || req.body?.profileId || 'default'
-    }
-
-    const apiKey = req.headers['x-api-key'] || req.query.apiKey
-    if (!apiKey) {
-        res.status(401).json({
-            success: false,
-            error: 'API key required. Provide via X-API-Key header or apiKey query parameter.'
-        })
-        return null
-    }
-
-    const keyInfo = apiKeys[apiKey]
-    if (!keyInfo) {
-        res.status(403).json({
-            success: false,
-            error: 'Invalid API key'
-        })
-        return null
-    }
-
-    return keyInfo.profileId
-}
 
 // Middleware to verify API key
 const verifyApiKey = (req: any, res: any, next: any) => {
@@ -1828,9 +2155,9 @@ app.get('/api/status', verifyApiKey, (req: any, res: any) => {
 // Configure conversational components (welcome message, commands, prompts)
 app.get('/api/waba/conversational-automation', async (req: any, res: any) => {
     try {
-        const profileId = resolveProfileIdFromRequest(req, res)
-        if (!profileId) return
-        const client = await wabaRegistry.getClientByProfile(profileId)
+        const access = await resolveProfileAccess(req, res)
+        if (!access) return
+        const client = await wabaRegistry.getClientByProfile(access.profileId)
         if (!client) {
             return res.status(503).json({ success: false, error: 'WABA not configured for this profile.' })
         }
@@ -1844,9 +2171,9 @@ app.get('/api/waba/conversational-automation', async (req: any, res: any) => {
 
 app.post('/api/waba/conversational-automation', async (req: any, res: any) => {
     try {
-        const profileId = resolveProfileIdFromRequest(req, res)
-        if (!profileId) return
-        const client = await wabaRegistry.getClientByProfile(profileId)
+        const access = await resolveProfileAccess(req, res)
+        if (!access) return
+        const client = await wabaRegistry.getClientByProfile(access.profileId)
         if (!client) {
             return res.status(503).json({ success: false, error: 'WABA not configured for this profile.' })
         }
@@ -1867,13 +2194,13 @@ app.post('/api/waba/conversational-automation', async (req: any, res: any) => {
 // Configure window reminder settings (24h window warning)
 app.get('/api/waba/window-reminder', async (req: any, res: any) => {
     try {
-        const profileId = resolveProfileIdFromRequest(req, res)
-        if (!profileId) return
+        const access = await resolveProfileAccess(req, res)
+        if (!access) return
 
         const { data, error } = await supabase
             .from('waba_configs')
             .select('window_reminder_enabled, window_reminder_minutes, window_reminder_text')
-            .eq('profile_id', profileId)
+            .eq('profile_id', access.profileId)
             .maybeSingle()
 
         if (error) {
@@ -1895,13 +2222,13 @@ app.get('/api/waba/window-reminder', async (req: any, res: any) => {
 
 app.post('/api/waba/window-reminder', async (req: any, res: any) => {
     try {
-        const profileId = resolveProfileIdFromRequest(req, res)
-        if (!profileId) return
+        const access = await resolveProfileAccess(req, res)
+        if (!access) return
 
         const { data: existing, error: fetchError } = await supabase
             .from('waba_configs')
             .select('profile_id')
-            .eq('profile_id', profileId)
+            .eq('profile_id', access.profileId)
             .maybeSingle()
 
         if (fetchError) {
@@ -1927,7 +2254,7 @@ app.post('/api/waba/window-reminder', async (req: any, res: any) => {
         const { error } = await supabase
             .from('waba_configs')
             .update(updatePayload)
-            .eq('profile_id', profileId)
+            .eq('profile_id', access.profileId)
 
         if (error) {
             return res.status(500).json({ success: false, error: error.message })
@@ -2057,6 +2384,14 @@ app.post('/api/waba/manual-config', async (req: any, res: any) => {
 
         if (!wabaId || !phoneNumberId || !accessToken) {
             return res.status(400).json({ success: false, error: 'wabaId, phoneNumberId, and accessToken are required' })
+        }
+
+        const phoneConfigConflict = await findConflictingActivePhoneNumberConfig(phoneNumberId, profileId)
+        if (phoneConfigConflict) {
+            return res.status(409).json({
+                success: false,
+                error: `phoneNumberId "${phoneNumberId}" is already connected to profile "${phoneConfigConflict.profileId}". Disconnect it first.`
+            })
         }
 
         if (!verifyToken) {
@@ -2373,6 +2708,20 @@ app.get('/auth/waba/callback', async (req: any, res: any) => {
             phoneNumberId = numbers[0].id
         }
 
+        const stateProfileId = typeof stateRow.profile_id === 'string' ? stateRow.profile_id.trim() : ''
+        if (!stateProfileId) {
+            return res.status(400).send(renderOauthHtml('Invalid callback', 'Profile information is missing in OAuth state.'))
+        }
+
+        const phoneConfigConflict = await findConflictingActivePhoneNumberConfig(phoneNumberId, stateProfileId)
+        if (phoneConfigConflict) {
+            return res.status(409).send(renderOauthHtml(
+                'Phone number already connected',
+                `phoneNumberId "${phoneNumberId}" is already connected to another profile. Disconnect it first.`,
+                stateRow.redirect_url || resolveOauthReturnUrl(req)
+            ))
+        }
+
         try {
             await subscribeWabaApp(wabaId, graphToken, apiVersion)
         } catch (err: any) {
@@ -2408,7 +2757,7 @@ app.get('/auth/waba/callback', async (req: any, res: any) => {
             : baseTokenExpiresAt
 
         const payload: any = {
-            profile_id: stateRow.profile_id,
+            profile_id: stateProfileId,
             company_id: stateRow.company_id,
             app_id: appId,
             phone_number_id: phoneNumberId,
@@ -3151,15 +3500,15 @@ app.post('/api/waba/clients/disconnect', async (req: any, res: any) => {
 // Connected client businesses for Meta app
 app.get('/api/waba/connected-client-businesses', async (req: any, res: any) => {
     try {
-        const profileId = resolveProfileIdFromRequest(req, res)
-        if (!profileId) return
+        const access = await resolveProfileAccess(req, res)
+        if (!access) return
 
-        const client = await wabaRegistry.getClientByProfile(profileId)
+        const client = await wabaRegistry.getClientByProfile(access.profileId)
         if (!client) {
             return res.status(503).json({ success: false, error: 'WABA not configured for this profile.' })
         }
 
-        const config = await wabaRegistry.getConfigByProfile(profileId)
+        const config = await wabaRegistry.getConfigByProfile(access.profileId)
         const rawAppId = req.query?.appId
         const appId = (Array.isArray(rawAppId) ? rawAppId[0] : rawAppId) || config?.appId
 
@@ -3193,18 +3542,13 @@ app.get('/api/waba/connected-client-businesses', async (req: any, res: any) => {
 // Configure global fallback settings (company-level)
 app.get('/api/company/fallback-settings', async (req: any, res: any) => {
     try {
-        const profileId = resolveProfileIdFromRequest(req, res)
-        if (!profileId) return
-
-        const companyId = await getCompanyIdForProfileOrProfileTable(profileId)
-        if (!companyId) {
-            return res.status(400).json({ success: false, error: 'Company not found' })
-        }
+        const access = await resolveProfileAccess(req, res)
+        if (!access) return
 
         const { data, error } = await supabase
             .from('company')
             .select('fallback_text, fallback_limit')
-            .eq('id', companyId)
+            .eq('id', access.companyId)
             .maybeSingle()
 
         if (error) {
@@ -3225,13 +3569,8 @@ app.get('/api/company/fallback-settings', async (req: any, res: any) => {
 
 app.post('/api/company/fallback-settings', async (req: any, res: any) => {
     try {
-        const profileId = resolveProfileIdFromRequest(req, res)
-        if (!profileId) return
-
-        const companyId = await getCompanyIdForProfileOrProfileTable(profileId)
-        if (!companyId) {
-            return res.status(400).json({ success: false, error: 'Company not found' })
-        }
+        const access = await resolveProfileAccess(req, res)
+        if (!access) return
 
         const rawText = req.body?.fallback_text
         const rawLimit = req.body?.fallback_limit
@@ -3251,7 +3590,7 @@ app.post('/api/company/fallback-settings', async (req: any, res: any) => {
                 fallback_text: fallbackText,
                 fallback_limit: fallbackLimit
             })
-            .eq('id', companyId)
+            .eq('id', access.companyId)
 
         if (error) {
             return res.status(500).json({ success: false, error: error.message })
@@ -3278,18 +3617,13 @@ const normalizeQuickReplyShortcut = (value: unknown): string => {
 // Configure quick replies (company-level)
 app.get('/api/company/quick-replies', async (req: any, res: any) => {
     try {
-        const profileId = resolveProfileIdFromRequest(req, res)
-        if (!profileId) return
-
-        const companyId = await getCompanyIdForProfileOrProfileTable(profileId)
-        if (!companyId) {
-            return res.status(400).json({ success: false, error: 'Company not found' })
-        }
+        const access = await resolveProfileAccess(req, res)
+        if (!access) return
 
         const { data, error } = await supabase
             .from('quick_replies')
             .select('id, shortcut, text, created_at, updated_at')
-            .eq('company_id', companyId)
+            .eq('company_id', access.companyId)
             .order('shortcut', { ascending: true })
 
         if (error) {
@@ -3304,13 +3638,8 @@ app.get('/api/company/quick-replies', async (req: any, res: any) => {
 
 app.post('/api/company/quick-replies', async (req: any, res: any) => {
     try {
-        const profileId = resolveProfileIdFromRequest(req, res)
-        if (!profileId) return
-
-        const companyId = await getCompanyIdForProfileOrProfileTable(profileId)
-        if (!companyId) {
-            return res.status(400).json({ success: false, error: 'Company not found' })
-        }
+        const access = await resolveProfileAccess(req, res)
+        if (!access) return
 
         const rawItems = req.body?.items
         if (!Array.isArray(rawItems)) {
@@ -3333,7 +3662,7 @@ app.post('/api/company/quick-replies', async (req: any, res: any) => {
         const { error: deleteError } = await supabase
             .from('quick_replies')
             .delete()
-            .eq('company_id', companyId)
+            .eq('company_id', access.companyId)
 
         if (deleteError) {
             return res.status(500).json({ success: false, error: deleteError.message })
@@ -3343,7 +3672,7 @@ app.post('/api/company/quick-replies', async (req: any, res: any) => {
             const { error: insertError } = await supabase
                 .from('quick_replies')
                 .insert(cleaned.map(item => ({
-                    company_id: companyId,
+                    company_id: access.companyId,
                     shortcut: item.shortcut,
                     text: item.text,
                     updated_at: new Date().toISOString()
@@ -3394,6 +3723,8 @@ app.get('/api/company/team-users', async (req: any, res: any) => {
             const entry: any = {
                 id: row.user_id,
                 role: normalizeTeamRole(row.role),
+                department: 'custom' as TeamDepartment,
+                customDepartment: null as string | null,
                 color: computeAgentColor(row.user_id),
                 createdAt: row.created_at || null
             }
@@ -3404,6 +3735,11 @@ app.get('/api/company/team-users', async (req: any, res: any) => {
                     entry.email = authUser.email || null
                     entry.name = deriveAgentName(authUser)
                     entry.lastSignInAt = authUser.last_sign_in_at || null
+                    const metadata = authUser.user_metadata || {}
+                    entry.department = normalizeTeamDepartment(metadata.team_department)
+                    entry.customDepartment = entry.department === 'custom'
+                        ? normalizeTeamCustomDepartment(metadata.team_department_custom)
+                        : null
                 }
             }
             if (!entry.name) entry.name = row.user_id
@@ -3436,19 +3772,37 @@ app.post('/api/company/team-users/invite', async (req: any, res: any) => {
         const email = readTrimmed(req.body?.email).toLowerCase()
         const requestedRole = normalizeTeamRole(req.body?.role)
         const role: TeamRole = requestedRole === 'owner' ? 'admin' : requestedRole
+        const password = typeof req.body?.password === 'string' ? req.body.password : ''
+        const department = normalizeTeamDepartment(req.body?.department)
+        const customDepartment = normalizeTeamCustomDepartment(req.body?.customDepartment)
         if (!email || !/^\S+@\S+\.\S+$/.test(email)) {
             return res.status(400).json({ success: false, error: 'Valid email is required' })
         }
-
-        const invited = await supabase.auth.admin.inviteUserByEmail(email, {
-            data: { company_id: access.companyId }
-        } as any)
-
-        if (invited.error || !invited.data?.user?.id) {
-            return res.status(500).json({ success: false, error: invited.error?.message || 'Failed to invite user' })
+        if (password.length < 8) {
+            return res.status(400).json({ success: false, error: 'Password must be at least 8 characters' })
+        }
+        if (department === 'custom' && !customDepartment) {
+            return res.status(400).json({ success: false, error: 'Custom department label is required' })
         }
 
-        const invitedUserId = invited.data.user.id
+        const created = await supabase.auth.admin.createUser({
+            email,
+            password,
+            email_confirm: true,
+            user_metadata: {
+                company_id: access.companyId,
+                team_department: department,
+                team_department_custom: department === 'custom' ? customDepartment : null
+            }
+        } as any)
+
+        if (created.error || !created.data?.user?.id) {
+            const message = created.error?.message || 'Failed to create user'
+            const isConflict = /already|exists|registered/i.test(message)
+            return res.status(isConflict ? 409 : 500).json({ success: false, error: message })
+        }
+
+        const invitedUserId = created.data.user.id
         const { error: upsertError } = await supabase
             .from('user_roles')
             .upsert({
@@ -3468,7 +3822,9 @@ app.post('/api/company/team-users/invite', async (req: any, res: any) => {
             data: {
                 id: invitedUserId,
                 email,
-                role
+                role,
+                department,
+                customDepartment: department === 'custom' ? customDepartment : null
             }
         })
     } catch (error: any) {
@@ -3524,6 +3880,75 @@ app.patch('/api/company/team-users/:userId/role', async (req: any, res: any) => 
             data: {
                 id: targetUserId,
                 role: nextRole
+            }
+        })
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message })
+    }
+})
+
+app.patch('/api/company/team-users/:userId/department', async (req: any, res: any) => {
+    try {
+        const access = await resolveCompanyAccess(req, res, 'admin')
+        if (!access) return
+
+        const hasServiceRole = Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_KEY)
+        if (!hasServiceRole) {
+            return res.status(500).json({ success: false, error: 'SUPABASE_SERVICE_ROLE_KEY is required to update departments' })
+        }
+
+        const targetUserId = readTrimmed(req.params?.userId)
+        if (!targetUserId) {
+            return res.status(400).json({ success: false, error: 'userId is required' })
+        }
+
+        const department = normalizeTeamDepartment(req.body?.department)
+        const customDepartment = normalizeTeamCustomDepartment(req.body?.customDepartment)
+        if (department === 'custom' && !customDepartment) {
+            return res.status(400).json({ success: false, error: 'Custom department label is required' })
+        }
+
+        const { data: targetRoleRow, error: roleError } = await supabase
+            .from('user_roles')
+            .select('user_id, company_id')
+            .eq('user_id', targetUserId)
+            .eq('company_id', access.companyId)
+            .maybeSingle()
+
+        if (roleError) {
+            return res.status(500).json({ success: false, error: roleError.message })
+        }
+        if (!targetRoleRow?.user_id) {
+            return res.status(404).json({ success: false, error: 'Team user not found in your company' })
+        }
+
+        const { data: authUserData, error: authUserError } = await supabase.auth.admin.getUserById(targetUserId)
+        if (authUserError || !authUserData?.user) {
+            return res.status(500).json({ success: false, error: authUserError?.message || 'Failed to load target user' })
+        }
+
+        const previousMetadata = authUserData.user.user_metadata || {}
+        const nextMetadata = {
+            ...previousMetadata,
+            company_id: access.companyId,
+            team_department: department,
+            team_department_custom: department === 'custom' ? customDepartment : null
+        }
+
+        const { error: updateError } = await supabase.auth.admin.updateUserById(targetUserId, {
+            user_metadata: nextMetadata
+        } as any)
+
+        if (updateError) {
+            return res.status(500).json({ success: false, error: updateError.message })
+        }
+
+        res.json({
+            success: true,
+            data: {
+                id: targetUserId,
+                department,
+                customDepartment: department === 'custom' ? customDepartment : null
             }
         })
     } catch (error: any) {
@@ -3656,85 +4081,645 @@ app.get('/api/admin/api-keys', (req: any, res: any) => {
     res.json({ success: true, data: apiKeys })
 })
 
-// ============================================
-// ADMIN SUMMARY (/my)
-// ============================================
-app.get('/my', async (req: any, res: any) => {
-    try {
-        const adminPassword = req.query?.adminPassword || req.headers['x-admin-password']
-        if (adminPassword !== ADMIN_PASSWORD) {
-            return res.status(403).json({ success: false, error: 'Invalid admin password' })
+function isWabaAdminUser(user: any): boolean {
+    const userMeta = user?.user_metadata || {}
+    const appMeta = user?.app_metadata || {}
+    const candidates = [
+        userMeta.waba_admin,
+        userMeta.is_waba_admin,
+        appMeta.waba_admin,
+        appMeta.is_waba_admin,
+        appMeta.role
+    ]
+    return candidates.some((value) => {
+        if (value === true) return true
+        if (typeof value === 'string') {
+            const normalized = value.trim().toLowerCase()
+            return normalized === 'true' || normalized === 'waba_admin' || normalized === 'super_admin'
         }
+        return false
+    })
+}
 
-        const { data: companies, error } = await supabase
-            .from('company')
-            .select('*')
-            .order('created_at', { ascending: false })
+function extractAdminEmail(req: any): string {
+    const bodyEmail = req.body?.email ?? req.body?.adminId
+    const queryEmail = req.query?.email ?? req.query?.adminId
+    const headerEmail = req.headers?.['x-admin-email']
+    if (Array.isArray(bodyEmail) && bodyEmail.length > 0) return String(bodyEmail[0] || '').trim().toLowerCase()
+    if (typeof bodyEmail === 'string') return bodyEmail.trim().toLowerCase()
+    if (Array.isArray(queryEmail) && queryEmail.length > 0) return String(queryEmail[0] || '').trim().toLowerCase()
+    if (typeof queryEmail === 'string') return queryEmail.trim().toLowerCase()
+    if (Array.isArray(headerEmail) && headerEmail.length > 0) return String(headerEmail[0] || '').trim().toLowerCase()
+    if (typeof headerEmail === 'string') return headerEmail.trim().toLowerCase()
+    return ''
+}
 
+function extractAdminPassword(req: any): string {
+    const bodyPassword = req.body?.password ?? req.body?.adminPassword
+    const queryPassword = req.query?.password ?? req.query?.adminPassword
+    const headerPassword = req.headers?.['x-admin-password']
+    if (Array.isArray(bodyPassword) && bodyPassword.length > 0) return String(bodyPassword[0] || '')
+    if (typeof bodyPassword === 'string') return bodyPassword
+    if (Array.isArray(queryPassword) && queryPassword.length > 0) return String(queryPassword[0] || '')
+    if (typeof queryPassword === 'string') return queryPassword
+    if (Array.isArray(headerPassword) && headerPassword.length > 0) return String(headerPassword[0] || '')
+    if (typeof headerPassword === 'string') return headerPassword
+    return ''
+}
+
+function extractBearerToken(req: any): string {
+    const rawAuth = req.headers?.authorization
+    if (!rawAuth || typeof rawAuth !== 'string') return ''
+    if (rawAuth.startsWith('Bearer ')) return rawAuth.slice(7).trim()
+    return rawAuth.trim()
+}
+
+async function countWabaAdminUsers(): Promise<number> {
+    const hasServiceRole = Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_KEY)
+    if (!hasServiceRole) {
+        throw new Error('SUPABASE_SERVICE_ROLE_KEY is required for WABA admin setup')
+    }
+
+    let page = 1
+    const perPage = 200
+    let count = 0
+
+    while (true) {
+        const { data, error } = await supabase.auth.admin.listUsers({ page, perPage })
         if (error) {
-            return res.status(500).json({ success: false, error: error.message })
+            throw new Error(error.message)
         }
 
-        const companyRows = companies || []
+        const users = Array.isArray(data?.users) ? data.users : []
+        users.forEach((user: any) => {
+            if (isWabaAdminUser(user)) count += 1
+        })
 
-        const companyStats = await Promise.all(companyRows.map(async (company: any) => {
-            const [
-                profilesCount,
-                usersCount,
-                workflowsCount,
-                wabaCount,
-                wabaEnabledCount,
-                messagesCount
-            ] = await Promise.all([
-                supabase.from('profiles').select('id', { count: 'exact', head: true }).eq('company_id', company.id),
-                supabase.from('users').select('id', { count: 'exact', head: true }).eq('company_id', company.id),
-                supabase.from('workflows').select('id', { count: 'exact', head: true }).eq('company_id', company.id),
-                supabase.from('waba_configs').select('profile_id', { count: 'exact', head: true }).eq('company_id', company.id),
-                supabase.from('waba_configs').select('profile_id', { count: 'exact', head: true }).eq('company_id', company.id).eq('enabled', true),
-                supabase
-                    .from('messages')
-                    .select('id, users!inner(company_id)', { count: 'exact', head: true })
-                    .eq('users.company_id', company.id)
-            ])
+        if (users.length < perPage || page >= 50) break
+        page += 1
+    }
 
-            return {
-                id: company.id,
-                name: company.name,
-                email: company.email,
-                created_at: company.created_at,
-                counts: {
-                    profiles: profilesCount.count || 0,
-                    contacts: usersCount.count || 0,
-                    workflows: workflowsCount.count || 0,
-                    waba_configs: wabaCount.count || 0,
-                    waba_enabled: wabaEnabledCount.count || 0,
-                    messages: messagesCount.count || 0
-                }
+    return count
+}
+
+async function resolveWabaAdminAccess(req: any, res: any) {
+    const token = extractBearerToken(req)
+    if (!token) {
+        res.status(401).json({ success: false, error: 'Authorization token required' })
+        return null
+    }
+
+    const { data: { user }, error } = await supabase.auth.getUser(token)
+    if (error || !user) {
+        res.status(401).json({ success: false, error: 'Invalid or expired session' })
+        return null
+    }
+
+    if (!isWabaAdminUser(user)) {
+        res.status(403).json({ success: false, error: 'WABA admin access required' })
+        return null
+    }
+
+    return { user, token }
+}
+
+async function buildAdminSummaryPayload() {
+    const { data: companies, error } = await supabase
+        .from('company')
+        .select('*')
+        .order('created_at', { ascending: false })
+
+    if (error) {
+        throw new Error(error.message)
+    }
+
+    const companyRows = companies || []
+    const companyStats = await Promise.all(companyRows.map(async (company: any) => {
+        const [
+            profilesCount,
+            usersCount,
+            workflowsCount,
+            wabaCount,
+            wabaEnabledCount,
+            messagesCount
+        ] = await Promise.all([
+            supabase.from('profiles').select('id', { count: 'exact', head: true }).eq('company_id', company.id),
+            supabase.from('users').select('id', { count: 'exact', head: true }).eq('company_id', company.id),
+            supabase.from('workflows').select('id', { count: 'exact', head: true }).eq('company_id', company.id),
+            supabase.from('waba_configs').select('profile_id', { count: 'exact', head: true }).eq('company_id', company.id),
+            supabase.from('waba_configs').select('profile_id', { count: 'exact', head: true }).eq('company_id', company.id).eq('enabled', true),
+            supabase
+                .from('messages')
+                .select('id, users!inner(company_id)', { count: 'exact', head: true })
+                .eq('users.company_id', company.id)
+        ])
+
+        return {
+            id: company.id,
+            name: company.name,
+            email: company.email,
+            created_at: company.created_at,
+            counts: {
+                profiles: profilesCount.count || 0,
+                contacts: usersCount.count || 0,
+                workflows: workflowsCount.count || 0,
+                waba_configs: wabaCount.count || 0,
+                waba_enabled: wabaEnabledCount.count || 0,
+                messages: messagesCount.count || 0
             }
-        }))
+        }
+    }))
 
-        const totals = companyStats.reduce(
-            (acc, row) => {
-                acc.companies += 1
-                acc.profiles += row.counts.profiles
-                acc.contacts += row.counts.contacts
-                acc.workflows += row.counts.workflows
-                acc.waba_configs += row.counts.waba_configs
-                acc.waba_enabled += row.counts.waba_enabled
-                acc.messages += row.counts.messages
-                return acc
-            },
-            { companies: 0, profiles: 0, contacts: 0, workflows: 0, waba_configs: 0, waba_enabled: 0, messages: 0 }
-        )
+    const totals = companyStats.reduce(
+        (acc, row) => {
+            acc.companies += 1
+            acc.profiles += row.counts.profiles
+            acc.contacts += row.counts.contacts
+            acc.workflows += row.counts.workflows
+            acc.waba_configs += row.counts.waba_configs
+            acc.waba_enabled += row.counts.waba_enabled
+            acc.messages += row.counts.messages
+            return acc
+        },
+        { companies: 0, profiles: 0, contacts: 0, workflows: 0, waba_configs: 0, waba_enabled: 0, messages: 0 }
+    )
 
-        return res.json({ success: true, totals, companies: companyStats })
+    return { totals, companies: companyStats }
+}
+
+// ============================================
+// MYADMIN (Super Admin Monitor)
+// ============================================
+app.get('/api/admin/setup-status', async (_req: any, res: any) => {
+    try {
+        const admins = await countWabaAdminUsers()
+        return res.json({
+            success: true,
+            data: {
+                setupOpen: admins === 0,
+                admins
+            }
+        })
+    } catch (error: any) {
+        return res.status(500).json({ success: false, error: error?.message || 'Failed to load setup status' })
+    }
+})
+
+app.post('/api/admin/setup', async (req: any, res: any) => {
+    try {
+        const hasServiceRole = Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_KEY)
+        if (!hasServiceRole) {
+            return res.status(500).json({ success: false, error: 'SUPABASE_SERVICE_ROLE_KEY is required to create WABA admin' })
+        }
+
+        const email = extractAdminEmail(req)
+        const password = extractAdminPassword(req)
+        if (!email || !/^\S+@\S+\.\S+$/.test(email)) {
+            return res.status(400).json({ success: false, error: 'Valid email is required' })
+        }
+        if (password.length < 8) {
+            return res.status(400).json({ success: false, error: 'Password must be at least 8 characters' })
+        }
+
+        const admins = await countWabaAdminUsers()
+        if (admins > 0) {
+            return res.status(409).json({ success: false, error: 'Setup is already closed. WABA admin already exists.' })
+        }
+
+        const created = await supabase.auth.admin.createUser({
+            email,
+            password,
+            email_confirm: true,
+            user_metadata: {
+                waba_admin: true
+            }
+        } as any)
+
+        if (created.error || !created.data?.user?.id) {
+            const message = created.error?.message || 'Failed to create WABA admin'
+            const isConflict = /already|exists|registered/i.test(message)
+            return res.status(isConflict ? 409 : 500).json({ success: false, error: message })
+        }
+
+        return res.json({
+            success: true,
+            data: {
+                userId: created.data.user.id,
+                email
+            }
+        })
+    } catch (error: any) {
+        return res.status(500).json({ success: false, error: error?.message || 'Failed to create WABA admin' })
+    }
+})
+
+app.post('/api/admin/login', async (req: any, res: any) => {
+    try {
+        const email = extractAdminEmail(req)
+        const password = extractAdminPassword(req)
+        if (!email || !password) {
+            return res.status(400).json({ success: false, error: 'Email and password are required' })
+        }
+
+        const { data, error } = await supabase.auth.signInWithPassword({ email, password })
+        if (error || !data?.user || !data?.session) {
+            return res.status(401).json({ success: false, error: error?.message || 'Invalid email or password' })
+        }
+
+        if (!isWabaAdminUser(data.user)) {
+            return res.status(403).json({ success: false, error: 'WABA admin access required' })
+        }
+
+        return res.json({
+            success: true,
+            data: {
+                email: data.user.email || email,
+                accessToken: data.session.access_token,
+                refreshToken: data.session.refresh_token,
+                expiresAt: data.session.expires_at || null
+            }
+        })
+    } catch (error: any) {
+        return res.status(500).json({ success: false, error: error?.message || 'Login failed' })
+    }
+})
+
+app.get('/api/admin/summary', async (req: any, res: any) => {
+    try {
+        const access = await resolveWabaAdminAccess(req, res)
+        if (!access) return
+        const payload = await buildAdminSummaryPayload()
+        return res.json({ success: true, ...payload })
     } catch (error: any) {
         return res.status(500).json({ success: false, error: error?.message || 'Failed to load admin summary' })
     }
 })
 
+// Backward-compatible JSON endpoint
+app.get('/my', async (req: any, res: any) => {
+    try {
+        const access = await resolveWabaAdminAccess(req, res)
+        if (!access) return
+        const payload = await buildAdminSummaryPayload()
+        return res.json({ success: true, ...payload })
+    } catch (error: any) {
+        return res.status(500).json({ success: false, error: error?.message || 'Failed to load admin summary' })
+    }
+})
+
+app.get('/myadmin', (_req: any, res: any) => {
+    const html = `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>MyAdmin Company Monitor</title>
+  <style>
+    :root { --bg:#f4f7f8; --card:#ffffff; --line:#d9e2e6; --text:#111b21; --muted:#54656f; --brand:#00a884; }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: Arial, sans-serif; background: var(--bg); color: var(--text); }
+    .wrap { max-width: 1200px; margin: 0 auto; padding: 24px; }
+    .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; }
+    .login { max-width: 440px; margin: 80px auto; padding: 20px; display: grid; gap: 10px; }
+    .panel-head { display: flex; gap: 10px; align-items: center; justify-content: space-between; flex-wrap: wrap; padding: 16px; margin-bottom: 16px; }
+    .inline { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+    input, button { font: inherit; }
+    input { width: 100%; border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }
+    button { border: 0; border-radius: 10px; padding: 10px 14px; cursor: pointer; font-weight: 700; }
+    .btn-primary { background: var(--brand); color: #fff; }
+    .btn-secondary { background: #eaf4f2; color: #0b6f59; }
+    .status { padding: 12px 16px; margin-bottom: 16px; color: var(--muted); }
+    .totals { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; padding: 16px; margin-bottom: 16px; }
+    .metric { padding: 12px; border: 1px solid var(--line); border-radius: 10px; background: #fcfdfd; }
+    .metric b { display: block; font-size: 20px; margin-top: 4px; }
+    .table-wrap { overflow: auto; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--line); font-size: 13px; white-space: nowrap; }
+    th { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; }
+    .mono { font-family: Menlo, Consolas, monospace; }
+    .right { text-align: right; }
+    .hidden { display: none; }
+    .title { margin: 0; font-size: 18px; font-weight: 700; }
+    .hint { color: var(--muted); font-size: 13px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div id="loginPanel" class="card login">
+      <h1 class="title">MyAdmin Login</h1>
+      <div class="hint">Use WABA admin credentials to monitor all companies.</div>
+      <input id="adminIdInput" type="email" placeholder="Admin email" />
+      <input id="adminPasswordInput" type="password" placeholder="Password" />
+      <button id="setupBtn" class="btn-secondary hidden">Create First WABA Admin</button>
+      <button id="loginBtn" class="btn-primary">Login</button>
+      <div id="loginStatus" class="hint"></div>
+    </div>
+
+    <div id="monitorPanel" class="hidden">
+      <div class="card panel-head">
+        <div class="inline">
+          <h2 class="title">MyAdmin Company Monitor</h2>
+          <span id="adminBadge" class="hint"></span>
+        </div>
+        <div class="inline">
+          <button id="refreshBtn" class="btn-primary">Refresh</button>
+          <button id="logoutBtn" class="btn-secondary">Logout</button>
+        </div>
+      </div>
+
+      <div id="status" class="card status">Ready.</div>
+      <div id="totals" class="card totals" style="display:none"></div>
+
+      <div class="card table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Company ID</th>
+              <th>Name</th>
+              <th>Email</th>
+              <th class="right">Profiles</th>
+              <th class="right">Contacts</th>
+              <th class="right">Workflows</th>
+              <th class="right">WABA</th>
+              <th class="right">WABA On</th>
+              <th class="right">Messages</th>
+              <th>Created</th>
+            </tr>
+          </thead>
+          <tbody id="companyRows"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const STORAGE_KEY_EMAIL = 'myadmin_email';
+    const STORAGE_KEY_TOKEN = 'myadmin_token';
+
+    const loginPanel = document.getElementById('loginPanel');
+    const monitorPanel = document.getElementById('monitorPanel');
+    const adminEmailInput = document.getElementById('adminIdInput');
+    const adminPasswordInput = document.getElementById('adminPasswordInput');
+    const setupBtn = document.getElementById('setupBtn');
+    const loginBtn = document.getElementById('loginBtn');
+    const loginStatus = document.getElementById('loginStatus');
+    const adminBadge = document.getElementById('adminBadge');
+    const refreshBtn = document.getElementById('refreshBtn');
+    const logoutBtn = document.getElementById('logoutBtn');
+    const statusEl = document.getElementById('status');
+    const totalsEl = document.getElementById('totals');
+    const rowsEl = document.getElementById('companyRows');
+
+    function setStatus(message, isError) {
+      statusEl.textContent = message;
+      statusEl.style.color = isError ? '#b42318' : '#54656f';
+    }
+
+    function showLogin(message, isError) {
+      loginPanel.classList.remove('hidden');
+      monitorPanel.classList.add('hidden');
+      loginStatus.textContent = message || '';
+      loginStatus.style.color = isError ? '#b42318' : '#54656f';
+    }
+
+    function showMonitor(adminEmail) {
+      adminBadge.textContent = adminEmail ? 'Signed in as ' + adminEmail : '';
+      loginPanel.classList.add('hidden');
+      monitorPanel.classList.remove('hidden');
+      loginStatus.textContent = '';
+    }
+
+    function readStoredCreds() {
+      return {
+        email: sessionStorage.getItem(STORAGE_KEY_EMAIL) || '',
+        token: sessionStorage.getItem(STORAGE_KEY_TOKEN) || ''
+      };
+    }
+
+    function saveCreds(email, token) {
+      sessionStorage.setItem(STORAGE_KEY_EMAIL, email);
+      sessionStorage.setItem(STORAGE_KEY_TOKEN, token);
+    }
+
+    function clearCreds() {
+      sessionStorage.removeItem(STORAGE_KEY_EMAIL);
+      sessionStorage.removeItem(STORAGE_KEY_TOKEN);
+    }
+
+    async function fetchSetupStatus() {
+      const res = await fetch('/api/admin/setup-status');
+      const data = await res.json().catch(function() { return null; });
+      if (!res.ok || !data || !data.success) {
+        throw new Error((data && data.error) || 'Failed to load setup status');
+      }
+      return data.data || { setupOpen: false, admins: 0 };
+    }
+
+    async function createFirstAdmin(email, password) {
+      const res = await fetch('/api/admin/setup', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: email, password: password })
+      });
+      const data = await res.json().catch(function() { return null; });
+      if (!res.ok || !data || !data.success) {
+        throw new Error((data && data.error) || 'Failed to create WABA admin');
+      }
+      return data;
+    }
+
+    async function login(email, password) {
+      const res = await fetch('/api/admin/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: email, password: password })
+      });
+      const data = await res.json().catch(function() { return null; });
+      if (!res.ok || !data || !data.success) {
+        throw new Error((data && data.error) || 'Login failed');
+      }
+      return data.data || {};
+    }
+
+    function renderTotals(totals) {
+      totalsEl.innerHTML = '';
+      totalsEl.style.display = 'grid';
+      const keys = ['companies', 'profiles', 'contacts', 'workflows', 'waba_configs', 'waba_enabled', 'messages'];
+      keys.forEach(function(key) {
+        const box = document.createElement('div');
+        box.className = 'metric';
+        const label = document.createElement('span');
+        label.textContent = key.replace('_', ' ');
+        const value = document.createElement('b');
+        value.textContent = String(totals[key] || 0);
+        box.appendChild(label);
+        box.appendChild(value);
+        totalsEl.appendChild(box);
+      });
+    }
+
+    function renderRows(companies) {
+      rowsEl.innerHTML = '';
+      companies.forEach(function(company) {
+        const tr = document.createElement('tr');
+        const values = [
+          { v: company.id, mono: true },
+          { v: company.name || '-' },
+          { v: company.email || '-' },
+          { v: company.counts && company.counts.profiles, right: true },
+          { v: company.counts && company.counts.contacts, right: true },
+          { v: company.counts && company.counts.workflows, right: true },
+          { v: company.counts && company.counts.waba_configs, right: true },
+          { v: company.counts && company.counts.waba_enabled, right: true },
+          { v: company.counts && company.counts.messages, right: true },
+          { v: company.created_at ? new Date(company.created_at).toLocaleString() : '-' }
+        ];
+        values.forEach(function(item) {
+          const td = document.createElement('td');
+          td.textContent = item.v == null ? '-' : String(item.v);
+          if (item.mono) td.className = 'mono';
+          if (item.right) td.className = (td.className ? td.className + ' ' : '') + 'right';
+          tr.appendChild(td);
+        });
+        rowsEl.appendChild(tr);
+      });
+    }
+
+    async function loadSummary() {
+      const creds = readStoredCreds();
+      if (!creds.token) {
+        showLogin('Please login first.', true);
+        return;
+      }
+      setStatus('Loading company monitor...', false);
+      refreshBtn.disabled = true;
+      try {
+        const res = await fetch('/api/admin/summary', {
+          headers: {
+            'Authorization': 'Bearer ' + creds.token
+          }
+        });
+        const data = await res.json().catch(function() { return null; });
+        if (!res.ok || !data || !data.success) {
+          throw new Error((data && data.error) || 'Failed to load admin summary');
+        }
+        renderTotals(data.totals || {});
+        renderRows(Array.isArray(data.companies) ? data.companies : []);
+        setStatus('Loaded ' + String((data.totals && data.totals.companies) || 0) + ' companies.', false);
+      } catch (err) {
+        clearCreds();
+        showLogin(err && err.message ? err.message : 'Session expired. Please login again.', true);
+      } finally {
+        refreshBtn.disabled = false;
+      }
+    }
+
+    async function refreshSetupControls() {
+      try {
+        const setup = await fetchSetupStatus();
+        if (setup.setupOpen) {
+          setupBtn.classList.remove('hidden');
+          if (!loginStatus.textContent) {
+            showLogin('Setup is open. Create the first WABA admin account.', false);
+          }
+        } else {
+          setupBtn.classList.add('hidden');
+        }
+      } catch (err) {
+        showLogin(err && err.message ? err.message : 'Failed to load setup status.', true);
+      }
+    }
+
+    loginBtn.addEventListener('click', async function() {
+      const email = (adminEmailInput.value || '').trim().toLowerCase();
+      const password = adminPasswordInput.value || '';
+      if (!email || !password) {
+        showLogin('Enter admin email and password.', true);
+        return;
+      }
+      loginBtn.disabled = true;
+      try {
+        const data = await login(email, password);
+        if (!data.accessToken) throw new Error('Missing access token');
+        saveCreds(data.email || email, data.accessToken);
+        showMonitor(data.email || email);
+        await loadSummary();
+      } catch (err) {
+        showLogin(err && err.message ? err.message : 'Login failed.', true);
+      } finally {
+        loginBtn.disabled = false;
+      }
+    });
+
+    setupBtn.addEventListener('click', async function() {
+      const email = (adminEmailInput.value || '').trim().toLowerCase();
+      const password = adminPasswordInput.value || '';
+      if (!email || !password) {
+        showLogin('Enter admin email and password first.', true);
+        return;
+      }
+      setupBtn.disabled = true;
+      try {
+        await createFirstAdmin(email, password);
+        const data = await login(email, password);
+        if (!data.accessToken) throw new Error('Missing access token');
+        saveCreds(data.email || email, data.accessToken);
+        showMonitor(data.email || email);
+        await loadSummary();
+      } catch (err) {
+        showLogin(err && err.message ? err.message : 'Failed to create admin.', true);
+      } finally {
+        setupBtn.disabled = false;
+        await refreshSetupControls();
+      }
+    });
+
+    adminPasswordInput.addEventListener('keydown', function(event) {
+      if (event.key === 'Enter') loginBtn.click();
+    });
+
+    refreshBtn.addEventListener('click', loadSummary);
+    logoutBtn.addEventListener('click', function() {
+      clearCreds();
+      totalsEl.style.display = 'none';
+      totalsEl.innerHTML = '';
+      rowsEl.innerHTML = '';
+      adminPasswordInput.value = '';
+      showLogin('Logged out.', false);
+    });
+
+    async function init() {
+      await refreshSetupControls();
+      const stored = readStoredCreds();
+      if (stored.email && stored.token) {
+        adminEmailInput.value = stored.email;
+        showMonitor(stored.email);
+        await loadSummary();
+      } else {
+        showLogin('', false);
+      }
+    }
+
+    init();
+  </script>
+</body>
+</html>`
+
+    res.setHeader('content-type', 'text/html; charset=utf-8')
+    return res.send(html)
+})
+
 const getClient = async (profileId: string) => wabaRegistry.getClientByProfile(profileId)
-app.use('/addon', addon.createAddonRouter(getClient, getCompanyIdForProfile, workflowEngine, verifyApiKey))
+app.use(
+    '/addon',
+    addon.createAddonRouter(
+        getClient,
+        getCompanyIdForProfile,
+        workflowEngine,
+        verifyApiKey,
+        { resolveProfileAccess }
+    )
+)
 
 function buildSyntheticMessage(inbound: WabaInboundMessage) {
     const from = (inbound.from || '').replace(/\D/g, '')
@@ -4080,7 +5065,21 @@ io.use(async (socket, next) => {
         const { data: { user }, error } = await supabase.auth.getUser(token)
         if (error || !user) return next(new Error('Authentication error: Invalid session'))
 
+        const requestHostname = getHostnameFromHeaders(socket.handshake.headers || {})
+        const hostCompanyId = resolveCompanyIdFromHostname(requestHostname)
+        const directCompanyId = normalizeCompanyId(getUserCompanyId(user))
+        if (hostCompanyId && !directCompanyId) {
+            return next(new Error('Authentication error: Account is not assigned to any company'))
+        }
+        if (hostCompanyId && directCompanyId && directCompanyId !== hostCompanyId) {
+            return next(new Error('Authentication error: Company mismatch for this subdomain'))
+        }
+
         const { user: ensuredUser, companyId } = await ensureUserCompanyId(user)
+        const ensuredCompanyId = normalizeCompanyId(companyId || getUserCompanyId(ensuredUser))
+        if (hostCompanyId && ensuredCompanyId !== hostCompanyId) {
+            return next(new Error('Authentication error: Company mismatch for this subdomain'))
+        }
         socket.data.user = ensuredUser
         if (companyId) socket.data.companyId = companyId
         next()

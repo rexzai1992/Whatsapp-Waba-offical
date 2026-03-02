@@ -1,0 +1,9 @@
+tunnel: 0bcd5d57-0dc6-4353-b5c8-f81c3ac80180
+credentials-file: /Users/cravemac2/.cloudflared/0bcd5d57-0dc6-4353-b5c8-f81c3ac80180.json
+
+ingress:
+  - hostname: 2fast.xyz
+    service: http://localhost:3000
+  - hostname: '*.2fast.xyz'
+    service: http://localhost:3000
+  - service: http_status:404

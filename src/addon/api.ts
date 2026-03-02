@@ -10,9 +10,13 @@ export function createAddonRouter(
     getClient: (profileId: string) => Promise<WabaClient | null>,
     getCompanyIdForProfile: (profileId: string) => Promise<string | null>,
     workflowEngine: WorkflowEngine,
-    verifyApiKey: any
+    verifyApiKey: any,
+    options?: {
+        resolveProfileAccess?: (req: any, res: any) => Promise<{ profileId: string; companyId: string; user: any } | null>
+    }
 ) {
     const router = Router()
+    const resolveProfileAccess = options?.resolveProfileAccess
 
     // 1. Send Message API
     router.post('/api/send-message', verifyApiKey, async (req: any, res: any) => {
@@ -217,16 +221,23 @@ export function createAddonRouter(
     })
 
     // 4. Admin Settings API (Webhooks)
-    // We allow either a valid API Key OR the admin password
-    const checkAdminAuth = (req: any, res: any, next: any) => {
-        const adminPass = req.query?.adminPassword || req.body?.adminPassword
-        if (adminPass === 'admin123') {
-            // Mock api key info for profile context if needed
-            // If admin is accessing, they likely want to manage a specific profile provided in query/body
-            const targetProfile = req.query?.profileId || req.body?.profileId || 'default'
-            req.apiKeyInfo = { profileId: targetProfile }
+    // Accept either dashboard Bearer auth (tenant-scoped) or API key auth.
+    const checkAdminAuth = async (req: any, res: any, next: any) => {
+        const rawAuth = req.headers?.authorization
+        const hasAuthHeader = typeof rawAuth === 'string' && rawAuth.trim().length > 0
+
+        if (hasAuthHeader && resolveProfileAccess) {
+            const access = await resolveProfileAccess(req, res)
+            if (!access) return
+            req.apiKeyInfo = {
+                ...(req.apiKeyInfo || {}),
+                profileId: access.profileId,
+                companyId: access.companyId,
+                userId: access.user?.id || null
+            }
             return next()
         }
+
         return verifyApiKey(req, res, next)
     }
 

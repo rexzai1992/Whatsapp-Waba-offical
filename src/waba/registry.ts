@@ -148,7 +148,14 @@ export class WabaRegistry {
 
             configs.forEach(config => {
                 this.configsByProfile.set(config.profileId, config)
-                this.configsByPhoneNumber.set(config.phoneNumberId, config)
+                const existingPhoneConfig = this.configsByPhoneNumber.get(config.phoneNumberId)
+                if (existingPhoneConfig && existingPhoneConfig.profileId !== config.profileId) {
+                    console.warn(
+                        `[WABA] Duplicate enabled phone_number_id "${config.phoneNumberId}" found for profiles "${existingPhoneConfig.profileId}" and "${config.profileId}". Keeping "${existingPhoneConfig.profileId}".`
+                    )
+                } else {
+                    this.configsByPhoneNumber.set(config.phoneNumberId, config)
+                }
                 this.clientsByProfile.set(config.profileId, new WabaClient(config))
             })
 

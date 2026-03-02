@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react';
+import { getSocketUrl } from './runtimeConfig';
 
-const SOCKET_URL = import.meta.env.VITE_SOCKET_URL || 'http://localhost:3000';
+const SOCKET_URL = getSocketUrl();
 
 type BroadcastTemplatesListProps = {
     profileId: string;
@@ -34,7 +35,7 @@ const statusToneClass = (status: string): string => {
 export default function BroadcastTemplatesList({
     profileId,
     sessionToken,
-    title = 'My Templates'
+    title = 'Template Gallery'
 }: BroadcastTemplatesListProps) {
     const [items, setItems] = useState<TemplateRow[]>([]);
     const [loading, setLoading] = useState(false);
@@ -103,7 +104,10 @@ export default function BroadcastTemplatesList({
         <div className="h-full overflow-y-auto custom-scrollbar p-6">
             <div className="bg-white rounded-3xl border border-[#eceff1] shadow-[0_10px_30px_rgba(0,0,0,0.05)] p-6">
                 <div className="flex items-center justify-between gap-4 flex-wrap mb-4">
-                    <h2 className="text-2xl font-black text-[#111b21]">{title}</h2>
+                    <div>
+                        <h2 className="text-2xl font-black text-[#111b21]">{title}</h2>
+                        <p className="text-sm text-[#64748b] mt-1">View approved and pending templates on this WABA profile.</p>
+                    </div>
                     <button
                         type="button"
                         onClick={() => void loadTemplates()}
@@ -131,7 +135,7 @@ export default function BroadcastTemplatesList({
                     <input
                         value={query}
                         onChange={(e) => setQuery(e.target.value)}
-                        placeholder="Search template..."
+                        placeholder="Search name / id / language"
                         className="ml-auto min-w-[240px] flex-1 max-w-[360px] bg-white border border-[#e5e7eb] rounded-xl px-3 py-2 text-sm text-[#111b21] focus:outline-none focus:border-[#00a884]"
                     />
                 </div>

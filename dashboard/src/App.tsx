@@ -41,11 +41,11 @@ import Login from './Login';
 import DebugButton from './DebugButton';
 import { supabase } from './supabase';
 import type { Session } from '@supabase/supabase-js';
+import { getSocketUrl, resolveCompanyIdFromLocation } from './runtimeConfig';
 
 
-const SOCKET_URL = import.meta.env.VITE_SOCKET_URL || 'http://localhost:3000';
+const SOCKET_URL = getSocketUrl();
 const SINGLE_PROFILE_MODE = true;
-const ADMIN_PASS = 'admin123';
 
 const LazyWebhookView = lazy(() => import('./WebhookView'));
 const LazyBroadcastTemplateBuilder = lazy(() => import('./BroadcastTemplateBuilder'));
@@ -744,6 +744,7 @@ export default function App() {
     // Auth State
     const [session, setSession] = useState<Session | null>(null);
     const [authChecking, setAuthChecking] = useState(true);
+    const [hostAuthError, setHostAuthError] = useState<string | null>(null);
 
     const [socket, setSocket] = useState<Socket | null>(null);
     const [connectionStatus, setConnectionStatus] = useState<'connecting' | 'open' | 'close'>('connecting');
@@ -1106,10 +1107,17 @@ export default function App() {
     }, []);
 
     const fetchQuickReplies = useCallback(() => {
-        if (!activeProfileId) return;
+        if (!activeProfileId || !session?.access_token) {
+            setQuickReplies([]);
+            return;
+        }
         setQuickRepliesLoading(true);
         setQuickRepliesError(null);
-        fetch(`${SOCKET_URL}/api/company/quick-replies?profileId=${encodeURIComponent(activeProfileId)}&adminPassword=${ADMIN_PASS}`)
+        fetch(`${SOCKET_URL}/api/company/quick-replies?profileId=${encodeURIComponent(activeProfileId)}`, {
+            headers: {
+                Authorization: `Bearer ${session.access_token}`
+            }
+        })
             .then(async res => {
                 const text = await res.text();
                 try {
@@ -1130,10 +1138,10 @@ export default function App() {
                 setQuickRepliesError(err?.message || 'Failed to load quick replies');
             })
             .finally(() => setQuickRepliesLoading(false));
-    }, [activeProfileId]);
+    }, [activeProfileId, session?.access_token]);
 
     const saveQuickReplies = useCallback(async (items: QuickReply[]) => {
-        if (!activeProfileId) return;
+        if (!activeProfileId || !session?.access_token) return;
         setQuickRepliesSaving(true);
         setQuickRepliesError(null);
 
@@ -1154,9 +1162,12 @@ export default function App() {
         }
 
         try {
-            const res = await fetch(`${SOCKET_URL}/api/company/quick-replies?profileId=${encodeURIComponent(activeProfileId)}&adminPassword=${ADMIN_PASS}`, {
+            const res = await fetch(`${SOCKET_URL}/api/company/quick-replies?profileId=${encodeURIComponent(activeProfileId)}`, {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers: {
+                    Authorization: `Bearer ${session.access_token}`,
+                    'Content-Type': 'application/json'
+                },
                 body: JSON.stringify({ items: cleaned })
             });
             const text = await res.text();
@@ -1176,7 +1187,7 @@ export default function App() {
         } finally {
             setQuickRepliesSaving(false);
         }
-    }, [activeProfileId, normalizeQuickReplyShortcut]);
+    }, [activeProfileId, normalizeQuickReplyShortcut, session?.access_token]);
 
     useEffect(() => {
         activeProfileIdRef.current = activeProfileId;
@@ -1312,6 +1323,7 @@ export default function App() {
     const handleSignOut = async () => {
         clearAllDrafts();
         setMessageText('');
+        setHostAuthError(null);
         await supabase.auth.signOut();
         setSession(null);
     };
@@ -1330,6 +1342,37 @@ export default function App() {
 
         return () => subscription.unsubscribe();
     }, []);
+
+    useEffect(() => {
+        if (!session) {
+            return;
+        }
+
+        const hostCompanyId = resolveCompanyIdFromLocation();
+        if (!hostCompanyId) {
+            setHostAuthError(null);
+            return;
+        }
+
+        const userCompanyRaw =
+            (session.user.user_metadata as any)?.company_id ||
+            (session.user.app_metadata as any)?.company_id ||
+            '';
+        const userCompany = String(userCompanyRaw || '').trim().toLowerCase();
+        if (userCompany === hostCompanyId) {
+            setHostAuthError(null);
+            return;
+        }
+
+        const message = userCompany
+            ? `This account belongs to "${userCompany}". Please use ${userCompany}.2fast.xyz.`
+            : 'This account is not assigned to any company. Ask your admin to set up your account first.';
+
+        setHostAuthError(message);
+        supabase.auth.signOut().finally(() => {
+            setSession(null);
+        });
+    }, [session]);
 
     useEffect(() => {
         if (!session) {
@@ -2219,7 +2262,9 @@ export default function App() {
     if (!session) {
         return (
             <Login
+                forcedMessage={resolveCompanyIdFromLocation() ? hostAuthError : null}
                 onLogin={(nextSession) => {
+                    setHostAuthError(null);
                     setSession(nextSession);
                     setAuthChecking(false);
                 }}
@@ -2244,7 +2289,7 @@ export default function App() {
 
     const activeWorkspaceLabel = workspaceTabs.find(tab => tab.id === workspaceSection)?.label || 'Workspace';
     const broadcastNav: Array<{ id: 'template-library' | 'my-templates' | 'broadcast-history' | 'scheduled-broadcasts'; label: string }> = [
-        { id: 'template-library', label: 'Template Library' },
+        { id: 'template-library', label: 'Create Template' },
         { id: 'my-templates', label: 'My Templates' },
         { id: 'broadcast-history', label: 'Broadcast History' },
         { id: 'scheduled-broadcasts', label: 'Scheduled Broadcasts' }
@@ -3979,7 +4024,7 @@ export default function App() {
                                     <LazyBroadcastTemplatesList
                                         profileId={activeProfileId || ''}
                                         sessionToken={session?.access_token || null}
-                                        title="My Templates"
+                                        title="Template Gallery"
                                     />
                                 </Suspense>
                             )}

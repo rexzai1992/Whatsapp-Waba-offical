@@ -1,9 +1,10 @@
 
 import React, { useState, useEffect } from 'react';
 import { Plus, Trash2, Globe, Shield } from 'lucide-react';
+import { getSocketUrl } from './runtimeConfig';
+import { supabase } from './supabase';
 
-const SOCKET_URL = import.meta.env.VITE_SOCKET_URL || 'http://localhost:3000';
-const ADMIN_PASS = 'admin123';
+const SOCKET_URL = getSocketUrl();
 
 type QuickReply = {
     id?: string;
@@ -12,15 +13,34 @@ type QuickReply = {
 };
 
 type TeamRole = 'owner' | 'admin' | 'agent';
+type TeamDepartment = 'finance' | 'sales' | 'marketing' | 'production' | 'custom';
 
 type TeamUser = {
     id: string;
     email?: string | null;
     name: string;
     role: TeamRole;
+    department?: TeamDepartment;
+    customDepartment?: string | null;
     color?: string | null;
     createdAt?: string | null;
     lastSignInAt?: string | null;
+};
+
+const TEAM_DEPARTMENT_OPTIONS: Array<{ value: TeamDepartment; label: string }> = [
+    { value: 'finance', label: 'Finance' },
+    { value: 'sales', label: 'Sales' },
+    { value: 'marketing', label: 'Marketing' },
+    { value: 'production', label: 'Production' },
+    { value: 'custom', label: 'Custom' }
+];
+
+const normalizeTeamDepartment = (value: unknown): TeamDepartment => {
+    const lower = typeof value === 'string' ? value.trim().toLowerCase() : '';
+    if (lower === 'finance' || lower === 'sales' || lower === 'marketing' || lower === 'production' || lower === 'custom') {
+        return lower;
+    }
+    return 'custom';
 };
 
 type WebhookViewProps = {
@@ -99,11 +119,20 @@ export default function WebhookView({
     const [teamCurrentRole, setTeamCurrentRole] = useState<TeamRole>('agent');
     const [teamCurrentUserId, setTeamCurrentUserId] = useState<string | null>(null);
     const [inviteEmail, setInviteEmail] = useState('');
+    const [invitePassword, setInvitePassword] = useState('');
     const [inviteRole, setInviteRole] = useState<TeamRole>('agent');
+    const [inviteDepartment, setInviteDepartment] = useState<TeamDepartment>('sales');
+    const [inviteCustomDepartment, setInviteCustomDepartment] = useState('');
     const [inviteLoading, setInviteLoading] = useState(false);
     const [inviteError, setInviteError] = useState<string | null>(null);
     const [inviteSuccess, setInviteSuccess] = useState<string | null>(null);
     const [roleSavingUserId, setRoleSavingUserId] = useState<string | null>(null);
+    const [departmentSavingUserId, setDepartmentSavingUserId] = useState<string | null>(null);
+    const [selfPassword, setSelfPassword] = useState('');
+    const [selfPasswordConfirm, setSelfPasswordConfirm] = useState('');
+    const [selfPasswordSaving, setSelfPasswordSaving] = useState(false);
+    const [selfPasswordError, setSelfPasswordError] = useState<string | null>(null);
+    const [selfPasswordSuccess, setSelfPasswordSuccess] = useState<string | null>(null);
     const [manualConfig, setManualConfig] = useState({
         wabaId: '',
         phoneNumberId: '',
@@ -537,7 +566,12 @@ export default function WebhookView({
     };
 
     const fetchWebhooks = () => {
-        fetch(`${SOCKET_URL}/addon/admin/webhooks?profileId=${profileId}&adminPassword=${ADMIN_PASS}`)
+        if (!sessionToken || !profileId) return;
+        fetch(`${SOCKET_URL}/addon/admin/webhooks?profileId=${profileId}`, {
+            headers: {
+                Authorization: `Bearer ${sessionToken}`
+            }
+        })
             .then(async res => {
                 const text = await res.text();
                 try {
@@ -553,14 +587,16 @@ export default function WebhookView({
     };
 
     const handleAddWebhook = () => {
-        if (!newUrl) return;
+        if (!sessionToken || !newUrl) return;
         setLoading(true);
         fetch(`${SOCKET_URL}/addon/admin/webhooks`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: {
+                Authorization: `Bearer ${sessionToken}`,
+                'Content-Type': 'application/json'
+            },
             body: JSON.stringify({
                 profileId,
-                adminPassword: ADMIN_PASS,
                 url: newUrl,
                 events: newEvents
             })
@@ -582,13 +618,16 @@ export default function WebhookView({
     };
 
     const handleDeleteWebhook = (url: string) => {
+        if (!sessionToken) return;
         if (!confirm('Delete webhook?')) return;
         fetch(`${SOCKET_URL}/addon/admin/webhooks`, {
             method: 'DELETE',
-            headers: { 'Content-Type': 'application/json' },
+            headers: {
+                Authorization: `Bearer ${sessionToken}`,
+                'Content-Type': 'application/json'
+            },
             body: JSON.stringify({
                 profileId,
-                adminPassword: ADMIN_PASS,
                 url
             })
         })
@@ -605,8 +644,13 @@ export default function WebhookView({
     };
 
     const fetchAutomation = () => {
+        if (!sessionToken || !profileId) return;
         setAutoLoading(true);
-        fetch(`${SOCKET_URL}/api/waba/conversational-automation?profileId=${profileId}&adminPassword=${ADMIN_PASS}`)
+        fetch(`${SOCKET_URL}/api/waba/conversational-automation?profileId=${profileId}`, {
+            headers: {
+                Authorization: `Bearer ${sessionToken}`
+            }
+        })
             .then(async res => {
                 const text = await res.text();
                 try {
@@ -628,8 +672,13 @@ export default function WebhookView({
     };
 
     const fetchWindowReminder = () => {
+        if (!sessionToken || !profileId) return;
         setReminderLoading(true);
-        fetch(`${SOCKET_URL}/api/waba/window-reminder?profileId=${profileId}&adminPassword=${ADMIN_PASS}`)
+        fetch(`${SOCKET_URL}/api/waba/window-reminder?profileId=${profileId}`, {
+            headers: {
+                Authorization: `Bearer ${sessionToken}`
+            }
+        })
             .then(async res => {
                 const text = await res.text();
                 try {
@@ -651,6 +700,7 @@ export default function WebhookView({
     };
 
     const handleSaveAutomation = () => {
+        if (!sessionToken) return;
         setAutoSaving(true);
         const payload = {
             enable_welcome_message: autoConfig.enable_welcome_message,
@@ -661,12 +711,14 @@ export default function WebhookView({
                     command_description: (c.command_description || '').trim()
                 }))
                 .filter(c => c.command_name && c.command_description),
-            profileId,
-            adminPassword: ADMIN_PASS
+            profileId
         };
         fetch(`${SOCKET_URL}/api/waba/conversational-automation`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: {
+                Authorization: `Bearer ${sessionToken}`,
+                'Content-Type': 'application/json'
+            },
             body: JSON.stringify(payload)
         })
             .then(async res => {
@@ -689,6 +741,7 @@ export default function WebhookView({
     };
 
     const handleSaveReminder = () => {
+        if (!sessionToken) return;
         setReminderSaving(true);
         const payload = {
             enabled: reminderConfig.enabled,
@@ -697,10 +750,12 @@ export default function WebhookView({
         };
         fetch(`${SOCKET_URL}/api/waba/window-reminder`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: {
+                Authorization: `Bearer ${sessionToken}`,
+                'Content-Type': 'application/json'
+            },
             body: JSON.stringify({
                 profileId,
-                adminPassword: ADMIN_PASS,
                 ...payload
             })
         })
@@ -724,10 +779,14 @@ export default function WebhookView({
     };
 
     const fetchFallbackSettings = () => {
-        if (!profileId) return;
+        if (!sessionToken || !profileId) return;
         setFallbackLoading(true);
         setFallbackError(null);
-        fetch(`${SOCKET_URL}/api/company/fallback-settings?profileId=${profileId}&adminPassword=${ADMIN_PASS}`)
+        fetch(`${SOCKET_URL}/api/company/fallback-settings?profileId=${profileId}`, {
+            headers: {
+                Authorization: `Bearer ${sessionToken}`
+            }
+        })
             .then(async res => {
                 const text = await res.text();
                 try {
@@ -752,6 +811,7 @@ export default function WebhookView({
     };
 
     const handleSaveFallbackSettings = () => {
+        if (!sessionToken) return;
         setFallbackSaving(true);
         setFallbackError(null);
         const payload = {
@@ -760,10 +820,12 @@ export default function WebhookView({
         };
         fetch(`${SOCKET_URL}/api/company/fallback-settings`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: {
+                Authorization: `Bearer ${sessionToken}`,
+                'Content-Type': 'application/json'
+            },
             body: JSON.stringify({
                 profileId,
-                adminPassword: ADMIN_PASS,
                 ...payload
             })
         })
@@ -808,20 +870,23 @@ export default function WebhookView({
     };
 
     const fetchConnectedBusinesses = (opts: { after?: string; before?: string } = {}) => {
-        if (!profileId) return;
+        if (!sessionToken || !profileId) return;
         setConnectedLoading(true);
         setConnectedError(null);
 
         const params = new URLSearchParams();
         params.set('profileId', profileId);
-        params.set('adminPassword', ADMIN_PASS);
         params.set('fields', 'id,name,verification_status,business_status,created_time,updated_time');
         params.set('limit', '50');
         if (connectedAppId.trim()) params.set('appId', connectedAppId.trim());
         if (opts.after) params.set('after', opts.after);
         if (opts.before) params.set('before', opts.before);
 
-        fetch(`${SOCKET_URL}/api/waba/connected-client-businesses?${params.toString()}`)
+        fetch(`${SOCKET_URL}/api/waba/connected-client-businesses?${params.toString()}`, {
+            headers: {
+                Authorization: `Bearer ${sessionToken}`
+            }
+        })
             .then(async res => {
                 const text = await res.text();
                 try {
@@ -860,7 +925,12 @@ export default function WebhookView({
             if (!res.ok || !data?.success) {
                 throw new Error(data?.error || 'Failed to load team users');
             }
-            setTeamUsers(Array.isArray(data?.data?.users) ? data.data.users : []);
+            const users = Array.isArray(data?.data?.users) ? data.data.users : [];
+            setTeamUsers(users.map((item: any) => ({
+                ...item,
+                department: normalizeTeamDepartment(item?.department),
+                customDepartment: typeof item?.customDepartment === 'string' ? item.customDepartment : null
+            })));
             setTeamCurrentRole((data?.data?.currentUserRole || 'agent') as TeamRole);
             setTeamCurrentUserId(data?.data?.currentUserId || null);
         } catch (err: any) {
@@ -880,7 +950,11 @@ export default function WebhookView({
         setInviteSuccess(null);
         try {
             const email = inviteEmail.trim().toLowerCase();
+            const password = invitePassword;
+            const customDepartment = inviteDepartment === 'custom' ? inviteCustomDepartment.trim() : '';
             if (!email) throw new Error('Email is required');
+            if (password.length < 8) throw new Error('Password must be at least 8 characters');
+            if (inviteDepartment === 'custom' && !customDepartment) throw new Error('Custom department label is required');
 
             const res = await fetch(`${SOCKET_URL}/api/company/team-users/invite`, {
                 method: 'POST',
@@ -890,15 +964,21 @@ export default function WebhookView({
                 },
                 body: JSON.stringify({
                     email,
-                    role: inviteRole
+                    password,
+                    role: inviteRole,
+                    department: inviteDepartment,
+                    customDepartment: inviteDepartment === 'custom' ? customDepartment : null
                 })
             });
             const data = await res.json().catch(() => null);
             if (!res.ok || !data?.success) {
                 throw new Error(data?.error || 'Failed to invite user');
             }
-            setInviteSuccess(`Invite sent to ${email}`);
+            setInviteSuccess(`User created for ${email}`);
             setInviteEmail('');
+            setInvitePassword('');
+            setInviteDepartment('sales');
+            setInviteCustomDepartment('');
             await fetchTeamUsers();
         } catch (err: any) {
             setInviteError(err?.message || 'Failed to invite user');
@@ -929,6 +1009,68 @@ export default function WebhookView({
             setTeamError(err?.message || 'Failed to update role');
         } finally {
             setRoleSavingUserId(null);
+        }
+    };
+
+    const handleUpdateTeamDepartment = async (
+        userId: string,
+        department: TeamDepartment,
+        customDepartment?: string | null
+    ) => {
+        if (!sessionToken) return;
+        setDepartmentSavingUserId(userId);
+        setTeamError(null);
+        try {
+            const payload = {
+                department,
+                customDepartment: department === 'custom' ? (customDepartment || '').trim() : null
+            };
+            if (department === 'custom' && !payload.customDepartment) {
+                throw new Error('Custom department label is required');
+            }
+            const res = await fetch(`${SOCKET_URL}/api/company/team-users/${encodeURIComponent(userId)}/department`, {
+                method: 'PATCH',
+                headers: {
+                    Authorization: `Bearer ${sessionToken}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(payload)
+            });
+            const data = await res.json().catch(() => null);
+            if (!res.ok || !data?.success) {
+                throw new Error(data?.error || 'Failed to update department');
+            }
+            await fetchTeamUsers();
+        } catch (err: any) {
+            setTeamError(err?.message || 'Failed to update department');
+        } finally {
+            setDepartmentSavingUserId(null);
+        }
+    };
+
+    const handleChangeOwnPassword = async () => {
+        setSelfPasswordError(null);
+        setSelfPasswordSuccess(null);
+        if (selfPassword.length < 8) {
+            setSelfPasswordError('New password must be at least 8 characters.');
+            return;
+        }
+        if (selfPassword !== selfPasswordConfirm) {
+            setSelfPasswordError('Password confirmation does not match.');
+            return;
+        }
+
+        setSelfPasswordSaving(true);
+        try {
+            const { error } = await supabase.auth.updateUser({ password: selfPassword });
+            if (error) throw error;
+            setSelfPassword('');
+            setSelfPasswordConfirm('');
+            setSelfPasswordSuccess('Password updated successfully.');
+        } catch (err: any) {
+            setSelfPasswordError(err?.message || 'Failed to update password.');
+        } finally {
+            setSelfPasswordSaving(false);
         }
     };
 
@@ -1534,12 +1676,19 @@ export default function WebhookView({
                     )}
 
                     {canManageTeam && (
-                        <div className="mb-6 grid grid-cols-1 lg:grid-cols-5 gap-3 bg-[#fcfdfd] border border-[#eceff1] rounded-2xl p-4">
+                        <div className="mb-6 grid grid-cols-1 lg:grid-cols-6 gap-3 bg-[#fcfdfd] border border-[#eceff1] rounded-2xl p-4">
                             <input
-                                className="lg:col-span-3 bg-white border border-[#eceff1] rounded-xl px-4 py-3 text-sm font-medium text-[#111b21] focus:outline-none focus:border-[#00a884]"
+                                className="lg:col-span-2 bg-white border border-[#eceff1] rounded-xl px-4 py-3 text-sm font-medium text-[#111b21] focus:outline-none focus:border-[#00a884]"
                                 placeholder="agent@company.com"
                                 value={inviteEmail}
                                 onChange={e => setInviteEmail(e.target.value)}
+                            />
+                            <input
+                                className="lg:col-span-2 bg-white border border-[#eceff1] rounded-xl px-4 py-3 text-sm font-medium text-[#111b21] focus:outline-none focus:border-[#00a884]"
+                                type="password"
+                                placeholder="Temporary password (min 8 chars)"
+                                value={invitePassword}
+                                onChange={e => setInvitePassword(e.target.value)}
                             />
                             <select
                                 className="lg:col-span-1 bg-white border border-[#eceff1] rounded-xl px-3 py-3 text-sm font-bold text-[#111b21] focus:outline-none focus:border-[#00a884]"
@@ -1549,25 +1698,76 @@ export default function WebhookView({
                                 <option value="agent">Agent</option>
                                 <option value="admin">Admin</option>
                             </select>
+                            <select
+                                className="lg:col-span-1 bg-white border border-[#eceff1] rounded-xl px-3 py-3 text-sm font-bold text-[#111b21] focus:outline-none focus:border-[#00a884]"
+                                value={inviteDepartment}
+                                onChange={e => setInviteDepartment(normalizeTeamDepartment(e.target.value))}
+                            >
+                                {TEAM_DEPARTMENT_OPTIONS.map(option => (
+                                    <option key={option.value} value={option.value}>{option.label}</option>
+                                ))}
+                            </select>
+                            {inviteDepartment === 'custom' && (
+                                <input
+                                    className="lg:col-span-5 bg-white border border-[#eceff1] rounded-xl px-4 py-3 text-sm font-medium text-[#111b21] focus:outline-none focus:border-[#00a884]"
+                                    placeholder="Custom department label"
+                                    value={inviteCustomDepartment}
+                                    onChange={e => setInviteCustomDepartment(e.target.value)}
+                                />
+                            )}
                             <button
                                 onClick={handleInviteTeamUser}
-                                disabled={inviteLoading || !inviteEmail.trim()}
-                                className="lg:col-span-1 bg-[#00a884] hover:bg-[#008f6f] text-white rounded-xl px-4 py-3 text-xs font-bold uppercase tracking-widest disabled:opacity-50"
+                                disabled={inviteLoading || !inviteEmail.trim() || !invitePassword}
+                                className={`${inviteDepartment === 'custom' ? 'lg:col-span-1' : 'lg:col-span-2'} bg-[#00a884] hover:bg-[#008f6f] text-white rounded-xl px-4 py-3 text-xs font-bold uppercase tracking-widest disabled:opacity-50`}
                             >
-                                {inviteLoading ? 'Sending…' : 'Invite'}
+                                {inviteLoading ? 'Creating…' : 'Create User'}
                             </button>
                             {inviteError && (
-                                <div className="lg:col-span-5 text-sm text-rose-600 font-medium">
+                                <div className="lg:col-span-6 text-sm text-rose-600 font-medium">
                                     {inviteError}
                                 </div>
                             )}
                             {inviteSuccess && (
-                                <div className="lg:col-span-5 text-sm text-emerald-600 font-medium">
+                                <div className="lg:col-span-6 text-sm text-emerald-600 font-medium">
                                     {inviteSuccess}
                                 </div>
                             )}
                         </div>
                     )}
+
+                    <div className="mb-6 grid grid-cols-1 lg:grid-cols-5 gap-3 bg-[#fcfdfd] border border-[#eceff1] rounded-2xl p-4">
+                        <input
+                            type="password"
+                            className="lg:col-span-2 bg-white border border-[#eceff1] rounded-xl px-4 py-3 text-sm font-medium text-[#111b21] focus:outline-none focus:border-[#00a884]"
+                            placeholder="New password"
+                            value={selfPassword}
+                            onChange={e => setSelfPassword(e.target.value)}
+                        />
+                        <input
+                            type="password"
+                            className="lg:col-span-2 bg-white border border-[#eceff1] rounded-xl px-4 py-3 text-sm font-medium text-[#111b21] focus:outline-none focus:border-[#00a884]"
+                            placeholder="Confirm new password"
+                            value={selfPasswordConfirm}
+                            onChange={e => setSelfPasswordConfirm(e.target.value)}
+                        />
+                        <button
+                            onClick={handleChangeOwnPassword}
+                            disabled={selfPasswordSaving || !selfPassword || !selfPasswordConfirm}
+                            className="lg:col-span-1 bg-[#111b21] hover:bg-[#202c33] text-white rounded-xl px-4 py-3 text-xs font-bold uppercase tracking-widest disabled:opacity-50"
+                        >
+                            {selfPasswordSaving ? 'Saving…' : 'Change My Password'}
+                        </button>
+                        {selfPasswordError && (
+                            <div className="lg:col-span-5 text-sm text-rose-600 font-medium">
+                                {selfPasswordError}
+                            </div>
+                        )}
+                        {selfPasswordSuccess && (
+                            <div className="lg:col-span-5 text-sm text-emerald-600 font-medium">
+                                {selfPasswordSuccess}
+                            </div>
+                        )}
+                    </div>
 
                     <div className="bg-[#fcfdfd] rounded-2xl border border-[#eceff1] overflow-hidden">
                         <table className="w-full text-left">
@@ -1575,6 +1775,7 @@ export default function WebhookView({
                                 <tr>
                                     <th className="px-4 py-3">User</th>
                                     <th className="px-4 py-3">Role</th>
+                                    <th className="px-4 py-3">Department</th>
                                     <th className="px-4 py-3">Last Sign-In</th>
                                     <th className="px-4 py-3">Joined</th>
                                 </tr>
@@ -1582,13 +1783,13 @@ export default function WebhookView({
                             <tbody className="divide-y divide-[#f0f2f5]">
                                 {teamLoading ? (
                                     <tr>
-                                        <td className="px-4 py-4 text-sm text-[#8696a0]" colSpan={4}>
+                                        <td className="px-4 py-4 text-sm text-[#8696a0]" colSpan={5}>
                                             Loading team users...
                                         </td>
                                     </tr>
                                 ) : teamUsers.length === 0 ? (
                                     <tr>
-                                        <td className="px-4 py-4 text-sm text-[#8696a0]" colSpan={4}>
+                                        <td className="px-4 py-4 text-sm text-[#8696a0]" colSpan={5}>
                                             No team users found.
                                         </td>
                                     </tr>
@@ -1598,6 +1799,10 @@ export default function WebhookView({
                                             canManageTeam &&
                                             item.id !== teamCurrentUserId &&
                                             !(item.role === 'owner' && teamCurrentRole !== 'owner');
+                                        const currentDepartment = normalizeTeamDepartment(item.department);
+                                        const departmentLabel = currentDepartment === 'custom'
+                                            ? (item.customDepartment || 'Custom')
+                                            : currentDepartment;
                                         return (
                                             <tr key={item.id} className="hover:bg-white transition-all">
                                                 <td className="px-4 py-3">
@@ -1618,6 +1823,41 @@ export default function WebhookView({
                                                         </select>
                                                     ) : (
                                                         <span className="text-xs font-bold uppercase tracking-widest text-[#54656f]">{item.role}</span>
+                                                    )}
+                                                </td>
+                                                <td className="px-4 py-3">
+                                                    {canManageTeam ? (
+                                                        <div className="flex items-center gap-2">
+                                                            <select
+                                                                value={currentDepartment}
+                                                                disabled={departmentSavingUserId === item.id}
+                                                                onChange={async (e) => {
+                                                                    const nextDepartment = normalizeTeamDepartment(e.target.value);
+                                                                    if (nextDepartment === 'custom') {
+                                                                        const currentLabel = item.customDepartment || '';
+                                                                        const nextLabel = window.prompt('Custom department label', currentLabel);
+                                                                        if (nextLabel === null) return;
+                                                                        await handleUpdateTeamDepartment(item.id, 'custom', nextLabel);
+                                                                        return;
+                                                                    }
+                                                                    await handleUpdateTeamDepartment(item.id, nextDepartment, null);
+                                                                }}
+                                                                className="bg-white border border-[#eceff1] rounded-lg px-2 py-1 text-xs font-bold text-[#111b21] focus:outline-none focus:border-[#00a884] disabled:opacity-50"
+                                                            >
+                                                                {TEAM_DEPARTMENT_OPTIONS.map(option => (
+                                                                    <option key={option.value} value={option.value}>{option.label}</option>
+                                                                ))}
+                                                            </select>
+                                                            {currentDepartment === 'custom' && (
+                                                                <span className="text-xs text-[#54656f] font-medium">
+                                                                    {item.customDepartment || 'Custom'}
+                                                                </span>
+                                                            )}
+                                                        </div>
+                                                    ) : (
+                                                        <span className="text-xs font-bold uppercase tracking-widest text-[#54656f]">
+                                                            {departmentLabel}
+                                                        </span>
                                                     )}
                                                 </td>
                                                 <td className="px-4 py-3 text-xs text-[#54656f]">
