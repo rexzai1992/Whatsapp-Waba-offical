@@ -16,7 +16,7 @@ import { parseWabaWebhook, verifyWabaSignature } from './src/waba/webhook'
 import type { WabaInboundMessage, WabaStatus, WabaConfig } from './src/waba/types'
 import { resolveCompanyId, findOrCreateUser, getMessagesForUsers, getUsersForCompany, insertMessage, getUserByPhone, deleteMessagesForUser, normalizePhoneNumber, updateMessageStatusByMessageId, updateUserName, setUserTags, getUsersWithExpiringWindow, updateUserWindowReminder, activateUserCtaFreeWindow, getUserById, assignUserToAgentIfUnassigned, setUserAssignee } from './src/services/wa-store'
 import type { MessageRecord } from './src/services/wa-store'
-import { sendWhatsAppMessage, canReplyFreely } from './src/services/whatsapp'
+import { sendWhatsAppMessage } from './src/services/whatsapp'
 import { WorkflowEngine } from './src/workflow/engine'
 import { encryptToken, decryptToken, getTokenEncryptionKey } from './src/services/token-vault'
 import { exchangeCodeForToken, exchangeForLongLivedToken, fetchBusinesses, fetchOwnedWabaAccounts, fetchClientWabaAccounts, fetchPhoneNumbers, subscribeWabaApp, createSystemUserToken, unsubscribeWabaApp, fetchClientBusinessId, fetchBusinessIntegrationSystemUserToken } from './src/services/meta-graph'
@@ -2714,11 +2714,6 @@ app.post('/api/send-image', verifyApiKey, async (req: any, res: any) => {
             return res.status(500).json({ success: false, error: 'Failed to resolve user' })
         }
 
-        const withinWindow = await canReplyFreely(user.id)
-        if (!withinWindow) {
-            return res.status(400).json({ success: false, error: 'Outside 24h window: template required' })
-        }
-
         const response = await client.sendImage(phoneNumber, imageUrl, caption || '')
         const messageId = response?.messages?.[0]?.id
 
@@ -2748,7 +2743,8 @@ app.post('/api/send-image', verifyApiKey, async (req: any, res: any) => {
         })
     } catch (error: any) {
         console.error('Send image error:', error)
-        res.status(500).json({
+        const status = error?.message?.includes('Outside 24h') ? 400 : 500
+        res.status(status).json({
             success: false,
             error: error.message || 'Failed to send image'
         })

@@ -44,6 +44,31 @@ function normalizeInlineMedia(raw: any): OutboundInlineMedia | null {
     }
 }
 
+function normalizeErrorMessage(error: any): string {
+    if (!error) return ''
+    if (typeof error === 'string') return error
+    if (typeof error?.message === 'string') return error.message
+    try {
+        return JSON.stringify(error)
+    } catch {
+        return String(error)
+    }
+}
+
+function isOutside24hWindowError(error: any): boolean {
+    const message = normalizeErrorMessage(error).toLowerCase()
+    if (!message) return false
+    return (
+        message.includes('outside 24h') ||
+        message.includes('outside the 24') ||
+        message.includes('more than 24 hours') ||
+        message.includes('24-hour') ||
+        message.includes('24 hour') ||
+        message.includes('template message') ||
+        message.includes('requires a template')
+    )
+}
+
 export async function canReplyFreely(userId: string): Promise<boolean> {
     const lastInbound = await getLastInboundTimestamp(userId)
     if (!lastInbound) return false
@@ -69,54 +94,57 @@ export async function sendWhatsAppMessage(input: SendMessageInput) {
 
     let response: any = null
 
-    if (type === 'template') {
-        response = await client.sendTemplate(to, content.name, content.language || 'en_US', content.components)
-    } else if (!withinWindow) {
-        if (content?.template) {
+    try {
+        if (type === 'template') {
+            response = await client.sendTemplate(to, content.name, content.language || 'en_US', content.components)
+        } else if (!withinWindow && content?.template) {
             response = await client.sendTemplate(to, content.template.name, content.template.language || 'en_US', content.template.components)
+        } else if (type === 'text') {
+            if (inlineMedia) {
+                response = await client.sendMedia(to, inlineMedia.type, inlineMedia.link, {
+                    caption: content.text || undefined,
+                    ...(inlineMedia.type === 'document' && inlineMedia.filename ? { filename: inlineMedia.filename } : {})
+                })
+            } else {
+                response = await client.sendText(to, content.text)
+            }
+        } else if (type === 'buttons') {
+            const buttons = normalizeButtons(content.buttons || [])
+            content = { ...content, buttons }
+            response = await client.sendInteractiveButtons(to, content.text, buttons, {
+                header: content.header,
+                footer: content.footer
+            })
+        } else if (type === 'list') {
+            response = await client.sendInteractiveList(
+                to,
+                content.text || content.body || '',
+                content.button_text || content.buttonText || content.button || '',
+                content.sections || [],
+                {
+                    header: content.header,
+                    footer: content.footer
+                }
+            )
+        } else if (type === 'cta_url') {
+            response = await client.sendCtaUrl(
+                to,
+                content.body || content.text || '',
+                content.button_text || content.display_text || '',
+                content.url,
+                {
+                    header: content.header,
+                    footer: content.footer
+                }
+            )
         } else {
+            throw new Error(`Unsupported message type: ${type}`)
+        }
+    } catch (error: any) {
+        if (isOutside24hWindowError(error)) {
             throw new Error('Outside 24h window: template required')
         }
-    } else if (type === 'text') {
-        if (inlineMedia) {
-            response = await client.sendMedia(to, inlineMedia.type, inlineMedia.link, {
-                caption: content.text || undefined,
-                ...(inlineMedia.type === 'document' && inlineMedia.filename ? { filename: inlineMedia.filename } : {})
-            })
-        } else {
-            response = await client.sendText(to, content.text)
-        }
-    } else if (type === 'buttons') {
-        const buttons = normalizeButtons(content.buttons || [])
-        content = { ...content, buttons }
-        response = await client.sendInteractiveButtons(to, content.text, buttons, {
-            header: content.header,
-            footer: content.footer
-        })
-    } else if (type === 'list') {
-        response = await client.sendInteractiveList(
-            to,
-            content.text || content.body || '',
-            content.button_text || content.buttonText || content.button || '',
-            content.sections || [],
-            {
-                header: content.header,
-                footer: content.footer
-            }
-        )
-    } else if (type === 'cta_url') {
-        response = await client.sendCtaUrl(
-            to,
-            content.body || content.text || '',
-            content.button_text || content.display_text || '',
-            content.url,
-            {
-                header: content.header,
-                footer: content.footer
-            }
-        )
-    } else {
-        throw new Error(`Unsupported message type: ${type}`)
+        throw error
     }
 
     const messageId = response?.messages?.[0]?.id

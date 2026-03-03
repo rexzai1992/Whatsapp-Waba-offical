@@ -4,7 +4,7 @@ import { webhookService } from './webhook-service'
 import type { WabaClient } from '../waba/client'
 import type { WorkflowEngine } from '../workflow/engine'
 import { findOrCreateUser, getMessagesForUsers, getUsersForCompany, insertMessage } from '../services/wa-store'
-import { sendWhatsAppMessage, canReplyFreely } from '../services/whatsapp'
+import { sendWhatsAppMessage } from '../services/whatsapp'
 
 export function createAddonRouter(
     getClient: (profileId: string) => Promise<WabaClient | null>,
@@ -73,11 +73,6 @@ export function createAddonRouter(
                     } catch (e) {
                         console.warn('HEAD request failed, defaulting to document', e)
                     }
-                }
-
-                const withinWindow = await canReplyFreely(user.id)
-                if (!withinWindow) {
-                    return res.status(400).json({ success: false, error: 'Outside 24h window: template required' })
                 }
 
                 responseMsg = await client.sendMedia(

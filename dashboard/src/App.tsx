@@ -1912,6 +1912,26 @@ export default function App() {
         return rows;
     }, [currentChatMessages]);
 
+    const messageContentHeight = useMemo(() => {
+        if (messageRows.length === 0) return 0;
+        let total = 0;
+        for (let index = 0; index < messageRows.length; index += 1) {
+            const size = messageRowHeight.getRowHeight(index);
+            if (typeof size === 'number' && Number.isFinite(size) && size > 0) {
+                total += size;
+            } else {
+                total += 120;
+            }
+        }
+        return total;
+    }, [messageRows, messageRowHeight]);
+
+    const messageTopPadding = useMemo(() => {
+        const viewportHeight = messageViewport.height || 0;
+        if (!viewportHeight) return 0;
+        return Math.max(0, viewportHeight - messageContentHeight);
+    }, [messageViewport.height, messageContentHeight]);
+
     useEffect(() => {
         if (!selectedChatId) return;
         if (messageRows.length === 0) return;
@@ -1921,7 +1941,7 @@ export default function App() {
                 align: 'end'
             });
         });
-    }, [selectedChatId, messageRows.length]);
+    }, [selectedChatId, messageRows.length, messageViewport.height]);
 
     useEffect(() => {
         if (!socket || !activeProfileId) return;
@@ -2671,7 +2691,8 @@ export default function App() {
                                     listRef={messageListRef}
                                     style={{
                                         height: messageViewport.height,
-                                        width: messageViewport.width || '100%'
+                                        width: messageViewport.width || '100%',
+                                        paddingTop: messageTopPadding
                                     }}
                                     rowCount={messageRows.length}
                                     rowHeight={messageRowHeight}
