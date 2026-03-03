@@ -405,7 +405,19 @@ const buildActionsFromBuilder = (builder: any) => {
         const routes: Record<string, number> = {};
         buttons.forEach((button, idx) => {
             const optionLabel = Array.isArray(node.options) ? node.options[idx] : button.title;
-            const targetId = node.connections?.[optionLabel];
+            const connectionKeys = [
+                optionLabel,
+                button.id,
+                `opt-${idx}`
+            ].filter((value): value is string => typeof value === 'string' && value.trim().length > 0);
+            let targetId: string | undefined;
+            for (const key of connectionKeys) {
+                const nextTarget = node.connections?.[key];
+                if (typeof nextTarget === 'string' && nextTarget) {
+                    targetId = nextTarget;
+                    break;
+                }
+            }
             const resolvedIndex = resolveActionIndex(targetId);
             if (resolvedIndex !== undefined) {
                 routes[button.id] = resolvedIndex;
@@ -626,7 +638,7 @@ const buildBuilderFromActions = (actions: any[], workflowId: string) => {
             if (targetIndex === undefined) return;
             const targetNodeId = indexToNodeId[targetIndex];
             if (targetNodeId) {
-                connections[node.options?.[btnIdx] || button.title || `Option ${btnIdx + 1}`] = targetNodeId;
+                connections[`opt-${btnIdx}`] = targetNodeId;
             }
         });
         if (Object.keys(connections).length > 0) {

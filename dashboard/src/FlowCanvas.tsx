@@ -825,6 +825,11 @@ export default function FlowCanvas({
                 Object.entries(n.connections).forEach(([key, targetId]) => {
                     if (targetId) {
                         let label = key !== 'default' ? key : '';
+                        if (n.type === 'QUESTION' && key.startsWith('opt-')) {
+                            const optIndex = Number(key.replace('opt-', ''));
+                            const optionLabel = Array.isArray(n.options) ? n.options[optIndex] : '';
+                            if (optionLabel) label = optionLabel;
+                        }
                         if (n.type === 'LIST' && key.startsWith('row-')) {
                             const parts = key.split('-');
                             const sectionIdx = Number(parts[1]);
@@ -906,13 +911,7 @@ export default function FlowCanvas({
                 const connections: any = {};
                 sourceEdges.forEach(e => {
                     if (e.sourceHandle) {
-                        if (e.sourceHandle.startsWith('opt-')) {
-                            const optIndex = parseInt(e.sourceHandle.replace('opt-', ''));
-                            const optLabel = (nodeData as any).options[optIndex];
-                            if (optLabel) connections[optLabel] = e.target;
-                        } else {
-                            connections[e.sourceHandle] = e.target;
-                        }
+                        connections[e.sourceHandle] = e.target;
                     }
                 });
                 return { ...nodeData, type: n.type, position: n.position, connections };

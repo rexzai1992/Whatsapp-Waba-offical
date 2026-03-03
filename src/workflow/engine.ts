@@ -155,6 +155,64 @@ function getInboundAnswer(ctx: InboundContext): string {
     return ''
 }
 
+function normalizeChoiceKey(value: unknown): string {
+    if (typeof value !== 'string') return ''
+    return value
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '_')
+        .replace(/^_+|_+$/g, '')
+}
+
+function resolveAwaitingButtonId(
+    ctx: InboundContext,
+    awaitingRaw?: string[] | null
+): string | null {
+    const rawId = typeof ctx.buttonId === 'string' ? ctx.buttonId.trim() : ''
+    const rawTitle = typeof ctx.buttonTitle === 'string' ? ctx.buttonTitle.trim() : ''
+
+    const awaiting = Array.isArray(awaitingRaw)
+        ? awaitingRaw.map((value) => (typeof value === 'string' ? value.trim() : '')).filter(Boolean)
+        : []
+
+    if (awaiting.length === 0) {
+        return rawId || null
+    }
+
+    const candidates: string[] = []
+    if (rawId) candidates.push(rawId)
+    if (rawTitle) candidates.push(rawTitle)
+
+    const normalizedId = normalizeChoiceKey(rawId)
+    if (normalizedId && !candidates.includes(normalizedId)) candidates.push(normalizedId)
+    const normalizedTitle = normalizeChoiceKey(rawTitle)
+    if (normalizedTitle && !candidates.includes(normalizedTitle)) candidates.push(normalizedTitle)
+
+    for (const candidate of candidates) {
+        const exact = awaiting.find((value) => value === candidate)
+        if (exact) return exact
+    }
+
+    const awaitingByLower = new Map<string, string>()
+    awaiting.forEach((value) => {
+        const lower = value.toLowerCase()
+        if (!awaitingByLower.has(lower)) awaitingByLower.set(lower, value)
+    })
+
+    for (const candidate of candidates) {
+        const match = awaitingByLower.get(candidate.toLowerCase())
+        if (match) return match
+    }
+
+    if (normalizedTitle) {
+        for (const value of awaiting) {
+            if (normalizeChoiceKey(value) === normalizedTitle) return value
+        }
+    }
+
+    return null
+}
+
 function resolveDynamicContext(state: WorkflowState, user: User, ctx: InboundContext) {
     const vars = sanitizeVars(state.vars)
     const contactName = (user.name || '').trim()
@@ -287,6 +345,10 @@ export class WorkflowEngine {
             }
         }
         const isFirstMessage = !lastMessage
+        const matchedIncomingButtonId = resolveAwaitingButtonId(ctx, currentState?.awaiting_buttons)
+        if (matchedIncomingButtonId) {
+            ctx = { ...ctx, buttonId: matchedIncomingButtonId }
+        }
 
         const inboundRecord = await insertMessage({
             userId: user.id,
@@ -405,8 +467,15 @@ export class WorkflowEngine {
 
         if (state?.awaiting_buttons && state.awaiting_buttons.length > 0) {
             const awaiting = state.awaiting_buttons
-            const validButton = ctx.buttonId && awaiting.includes(ctx.buttonId)
-            if (!validButton) {
+            const matchedButtonId = resolveAwaitingButtonId(ctx, awaiting)
+            if (!matchedButtonId) {
+                console.warn('[Workflow] Unmatched button reply while awaiting choice', {
+                    workflowId: state.workflow_id,
+                    stepIndex: state.step_index,
+                    incomingButtonId: ctx.buttonId || null,
+                    incomingButtonTitle: ctx.buttonTitle || null,
+                    awaiting
+                })
                 const actions = workflow ? parseActions(workflow.actions) : []
                 const actionIndex = Math.max(0, (state.step_index || 1) - 1)
                 const action = actions[actionIndex] as any
@@ -451,6 +520,9 @@ export class WorkflowEngine {
                     console.warn('[Workflow] fallback message failed:', error?.message || error)
                 }
                 return {}
+            }
+            if (matchedButtonId !== ctx.buttonId) {
+                ctx = { ...ctx, buttonId: matchedButtonId }
             }
         }
 
@@ -524,11 +596,11 @@ export class WorkflowEngine {
         state.qa_history = sanitizeQaHistory(state.qa_history)
 
         if (state.awaiting_buttons && state.awaiting_buttons.length > 0) {
-            if (!ctx.buttonId) return {}
-            if (!state.awaiting_buttons.includes(ctx.buttonId)) return {}
+            const matchedButtonId = resolveAwaitingButtonId(ctx, state.awaiting_buttons)
+            if (!matchedButtonId) return {}
             state.fallback_count = 0
 
-            const route = resolveRoute(state.awaiting_routes, ctx.buttonId)
+            const route = resolveRoute(state.awaiting_routes, matchedButtonId)
             if (route?.state) {
                 state.state = route.state
             }
