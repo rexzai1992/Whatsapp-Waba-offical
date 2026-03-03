@@ -310,9 +310,9 @@ function evaluateCondition(action: any, state: WorkflowState, user: User, ctx: I
 }
 
 export class WorkflowEngine {
-    public async processInbound(ctx: InboundContext): Promise<{ error?: string; handled: boolean }> {
+    public async processInbound(ctx: InboundContext): Promise<{ error?: string; handled: boolean; replied: boolean }> {
         const user = await findOrCreateUser(ctx.companyId, ctx.phoneNumber)
-        if (!user) return { handled: false }
+        if (!user) return { handled: false, replied: false }
 
         const inboundTimestamp = ctx.raw?.timestamp ? Number(ctx.raw.timestamp) * 1000 : null
         const inboundIso = inboundTimestamp && !Number.isNaN(inboundTimestamp)
@@ -375,7 +375,7 @@ export class WorkflowEngine {
             if (inboundRecord?.id && currentState) {
                 await updateMessageWorkflowState(inboundRecord.id, currentState)
             }
-            return { handled: false }
+            return { handled: false, replied: false }
         }
 
         let workflow = null
@@ -420,7 +420,7 @@ export class WorkflowEngine {
                     if (inboundRecord?.id) {
                         await updateMessageWorkflowState(inboundRecord.id, state)
                     }
-                    return { handled: true }
+                    return { handled: false, replied: false }
                 }
 
                 const fallbackText =
@@ -432,9 +432,10 @@ export class WorkflowEngine {
                     if (inboundRecord?.id) {
                         await updateMessageWorkflowState(inboundRecord.id, state)
                     }
-                    return { handled: true }
+                    return { handled: false, replied: false }
                 }
 
+                let sentFallback = false
                 try {
                     await sendWhatsAppMessage({
                         client: ctx.client,
@@ -444,10 +445,11 @@ export class WorkflowEngine {
                         content: { text: renderDynamicText(trimmedFallback, state, user, ctx) },
                         workflowState: state
                     })
+                    sentFallback = true
                 } catch (error: any) {
                     console.warn('[Workflow] ask_question fallback failed:', error?.message || error)
                 }
-                return { handled: true }
+                return { handled: true, replied: sentFallback }
             }
 
             const key = normalizeVariableKey(state.awaiting_input.save_as)
@@ -505,7 +507,7 @@ export class WorkflowEngine {
                     if (inboundRecord?.id) {
                         await updateMessageWorkflowState(inboundRecord.id, state)
                     }
-                    return { handled: true }
+                    return { handled: false, replied: false }
                 }
 
                 const trimmedFallback = typeof fallbackText === 'string' ? fallbackText.trim() : ''
@@ -513,9 +515,10 @@ export class WorkflowEngine {
                     if (inboundRecord?.id) {
                         await updateMessageWorkflowState(inboundRecord.id, state)
                     }
-                    return { handled: true }
+                    return { handled: false, replied: false }
                 }
 
+                let sentFallback = false
                 try {
                     await sendWhatsAppMessage({
                         client: ctx.client,
@@ -525,10 +528,11 @@ export class WorkflowEngine {
                         content: { text: trimmedFallback },
                         workflowState: state
                     })
+                    sentFallback = true
                 } catch (error: any) {
                     console.warn('[Workflow] fallback message failed:', error?.message || error)
                 }
-                return { handled: true }
+                return { handled: true, replied: sentFallback }
             }
             if (matchedButtonId !== ctx.buttonId) {
                 ctx = { ...ctx, buttonId: matchedButtonId }
@@ -567,20 +571,20 @@ export class WorkflowEngine {
         }
 
         if (!workflow || !state) {
-            return { handled: false }
+            return { handled: false, replied: false }
         }
 
         return this.runWorkflowActions(ctx, user, workflow, state)
     }
 
-    public async startWorkflow(ctx: InboundContext, workflowId: string): Promise<{ error?: string; handled: boolean }> {
+    public async startWorkflow(ctx: InboundContext, workflowId: string): Promise<{ error?: string; handled: boolean; replied: boolean }> {
         const user = await findOrCreateUser(ctx.companyId, ctx.phoneNumber)
-        if (!user) return { handled: false }
+        if (!user) return { handled: false, replied: false }
 
         const workflow = await getWorkflowById(workflowId)
-        if (!workflow) return { error: 'Workflow not found.', handled: false }
+        if (!workflow) return { error: 'Workflow not found.', handled: false, replied: false }
         if (workflow.company_id && workflow.company_id !== ctx.companyId) {
-            return { error: 'Workflow not found for this company.', handled: false }
+            return { error: 'Workflow not found for this company.', handled: false, replied: false }
         }
 
         const memory = await getLatestWorkflowMemory(user.id)
@@ -600,13 +604,14 @@ export class WorkflowEngine {
         user: User,
         workflow: any,
         state: WorkflowState
-    ): Promise<{ error?: string; handled: boolean }> {
+    ): Promise<{ error?: string; handled: boolean; replied: boolean }> {
         state.vars = sanitizeVars(state.vars)
         state.qa_history = sanitizeQaHistory(state.qa_history)
+        let replied = false
 
         if (state.awaiting_buttons && state.awaiting_buttons.length > 0) {
             const matchedButtonId = resolveAwaitingButtonId(ctx, state.awaiting_buttons)
-            if (!matchedButtonId) return { handled: true }
+            if (!matchedButtonId) return { handled: true, replied: false }
             state.fallback_count = 0
 
             const route = resolveRoute(state.awaiting_routes, matchedButtonId)
@@ -618,7 +623,7 @@ export class WorkflowEngine {
             }
         }
         if (state.awaiting_input?.save_as) {
-            return { handled: true }
+            return { handled: true, replied: false }
         }
 
         state.awaiting_buttons = undefined
@@ -703,6 +708,7 @@ export class WorkflowEngine {
                         },
                         workflowState: state
                     })
+                    replied = true
                 } catch (error: any) {
                     const msg = error?.message || String(error)
                     console.warn('[Workflow] send_text failed:', msg)
@@ -754,6 +760,7 @@ export class WorkflowEngine {
                         },
                         workflowState: state
                     })
+                    replied = true
                 } catch (error: any) {
                     const msg = error?.message || String(error)
                     console.warn('[Workflow] ask_question failed:', msg)
@@ -787,6 +794,7 @@ export class WorkflowEngine {
                         },
                         workflowState: state
                     })
+                    replied = true
                 } catch (error: any) {
                     const msg = error?.message || String(error)
                     console.warn('[Workflow] send_template failed:', msg)
@@ -897,6 +905,7 @@ export class WorkflowEngine {
                         },
                         workflowState: state
                     })
+                    replied = true
                 } catch (error: any) {
                     const msg = error?.message || String(error)
                     console.warn('[Workflow] send_buttons failed:', msg)
@@ -946,6 +955,7 @@ export class WorkflowEngine {
                         },
                         workflowState: state
                     })
+                    replied = true
                 } catch (error: any) {
                     const msg = error?.message || String(error)
                     console.warn('[Workflow] send_list failed:', msg)
@@ -977,6 +987,7 @@ export class WorkflowEngine {
                         },
                         workflowState: state
                     })
+                    replied = true
                 } catch (error: any) {
                     const msg = error?.message || String(error)
                     console.warn('[Workflow] send_cta_url failed:', msg)
@@ -993,6 +1004,6 @@ export class WorkflowEngine {
             state.step_index = index
         }
 
-        return lastError ? { error: lastError, handled: true } : { handled: true }
+        return lastError ? { error: lastError, handled: true, replied } : { handled: true, replied }
     }
 }

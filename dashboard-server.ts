@@ -27,7 +27,7 @@ import { registerPublicInfoRoutes } from './dashboard-server/routes/publicInfoRo
 import { registerWabaRoutes } from './dashboard-server/routes/wabaRoutes'
 import { registerCompanyRoutes } from './dashboard-server/routes/companyRoutes'
 import { registerAiRoutes } from './dashboard-server/routes/aiRoutes'
-import { createCompanyAiSettingsStore } from './dashboard-server/services/aiSettingsStore'
+import { getCompanyAiSettings } from './dashboard-server/services/aiSettingsSupabase'
 import { loadOpenAiMemoryForUser, requestOpenAiCompletion, type OpenAiChatMessage } from './dashboard-server/services/openaiAssistant'
 import { registerSocketHandlers } from './dashboard-server/socket/registerSocketHandlers'
 import { errorHandler } from './dashboard-server/middleware/error'
@@ -2597,7 +2597,6 @@ const apiKeyStore = createApiKeyStore(resolvePath('api_keys.json'))
 const verifyApiKey = apiKeyStore.middleware
 
 const webhookStore = createWebhookStore(resolvePath('webhooks.json'))
-const aiSettingsStore = createCompanyAiSettingsStore(resolvePath('company_ai_settings.json'))
 
 // ============================================
 // PUBLIC API ENDPOINTS
@@ -2843,13 +2842,11 @@ registerCompanyRoutes(app, {
 registerAiRoutes(app, {
     requireSupabaseUserMiddleware,
     resolveProfileAccess,
-    resolvePath,
     readTrimmed,
     supabase,
     encryptToken,
     decryptToken,
-    getTokenEncryptionKey,
-    aiSettingsStore
+    getTokenEncryptionKey
 })
 
 // WABA WEBHOOK (Meta Cloud API)
@@ -3866,7 +3863,7 @@ async function maybeSendAutoAiReply(params: {
     const inboundText = (params.inboundText || '').trim()
     if (!inboundText) return { sent: false, reason: 'empty_inbound_text' }
 
-    const settings = aiSettingsStore.get(params.companyId)
+    const settings = await getCompanyAiSettings(supabase, params.companyId)
     if (!settings.enabled) return { sent: false, reason: 'ai_disabled' }
 
     const apiKey = decryptAiApiKey(settings.api_key)
@@ -3930,7 +3927,8 @@ async function maybeSendAutoAiReply(params: {
 async function handleInboundMessage(config: WabaConfig, inbound: WabaInboundMessage) {
     const { syntheticMsg, remoteJid, text } = buildSyntheticMessage(inbound)
     const profileId = config.profileId
-    const companyId = await resolveCompanyId(config.companyId || profileId)
+    const profileCompanyId = await getCompanyIdForProfile(profileId)
+    const companyId = profileCompanyId || await resolveCompanyId(config.companyId || profileId)
     const phoneNumber = remoteJid.replace(/@s\\.whatsapp\\.net$/, '')
 
     const client = await wabaRegistry.getClientByProfile(profileId)
@@ -3995,10 +3993,12 @@ async function handleInboundMessage(config: WabaConfig, inbound: WabaInboundMess
                 phoneNumber,
                 inboundType: inbound.type,
                 inboundText: text || '',
-                workflowHandled: Boolean(workflowResult?.handled)
+                workflowHandled: Boolean(workflowResult?.handled && workflowResult?.replied)
             })
             if (aiResult.sent) {
                 console.log(`[${profileId}] Auto AI reply sent to ${phoneNumber}`)
+            } else if (aiResult.reason) {
+                console.log(`[${profileId}] Auto AI skipped (${aiResult.reason}) for ${phoneNumber}`)
             }
         } catch (error: any) {
             console.warn(`[${profileId}] Auto AI reply skipped:`, error?.message || error)

@@ -1,9 +1,10 @@
 import type { Express } from 'express'
 import {
-    createCompanyAiSettingsStore,
+    getCompanyAiSettings,
+    upsertCompanyAiSettings,
     DEFAULT_COMPANY_AI_SETTINGS,
     type CompanyAiSettingsRecord
-} from '../services/aiSettingsStore'
+} from '../services/aiSettingsSupabase'
 import { loadOpenAiMemoryForUser, requestOpenAiCompletion, type OpenAiChatMessage } from '../services/openaiAssistant'
 
 const ENCRYPTED_TOKEN_PREFIX = 'enc:v1:'
@@ -91,16 +92,12 @@ export function registerAiRoutes(app: Express, ctx: any) {
     const {
         requireSupabaseUserMiddleware,
         resolveProfileAccess,
-        resolvePath,
         readTrimmed,
         supabase,
         encryptToken,
         decryptToken,
-        getTokenEncryptionKey,
-        aiSettingsStore
+        getTokenEncryptionKey
     } = ctx
-
-    const settingsStore = aiSettingsStore || createCompanyAiSettingsStore(resolvePath('company_ai_settings.json'))
 
     const encryptApiKeyForStore = (value: string): string => {
         if (!value) return value
@@ -127,7 +124,7 @@ export function registerAiRoutes(app: Express, ctx: any) {
             const access = await resolveProfileAccess(req, res)
             if (!access) return
 
-            const settings = settingsStore.get(access.companyId)
+            const settings = await getCompanyAiSettings(supabase, access.companyId)
             return res.json({
                 success: true,
                 data: toPublicSettings(settings)
@@ -142,7 +139,20 @@ export function registerAiRoutes(app: Express, ctx: any) {
             const access = await resolveProfileAccess(req, res)
             if (!access) return
 
-            const current = settingsStore.get(access.companyId)
+            const { error: ensureCompanyError } = await supabase
+                .from('company')
+                .upsert(
+                    {
+                        id: access.companyId,
+                        name: access.companyId
+                    },
+                    { onConflict: 'id' }
+                )
+            if (ensureCompanyError) {
+                return res.status(500).json({ success: false, error: ensureCompanyError.message })
+            }
+
+            const current = await getCompanyAiSettings(supabase, access.companyId)
 
             const model = readTrimmed(req.body?.model) || current.model
             const systemPromptInput = typeof req.body?.systemPrompt === 'string'
@@ -164,7 +174,8 @@ export function registerAiRoutes(app: Express, ctx: any) {
                 nextApiKey = encryptApiKeyForStore(incomingApiKey)
             }
 
-            const updated = settingsStore.upsert(
+            const updated = await upsertCompanyAiSettings(
+                supabase,
                 access.companyId,
                 {
                     enabled,
@@ -198,7 +209,7 @@ export function registerAiRoutes(app: Express, ctx: any) {
                 return res.status(400).json({ success: false, error: 'prompt is required' })
             }
 
-            const settings = settingsStore.get(access.companyId)
+            const settings = await getCompanyAiSettings(supabase, access.companyId)
             const decryptedApiKey = settings.api_key ? decryptApiKeyFromStore(settings.api_key) : ''
             if (!decryptedApiKey) {
                 return res.status(400).json({ success: false, error: 'OpenAI API key is not configured' })

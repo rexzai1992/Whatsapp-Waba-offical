@@ -1,5 +1,3 @@
-import { readJsonFile, writeJsonFile } from './fileJsonStore'
-
 export type CompanyAiSettingsRecord = {
     enabled: boolean
     model: string
@@ -12,8 +10,6 @@ export type CompanyAiSettingsRecord = {
     updated_at: string
     updated_by?: string | null
 }
-
-type CompanyAiSettingsMap = Record<string, CompanyAiSettingsRecord>
 
 export const DEFAULT_COMPANY_AI_SETTINGS: CompanyAiSettingsRecord = {
     enabled: false,
@@ -65,7 +61,7 @@ function normalizeSettings(
         : (source.api_key ? String(source.api_key) : null)
 
     return {
-        enabled: Boolean(source.enabled),
+        enabled: source.enabled === undefined ? fallback.enabled : Boolean(source.enabled),
         model,
         system_prompt: systemPrompt,
         temperature: clampTemperature(source.temperature, fallback.temperature),
@@ -78,50 +74,66 @@ function normalizeSettings(
     }
 }
 
-export function createCompanyAiSettingsStore(filePath: string) {
-    let cache = readJsonFile<CompanyAiSettingsMap>(filePath, {})
+export async function getCompanyAiSettings(
+    supabase: any,
+    companyId: string
+): Promise<CompanyAiSettingsRecord> {
+    if (!companyId) return DEFAULT_COMPANY_AI_SETTINGS
 
-    const persist = () => {
-        writeJsonFile(filePath, cache)
+    const { data, error } = await supabase
+        .from('company_ai_settings')
+        .select('enabled, model, system_prompt, temperature, max_tokens, memory_enabled, memory_messages, api_key, updated_at, updated_by')
+        .eq('company_id', companyId)
+        .maybeSingle()
+
+    if (error) {
+        throw new Error(`Failed to load AI settings: ${error.message}`)
     }
 
-    const get = (companyId: string): CompanyAiSettingsRecord => {
-        const existing = cache[companyId]
-        return normalizeSettings(existing, DEFAULT_COMPANY_AI_SETTINGS)
-    }
+    return normalizeSettings(data || undefined, DEFAULT_COMPANY_AI_SETTINGS)
+}
 
-    const upsert = (
-        companyId: string,
-        patch: Partial<CompanyAiSettingsRecord>,
-        userId?: string | null
-    ): CompanyAiSettingsRecord => {
-        const previous = get(companyId)
-        const merged = normalizeSettings(
+export async function upsertCompanyAiSettings(
+    supabase: any,
+    companyId: string,
+    patch: Partial<CompanyAiSettingsRecord>,
+    updatedBy?: string | null
+): Promise<CompanyAiSettingsRecord> {
+    const previous = await getCompanyAiSettings(supabase, companyId)
+    const merged = normalizeSettings(
+        {
+            ...previous,
+            ...patch,
+            updated_at: new Date().toISOString(),
+            updated_by: updatedBy ?? previous.updated_by
+        },
+        previous
+    )
+
+    const { data, error } = await supabase
+        .from('company_ai_settings')
+        .upsert(
             {
-                ...previous,
-                ...patch,
-                updated_at: new Date().toISOString(),
-                updated_by: userId ?? previous.updated_by
+                company_id: companyId,
+                enabled: merged.enabled,
+                model: merged.model,
+                system_prompt: merged.system_prompt,
+                temperature: merged.temperature,
+                max_tokens: merged.max_tokens,
+                memory_enabled: merged.memory_enabled,
+                memory_messages: merged.memory_messages,
+                api_key: merged.api_key,
+                updated_at: merged.updated_at,
+                updated_by: merged.updated_by
             },
-            previous
+            { onConflict: 'company_id' }
         )
-        cache[companyId] = merged
-        persist()
-        return merged
+        .select('enabled, model, system_prompt, temperature, max_tokens, memory_enabled, memory_messages, api_key, updated_at, updated_by')
+        .maybeSingle()
+
+    if (error) {
+        throw new Error(`Failed to save AI settings: ${error.message}`)
     }
 
-    const setApiKey = (companyId: string, apiKey: string | null, userId?: string | null): CompanyAiSettingsRecord => {
-        return upsert(companyId, { api_key: apiKey }, userId)
-    }
-
-    const clearApiKey = (companyId: string, userId?: string | null): CompanyAiSettingsRecord => {
-        return upsert(companyId, { api_key: null }, userId)
-    }
-
-    return {
-        get,
-        upsert,
-        setApiKey,
-        clearApiKey
-    }
+    return normalizeSettings(data || merged, DEFAULT_COMPANY_AI_SETTINGS)
 }
