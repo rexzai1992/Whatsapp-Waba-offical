@@ -12,7 +12,7 @@ type OpenAiCompletionParams = {
     timeoutMs?: number
 }
 
-const OPENAI_CHAT_COMPLETIONS_URL = 'https://api.openai.com/v1/chat/completions'
+const OPENAI_RESPONSES_URL = 'https://api.openai.com/v1/responses'
 
 function extractMessageText(content: any): string {
     if (!content || typeof content !== 'object') return ''
@@ -44,30 +44,33 @@ export function toOpenAiMessage(direction: string, content: any): OpenAiChatMess
     }
 }
 
-function pickFirstTextContent(value: any): string {
-    if (typeof value === 'string') return value.trim()
-    if (Array.isArray(value)) {
-        const chunks = value
-            .map((chunk) => {
-                if (typeof chunk === 'string') return chunk
-                if (chunk && typeof chunk === 'object') {
-                    if (typeof chunk.text === 'string') return chunk.text
-                    if (typeof chunk?.type === 'string' && chunk.type === 'text' && typeof chunk?.text?.value === 'string') {
-                        return chunk.text.value
-                    }
-                }
-                return ''
-            })
-            .filter(Boolean)
-        return chunks.join('\n').trim()
+function extractResponsesText(payload: any): string {
+    if (typeof payload?.output_text === 'string' && payload.output_text.trim()) {
+        return payload.output_text.trim()
     }
-    return ''
-}
 
-function extractCompletionText(payload: any): string {
-    const firstChoice = payload?.choices?.[0]
-    const candidate = firstChoice?.message?.content
-    return pickFirstTextContent(candidate)
+    const outputs = Array.isArray(payload?.output) ? payload.output : []
+    const chunks: string[] = []
+    outputs.forEach((item: any) => {
+        if (!item || item.type !== 'message') return
+        const content = Array.isArray(item.content) ? item.content : []
+        content.forEach((part: any) => {
+            if (!part || typeof part !== 'object') return
+            if (part.type === 'output_text' && typeof part.text === 'string' && part.text.trim()) {
+                chunks.push(part.text.trim())
+                return
+            }
+            if (part.type === 'text' && typeof part.text === 'string' && part.text.trim()) {
+                chunks.push(part.text.trim())
+                return
+            }
+            if (part.type === 'text' && typeof part?.text?.value === 'string' && part.text.value.trim()) {
+                chunks.push(part.text.value.trim())
+            }
+        })
+    })
+
+    return chunks.join('\n').trim()
 }
 
 export async function loadOpenAiMemoryForUser(
@@ -111,18 +114,43 @@ export async function requestOpenAiCompletion(params: OpenAiCompletionParams): P
     let upstreamPayload: any = null
     let upstreamStatus = 500
     try {
-        const upstream = await fetch(OPENAI_CHAT_COMPLETIONS_URL, {
+        const systemInstructions = params.messages
+            .filter((msg) => msg.role === 'system')
+            .map((msg) => msg.content.trim())
+            .filter(Boolean)
+            .join('\n\n')
+            .trim()
+
+        const inputMessages = params.messages
+            .filter((msg) => msg.role !== 'system')
+            .map((msg) => ({
+                role: msg.role,
+                // Use plain string content for conversation history across roles
+                // (user + assistant) to keep Responses API role/content validation compatible.
+                content: msg.content
+            }))
+
+        const requestBody: any = {
+            model: params.model,
+            input: inputMessages
+        }
+        if (systemInstructions) {
+            requestBody.instructions = systemInstructions
+        }
+        if (Number.isFinite(params.temperature)) {
+            requestBody.temperature = params.temperature
+        }
+        if (Number.isFinite(params.maxTokens) && params.maxTokens > 0) {
+            requestBody.max_output_tokens = Math.floor(params.maxTokens)
+        }
+
+        const upstream = await fetch(OPENAI_RESPONSES_URL, {
             method: 'POST',
             headers: {
                 'content-type': 'application/json',
                 authorization: `Bearer ${params.apiKey}`
             },
-            body: JSON.stringify({
-                model: params.model,
-                messages: params.messages,
-                temperature: params.temperature,
-                max_tokens: params.maxTokens
-            }),
+            body: JSON.stringify(requestBody),
             signal: controller.signal
         })
         upstreamStatus = upstream.status
@@ -137,7 +165,7 @@ export async function requestOpenAiCompletion(params: OpenAiCompletionParams): P
     } catch (error: any) {
         clearTimeout(timeout)
         if (error?.name === 'AbortError') {
-            throw new Error('OpenAI request timed out')
+            throw new Error('OpenAI Responses API request timed out')
         }
         throw error
     } finally {
@@ -145,11 +173,11 @@ export async function requestOpenAiCompletion(params: OpenAiCompletionParams): P
     }
 
     if (upstreamStatus < 200 || upstreamStatus >= 300) {
-        const detail = upstreamPayload?.error?.message || upstreamBody || `OpenAI request failed (${upstreamStatus})`
+        const detail = upstreamPayload?.error?.message || upstreamBody || `OpenAI Responses API request failed (${upstreamStatus})`
         throw new Error(detail)
     }
 
-    const reply = extractCompletionText(upstreamPayload)
+    const reply = extractResponsesText(upstreamPayload)
     if (!reply) {
         throw new Error('OpenAI response did not include text output')
     }
