@@ -47,6 +47,7 @@ import { buildActionsFromBuilder, buildBuilderFromActions } from './features/wor
 import BroadcastView from './features/workspace/BroadcastView';
 import AutomationsView from './features/workspace/AutomationsView';
 import ContactsView from './features/workspace/ContactsView';
+import ChatbotsView from './features/workspace/ChatbotsView';
 import SettingsView from './features/workspace/SettingsView';
 import ChatflowView from './features/workspace/ChatflowView';
 import AddProfileModal from './features/workspace/modals/AddProfileModal';
@@ -2115,6 +2116,46 @@ export default function App() {
         setShowMediaComposer(false);
     };
 
+    const sendAiMessageToContact = useCallback(async (jid: string, text: string) => {
+        if (!socket || !activeProfileId) {
+            return { success: false, error: 'No active connection or profile.' };
+        }
+
+        const cleanText = text.trim();
+        if (!cleanText) {
+            return { success: false, error: 'Message text is required.' };
+        }
+
+        const normalizedDigits = jid.replace(/@s\.whatsapp\.net$/, '').replace(/\D/g, '');
+        if (!normalizedDigits) {
+            return { success: false, error: 'Valid contact JID is required.' };
+        }
+        const normalizedJid = jid.includes('@') ? jid : `${normalizedDigits}@s.whatsapp.net`;
+
+        socket.emit('sendMessage', {
+            profileId: activeProfileId,
+            jid: normalizedJid,
+            text: cleanText
+        });
+
+        const tempMsg: Message = {
+            key: { id: `ai-${Date.now()}`, remoteJid: normalizedJid, fromMe: true },
+            message: { conversation: cleanText },
+            messageTimestamp: Math.floor(Date.now() / 1000),
+            status: 'sent',
+            agent: {
+                user_id: session?.user?.id,
+                name: currentAgentName,
+                color: '#6b7280'
+            }
+        };
+        setAllMessages(prev => [tempMsg, ...prev]);
+        setSelectedChatId(normalizedJid);
+        setWorkspaceSection('team-inbox');
+
+        return { success: true };
+    }, [activeProfileId, currentAgentName, session?.user?.id, socket]);
+
     const handleStartWorkflow = () => {
         if (!socket || !selectedChatId || !activeProfileId || !startWorkflowId) return;
         if (selectedChatId.endsWith('@g.us')) {
@@ -2418,10 +2459,16 @@ export default function App() {
                         </nav>
                     </div>
                     <div className="hidden md:flex items-center gap-3">
-                        <button className="w-10 h-10 rounded-full bg-[#f3f4f6] text-[#6b7280] flex items-center justify-center">
+                        <button
+                            onClick={() => setWorkspaceSection('more')}
+                            className="w-10 h-10 rounded-full bg-[#f3f4f6] text-[#6b7280] flex items-center justify-center"
+                        >
                             <MoreVertical className="w-5 h-5" />
                         </button>
-                        <button className="w-10 h-10 rounded-full bg-[#f3f4f6] text-[#6b7280] flex items-center justify-center">
+                        <button
+                            onClick={() => setActiveView('settings')}
+                            className="w-10 h-10 rounded-full bg-[#f3f4f6] text-[#6b7280] flex items-center justify-center"
+                        >
                             <User className="w-5 h-5" />
                         </button>
                     </div>
@@ -3808,6 +3855,61 @@ export default function App() {
                         setStartWorkflowId(workflowId);
                     }}
                 />
+            ) : workspaceSection === 'chatbots' ? (
+                <ChatbotsView
+                    profileId={activeProfileId}
+                    sessionToken={session?.access_token || null}
+                    selectedChatId={selectedChatId}
+                    apiBaseUrl={SOCKET_URL}
+                    onSendMessage={sendAiMessageToContact}
+                />
+            ) : workspaceSection === 'more' ? (
+                <div className="h-screen pt-[72px] bg-[#f8f9fa] text-[#111b21] font-sans">
+                    <div className="h-full p-6 overflow-y-auto custom-scrollbar">
+                        <div className="max-w-3xl mx-auto space-y-4">
+                            <div className="bg-white border border-[#eceff1] rounded-3xl p-6 shadow-[0_10px_30px_rgba(0,0,0,0.05)]">
+                                <h2 className="text-2xl font-black text-[#111b21]">More</h2>
+                                <p className="text-sm text-[#54656f] mt-1">
+                                    Open additional tools and account settings.
+                                </p>
+                            </div>
+
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                <button
+                                    type="button"
+                                    onClick={() => setActiveView('settings')}
+                                    className="text-left bg-white border border-[#eceff1] rounded-2xl p-5 hover:bg-[#f8f9fa] transition-all"
+                                >
+                                    <div className="flex items-center gap-3 mb-2">
+                                        <div className="w-9 h-9 rounded-xl bg-[#00a884]/10 border border-[#00a884]/20 text-[#00a884] flex items-center justify-center">
+                                            <Settings className="w-5 h-5" />
+                                        </div>
+                                        <div className="text-lg font-black text-[#111b21]">Settings</div>
+                                    </div>
+                                    <p className="text-sm text-[#54656f]">
+                                        Webhooks, onboarding, team users, and workspace configuration.
+                                    </p>
+                                </button>
+
+                                <button
+                                    type="button"
+                                    onClick={() => setShowAnalytics(true)}
+                                    className="text-left bg-white border border-[#eceff1] rounded-2xl p-5 hover:bg-[#f8f9fa] transition-all"
+                                >
+                                    <div className="flex items-center gap-3 mb-2">
+                                        <div className="w-9 h-9 rounded-xl bg-[#111b21]/5 border border-[#111b21]/10 text-[#111b21] flex items-center justify-center">
+                                            <CircleDashed className="w-5 h-5" />
+                                        </div>
+                                        <div className="text-lg font-black text-[#111b21]">Analytics</div>
+                                    </div>
+                                    <p className="text-sm text-[#54656f]">
+                                        View message totals, workflow metrics, and date-based performance.
+                                    </p>
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
             ) : workspaceSection === 'contacts' ? (
                 <ContactsView
                     contactsList={contactsList}

@@ -26,6 +26,7 @@ import { registerFlowRoutes } from './dashboard-server/routes/flowRoutes'
 import { registerPublicInfoRoutes } from './dashboard-server/routes/publicInfoRoutes'
 import { registerWabaRoutes } from './dashboard-server/routes/wabaRoutes'
 import { registerCompanyRoutes } from './dashboard-server/routes/companyRoutes'
+import { registerAiRoutes } from './dashboard-server/routes/aiRoutes'
 import { registerSocketHandlers } from './dashboard-server/socket/registerSocketHandlers'
 import { errorHandler } from './dashboard-server/middleware/error'
 import { requireSupabaseUser } from './dashboard-server/middleware/auth'
@@ -2833,6 +2834,17 @@ registerCompanyRoutes(app, {
     computeAgentColor,
     deriveAgentName,
     readTrimmed
+})
+
+registerAiRoutes(app, {
+    requireSupabaseUserMiddleware,
+    resolveProfileAccess,
+    resolvePath,
+    readTrimmed,
+    supabase,
+    encryptToken,
+    decryptToken,
+    getTokenEncryptionKey
 })
 
 // WABA WEBHOOK (Meta Cloud API)
