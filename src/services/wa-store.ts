@@ -499,6 +499,75 @@ export async function getLastMessage(userId: string): Promise<MessageRecord | nu
     return data as MessageRecord | null
 }
 
+export async function getLatestWorkflowMemory(
+    userId: string
+): Promise<{
+    vars: Record<string, string>
+    qa_history: Array<{ key: string; question: string; answer: string; at: string }>
+}> {
+    if (!userId) {
+        return { vars: {}, qa_history: [] }
+    }
+
+    const { data, error } = await supabase
+        .from('messages')
+        .select('workflow_state')
+        .eq('user_id', userId)
+        .not('workflow_state', 'is', null)
+        .order('created_at', { ascending: false })
+        .limit(200)
+
+    if (error) {
+        console.warn('[DB] Failed to load workflow memory:', error.message)
+        return { vars: {}, qa_history: [] }
+    }
+
+    let vars: Record<string, string> | null = null
+    let qaHistory:
+        | Array<{ key: string; question: string; answer: string; at: string }>
+        | null = null
+
+    for (const row of data || []) {
+        const state = row?.workflow_state
+        if (!state || typeof state !== 'object') continue
+
+        if (!vars && state.vars && typeof state.vars === 'object') {
+            const nextVars: Record<string, string> = {}
+            Object.entries(state.vars as Record<string, unknown>).forEach(([k, v]) => {
+                if (typeof k !== 'string') return
+                const key = k.trim()
+                if (!key) return
+                if (v === null || v === undefined) return
+                nextVars[key] = String(v)
+            })
+            if (Object.keys(nextVars).length > 0) {
+                vars = nextVars
+            }
+        }
+
+        if (!qaHistory && Array.isArray(state.qa_history)) {
+            const nextHistory = state.qa_history
+                .map((entry: any) => ({
+                    key: typeof entry?.key === 'string' ? entry.key : '',
+                    question: typeof entry?.question === 'string' ? entry.question : '',
+                    answer: typeof entry?.answer === 'string' ? entry.answer : '',
+                    at: typeof entry?.at === 'string' ? entry.at : ''
+                }))
+                .filter((entry: any) => entry.key && entry.answer)
+            if (nextHistory.length > 0) {
+                qaHistory = nextHistory
+            }
+        }
+
+        if (vars && qaHistory) break
+    }
+
+    return {
+        vars: vars || {},
+        qa_history: qaHistory || []
+    }
+}
+
 export async function getLastInboundTimestamp(userId: string): Promise<string | null> {
     const { data: userData, error: userError } = await supabase
         .from('users')

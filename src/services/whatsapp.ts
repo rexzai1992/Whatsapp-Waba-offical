@@ -25,6 +25,25 @@ function normalizeButtons(buttons: Array<{ id: string; title: string }> = []) {
     return buttons.slice(0, MAX_BUTTONS)
 }
 
+type OutboundInlineMedia = {
+    type: 'image' | 'video' | 'document'
+    link: string
+    filename?: string
+}
+
+function normalizeInlineMedia(raw: any): OutboundInlineMedia | null {
+    const type = typeof raw?.type === 'string' ? raw.type.toLowerCase() : ''
+    const link = typeof raw?.link === 'string' ? raw.link.trim() : ''
+    if (!link) return null
+    if (type !== 'image' && type !== 'video' && type !== 'document') return null
+    const filename = typeof raw?.filename === 'string' ? raw.filename.trim() : ''
+    return {
+        type,
+        link,
+        ...(type === 'document' && filename ? { filename } : {})
+    }
+}
+
 export async function canReplyFreely(userId: string): Promise<boolean> {
     const lastInbound = await getLastInboundTimestamp(userId)
     if (!lastInbound) return false
@@ -46,6 +65,7 @@ export async function sendWhatsAppMessage(input: SendMessageInput) {
             : null)
     const withinWindow = await canReplyFreely(userId)
     const sentAtIso = new Date().toISOString()
+    const inlineMedia = type === 'text' ? normalizeInlineMedia(content?.media) : null
 
     let response: any = null
 
@@ -58,7 +78,14 @@ export async function sendWhatsAppMessage(input: SendMessageInput) {
             throw new Error('Outside 24h window: template required')
         }
     } else if (type === 'text') {
-        response = await client.sendText(to, content.text)
+        if (inlineMedia) {
+            response = await client.sendMedia(to, inlineMedia.type, inlineMedia.link, {
+                caption: content.text || undefined,
+                ...(inlineMedia.type === 'document' && inlineMedia.filename ? { filename: inlineMedia.filename } : {})
+            })
+        } else {
+            response = await client.sendText(to, content.text)
+        }
     } else if (type === 'buttons') {
         const buttons = normalizeButtons(content.buttons || [])
         content = { ...content, buttons }
@@ -97,20 +124,35 @@ export async function sendWhatsAppMessage(input: SendMessageInput) {
         throw new Error('WABA API response missing message ID')
     }
 
+    const persistedType = type === 'text' && inlineMedia ? inlineMedia.type : type
     const ctaReplyCandidate = await shouldMarkCtaReplyCandidate(userId, sentAtIso)
+    const persistedContent: any = {
+        type: persistedType,
+        to,
+        message_id: messageId,
+        payload: content,
+        status: 'sent',
+        sent_at: sentAtIso,
+        cta_entry_candidate: ctaReplyCandidate,
+        agent: messageActor
+    }
+    if (inlineMedia) {
+        if (inlineMedia.type === 'image') {
+            persistedContent.image_url = inlineMedia.link
+            persistedContent.caption = content.text || ''
+        } else if (inlineMedia.type === 'video') {
+            persistedContent.video_url = inlineMedia.link
+            persistedContent.caption = content.text || ''
+        } else if (inlineMedia.type === 'document') {
+            persistedContent.document_url = inlineMedia.link
+            persistedContent.filename = inlineMedia.filename || 'document'
+            persistedContent.caption = content.text || ''
+        }
+    }
     await insertMessage({
         userId,
         direction: 'out',
-        content: {
-            type,
-            to,
-            message_id: messageId,
-            payload: content,
-            status: 'sent',
-            sent_at: sentAtIso,
-            cta_entry_candidate: ctaReplyCandidate,
-            agent: messageActor
-        },
+        content: persistedContent,
         workflowState: workflowState ?? null
     })
 

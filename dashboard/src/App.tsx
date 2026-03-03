@@ -1,5 +1,5 @@
 
-import React, { Suspense, lazy, useEffect, useLayoutEffect, useState, useRef, useCallback, useMemo } from 'react';
+import React, { Suspense, lazy, useEffect, useState, useRef, useCallback, useMemo } from 'react';
 import { List, useDynamicRowHeight, useListRef } from 'react-window';
 import { io, Socket } from 'socket.io-client';
 import {
@@ -42,6 +42,33 @@ import DebugButton from './DebugButton';
 import { supabase } from './supabase';
 import type { Session } from '@supabase/supabase-js';
 import { getSocketUrl, resolveCompanyIdFromLocation } from './runtimeConfig';
+import { useElementSize } from './hooks/useElementSize';
+import { buildActionsFromBuilder, buildBuilderFromActions } from './features/workflows/builderConverters';
+import BroadcastView from './features/workspace/BroadcastView';
+import AutomationsView from './features/workspace/AutomationsView';
+import ContactsView from './features/workspace/ContactsView';
+import SettingsView from './features/workspace/SettingsView';
+import ChatflowView from './features/workspace/ChatflowView';
+import AddProfileModal from './features/workspace/modals/AddProfileModal';
+import EditProfileModal from './features/workspace/modals/EditProfileModal';
+import NewChatModal from './features/workspace/modals/NewChatModal';
+import OnboardingTutorialModal from './features/workspace/modals/OnboardingTutorialModal';
+import {
+    formatBps,
+    formatBytes,
+    formatDateLabel,
+    formatLogTime,
+    formatPhoneNumber,
+    formatRemaining,
+    getCleanId,
+    getInitials,
+    getLastInboundTs,
+    getMessagePreviewText,
+    pickContactName,
+    redactSecret,
+    textColor,
+    withHexAlpha
+} from './features/chat/utils';
 
 
 const SOCKET_URL = getSocketUrl();
@@ -129,6 +156,12 @@ type TeamUserLite = {
     color: string;
 };
 
+type WorkflowTemplateOption = {
+    id: string;
+    name: string;
+    language: string;
+};
+
 type LogEntry = {
     id: string;
     ts: number;
@@ -150,6 +183,26 @@ type ServerStats = {
     timestamp?: number;
 };
 
+type OnboardingStepId = 'welcome' | 'waba_id' | 'phone_number_id' | 'access_token' | 'verify_token' | 'connect';
+
+type OnboardingFieldKey = 'wabaId' | 'phoneNumberId' | 'accessToken' | 'verifyToken';
+
+type OnboardingStepConfig = {
+    id: OnboardingStepId;
+    title: string;
+    description: string;
+    details: string[];
+    fieldKey?: OnboardingFieldKey;
+    fieldLabel?: string;
+    fieldPlaceholder?: string;
+    fieldType?: 'text' | 'password';
+    whereToGet?: string[];
+    guideLinks?: Array<{
+        label: string;
+        href: string;
+    }>;
+};
+
 type ContactMeta = {
     name?: string;
     lastInboundAt?: string | null;
@@ -168,191 +221,16 @@ type MessageVirtualRow =
 
 const CHAT_ROW_HEIGHT = 86;
 const MESSAGE_DRAFT_STORAGE_PREFIX = 'draftMessage:';
-
-const useElementSize = <T extends HTMLElement>() => {
-    const [node, setNode] = useState<T | null>(null);
-    const [size, setSize] = useState({ width: 0, height: 0 });
-    const ref = useCallback((el: T | null) => {
-        setNode(el);
-    }, []);
-
-    useLayoutEffect(() => {
-        if (!node) return;
-
-        const update = () => {
-            setSize({
-                width: node.clientWidth,
-                height: node.clientHeight
-            });
-        };
-
-        update();
-
-        if (typeof ResizeObserver === 'undefined') {
-            window.addEventListener('resize', update);
-            return () => window.removeEventListener('resize', update);
-        }
-
-        const observer = new ResizeObserver(() => update());
-        observer.observe(node);
-        return () => observer.disconnect();
-    }, [node]);
-
-    return { ref, size };
-};
-
-const getCleanId = (jid: string | undefined): string => {
-    if (!jid) return '';
-    // Remove any @... suffix and any :device suffix
-    const clean = jid.split('@')[0].split(':')[0];
-    return clean;
-};
-
-const formatPhoneNumber = (id: string): string => {
-    if (!id) return id;
-    // If it's a long LID (usually 14-16 digits starting with 1 or 2),
-    // we can't easily format it as a PN, but we can at least make it look cleaner.
-    if (id.length > 13) return id;
-
-    // Attempt basic formatting for apparent phone numbers
-    if (/^\d+$/.test(id)) {
-        if (id.startsWith('60') && id.length >= 11) { // Malaysia
-            return `+${id.slice(0, 2)} ${id.slice(2, 4)}-${id.slice(4, 8)} ${id.slice(8)}`;
-        }
-        if (id.startsWith('62') && id.length >= 11) { // Indonesia
-            return `+${id.slice(0, 2)} ${id.slice(2, 5)}-${id.slice(5, 9)}-${id.slice(9)}`;
-        }
-        return `+${id}`;
-    }
-    return id;
-};
-
-const isPhoneLikeName = (name: string, jid?: string): boolean => {
-    if (!name) return false;
-    const trimmed = name.trim();
-    if (!trimmed) return false;
-    const cleanJid = getCleanId(jid);
-    const digitsOnly = trimmed.replace(/\D/g, '');
-    const jidDigits = cleanJid.replace(/\D/g, '');
-    if (jidDigits && digitsOnly === jidDigits) return true;
-    if (/^\+?\d[\d\s-]{5,}$/.test(trimmed)) return true;
-    return false;
-};
-
-const pickContactName = (incoming: string, prev?: string, jid?: string): string => {
-    const incomingTrimmed = (incoming || '').trim();
-    const prevTrimmed = (prev || '').trim();
-    if (!incomingTrimmed) return prevTrimmed;
-    if (prevTrimmed && !isPhoneLikeName(prevTrimmed, jid) && isPhoneLikeName(incomingTrimmed, jid)) {
-        return prevTrimmed;
-    }
-    return incomingTrimmed;
-};
-
-const getInitials = (name?: string | null): string => {
-    const value = (name || '').trim();
-    if (!value) return '?';
-    const parts = value.split(/\s+/).filter(Boolean);
-    if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
-    return `${parts[0][0] || ''}${parts[1][0] || ''}`.toUpperCase();
-};
-
-const withHexAlpha = (color?: string | null, alpha = '22', fallback = '#e5e7eb'): string => {
-    const value = (color || '').trim();
-    if (/^#[0-9a-fA-F]{6}$/.test(value)) return `${value}${alpha}`;
-    return fallback;
-};
-
-const textColor = (color?: string | null, fallback = '#374151'): string => {
-    const value = (color || '').trim();
-    if (/^#[0-9a-fA-F]{6}$/.test(value)) return value;
-    return fallback;
+const ONBOARDING_TOUR_STORAGE_PREFIX = 'onboardingTourSeen:';
+const ONBOARDING_TOUR_VERSION = 'v1';
+const ONBOARDING_SETUP_DEFAULTS: Record<OnboardingFieldKey, string> = {
+    wabaId: '',
+    phoneNumberId: '',
+    accessToken: '',
+    verifyToken: ''
 };
 
 
-const formatBytes = (value?: number): string => {
-    if (value === undefined || value === null || !Number.isFinite(value)) return '--';
-    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-    let size = Math.max(0, value);
-    let unitIndex = 0;
-    while (size >= 1024 && unitIndex < units.length - 1) {
-        size /= 1024;
-        unitIndex += 1;
-    }
-    return `${size.toFixed(size >= 100 ? 0 : size >= 10 ? 1 : 2)} ${units[unitIndex]}`;
-};
-
-const formatBps = (value?: number): string => {
-    if (value === undefined || value === null || !Number.isFinite(value)) return '--';
-    return `${formatBytes(value)}/s`;
-};
-
-const redactSecret = (value?: string | null, visibleStart = 6, visibleEnd = 4): string | null => {
-    if (!value) return null;
-    const str = String(value);
-    if (str.length <= visibleStart + visibleEnd + 3) return `${str} (len ${str.length})`;
-    return `${str.slice(0, visibleStart)}…${str.slice(-visibleEnd)} (len ${str.length})`;
-};
-
-const getLastInboundTs = (
-    messages: Message[],
-    chatId: string | null,
-    contacts: Record<string, ContactMeta>
-): number | null => {
-    if (!chatId) return null;
-    let latestSeconds = 0;
-    messages.forEach(msg => {
-        if (msg.key?.remoteJid === chatId && !msg.key?.fromMe && msg.messageTimestamp) {
-            if (msg.messageTimestamp > latestSeconds) latestSeconds = msg.messageTimestamp;
-        }
-    });
-
-    const contactInbound = contacts?.[chatId]?.lastInboundAt;
-    if (contactInbound) {
-        const inboundMs = new Date(contactInbound).getTime();
-        if (!Number.isNaN(inboundMs)) {
-            const inboundSeconds = Math.floor(inboundMs / 1000);
-            if (inboundSeconds > latestSeconds) latestSeconds = inboundSeconds;
-        }
-    }
-
-    return latestSeconds ? latestSeconds * 1000 : null;
-};
-
-const formatRemaining = (ms: number) => {
-    const totalSeconds = Math.max(0, Math.floor(ms / 1000));
-    const hours = Math.floor(totalSeconds / 3600);
-    const minutes = Math.floor((totalSeconds % 3600) / 60);
-    return `${hours}h ${minutes}m`;
-};
-
-const formatDateLabel = (ms: number) => {
-    if (!ms) return '';
-    const date = new Date(ms);
-    const today = new Date();
-    const yesterday = new Date();
-    yesterday.setDate(today.getDate() - 1);
-
-    const dateKey = date.toDateString();
-    if (dateKey === today.toDateString()) return 'Today';
-    if (dateKey === yesterday.toDateString()) return 'Yesterday';
-
-    return date.toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' });
-};
-
-const getMessagePreviewText = (msg: Message): string => {
-    return (
-        msg.message?.conversation ||
-        msg.message?.extendedTextMessage?.text ||
-        msg.message?.buttonsMessage?.contentText ||
-        msg.message?.listMessage?.description ||
-        ''
-    );
-};
-
-const formatLogTime = (ts: number) => {
-    return new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-};
 
 const renderMessageStatus = (msg: Message) => {
     if (!msg.key?.fromMe) return null;
@@ -364,381 +242,6 @@ const renderMessageStatus = (msg: Message) => {
     return <Check className="w-3.5 h-3.5 text-[#7a8a97]" />;
 };
 
-const BUILDER_ACTION_NODE_TYPES = new Set(['MESSAGE', 'QUESTION', 'LIST', 'IMAGE', 'END', 'CTA_URL']);
-const SUPPORTED_ACTION_TYPES = new Set(['send_text', 'send_buttons', 'send_list', 'send_cta_url', 'end_flow']);
-
-const slugifyButtonId = (label: string, index: number) => {
-    const base = (label || '')
-        .toLowerCase()
-        .replace(/[^a-z0-9]+/g, '_')
-        .replace(/^_+|_+$/g, '');
-    return base || `option_${index + 1}`;
-};
-
-const getNodeNextIds = (node: any) => {
-    if (!node) return [];
-    if (node.type === 'QUESTION' || node.type === 'LIST' || node.type === 'CONDITION') {
-        return Object.values(node.connections || {}).filter(Boolean) as string[];
-    }
-    if (node.nextId) return [node.nextId];
-    return [];
-};
-
-const pickFallbackNextId = (node: any) => {
-    if (!node) return '';
-    if (node.nextId) return node.nextId;
-    const connections = node.connections || {};
-    return connections.default || connections.true || connections.false || Object.values(connections)[0] || '';
-};
-
-const buildActionsFromBuilder = (builder: any) => {
-    const nodes = Array.isArray(builder?.nodes) ? builder.nodes : [];
-    if (!nodes.length) return { actions: [], warnings: [] as string[] };
-
-    const nodesById: Record<string, any> = {};
-    nodes.forEach((node: any) => {
-        if (node?.id) nodesById[node.id] = node;
-    });
-
-    const startNode = nodes.find((node: any) => node.type === 'START');
-    const startId = startNode?.nextId || startNode?.id || nodes[0]?.id;
-
-    const ordered: string[] = [];
-    const visited = new Set<string>();
-
-    const visit = (nodeId?: string) => {
-        if (!nodeId || visited.has(nodeId)) return;
-        visited.add(nodeId);
-        ordered.push(nodeId);
-        const node = nodesById[nodeId];
-        if (!node) return;
-        const nextIds = getNodeNextIds(node);
-        nextIds.forEach(visit);
-    };
-
-    if (startId) visit(startId);
-
-    const actions: any[] = [];
-    const indexByNode: Record<string, number> = {};
-    const pendingQuestions: Array<{ node: any; nodeId: string; actionIndex: number; buttons: Array<{ id: string; title: string }> }> = [];
-    const pendingLists: Array<{ node: any; nodeId: string; actionIndex: number; rows: Array<{ id: string; title: string; handleId: string }> }> = [];
-    const warnings: string[] = [];
-
-    ordered.forEach((nodeId) => {
-        const node = nodesById[nodeId];
-        if (!node || !BUILDER_ACTION_NODE_TYPES.has(node.type)) return;
-
-        if (node.type === 'MESSAGE') {
-            const actionIndex = actions.length;
-            actions.push({ type: 'send_text', text: node.content || '' });
-            indexByNode[nodeId] = actionIndex;
-            return;
-        }
-
-        if (node.type === 'QUESTION') {
-            const options = Array.isArray(node.options) ? node.options : [];
-            const buttons = options.map((opt: string, idx: number) => ({
-                id: slugifyButtonId(opt, idx),
-                title: opt || `Option ${idx + 1}`
-            }));
-            const actionIndex = actions.length;
-            const action: any = {
-                type: 'send_buttons',
-                text: node.content || '',
-                buttons
-            };
-            if (node.fallbackText) {
-                action.fallback_text = node.fallbackText;
-            }
-            actions.push(action);
-            indexByNode[nodeId] = actionIndex;
-            pendingQuestions.push({ node, nodeId, actionIndex, buttons });
-            return;
-        }
-
-        if (node.type === 'LIST') {
-            const sections = Array.isArray(node.sections) ? node.sections : [];
-            const normalizedSections: Array<{ title?: string; rows: Array<{ id: string; title: string; description?: string }> }> = [];
-            const rowsMeta: Array<{ id: string; title: string; handleId: string }> = [];
-            let globalRowIndex = 0;
-
-            sections.forEach((section: any, sectionIdx: number) => {
-                const title = section?.title || '';
-                const rows = Array.isArray(section?.rows) ? section.rows : [];
-                const normalizedRows = rows.map((row: any, rowIdx: number) => {
-                    const rowTitle = row?.title || `Option ${globalRowIndex + 1}`;
-                    let rowId = row?.id || slugifyButtonId(rowTitle, globalRowIndex);
-                    if (!rowId) rowId = `option_${globalRowIndex + 1}`;
-                    const handleId = `row-${sectionIdx}-${rowIdx}`;
-                    rowsMeta.push({ id: rowId, title: rowTitle, handleId });
-                    globalRowIndex += 1;
-                    return {
-                        id: rowId,
-                        title: rowTitle,
-                        ...(row?.description ? { description: row.description } : {})
-                    };
-                });
-                normalizedSections.push({
-                    ...(title ? { title } : {}),
-                    rows: normalizedRows
-                });
-            });
-
-            const actionIndex = actions.length;
-            const action: any = {
-                type: 'send_list',
-                text: node.body || node.content || '',
-                button_text: node.buttonText || node.button_text || node.button || 'View options',
-                sections: normalizedSections
-            };
-            if (node.headerText) {
-                action.header = { type: 'text', text: node.headerText };
-            }
-            if (node.footerText) {
-                action.footer = node.footerText;
-            }
-            if (node.fallbackText) {
-                action.fallback_text = node.fallbackText;
-            }
-            actions.push(action);
-            indexByNode[nodeId] = actionIndex;
-            pendingLists.push({ node, nodeId, actionIndex, rows: rowsMeta });
-            return;
-        }
-
-        if (node.type === 'CTA_URL') {
-            const actionIndex = actions.length;
-            const action: any = {
-                type: 'send_cta_url',
-                body: node.body || '',
-                button_text: node.buttonText || 'Open',
-                url: node.url || ''
-            };
-            if (node.headerText) {
-                action.header = { type: 'text', text: node.headerText };
-            }
-            if (node.footerText) {
-                action.footer = node.footerText;
-            }
-            actions.push(action);
-            indexByNode[nodeId] = actionIndex;
-            return;
-        }
-
-        if (node.type === 'IMAGE') {
-            const actionIndex = actions.length;
-            const caption = node.caption || '';
-            const url = node.imageUrl || '';
-            const text = caption && url ? `${caption}\n${url}` : caption || url;
-            actions.push({ type: 'send_text', text });
-            indexByNode[nodeId] = actionIndex;
-            warnings.push(`Image node ${nodeId} converted to send_text (no media support in workflow actions).`);
-            return;
-        }
-
-        if (node.type === 'END') {
-            const actionIndex = actions.length;
-            if (node.content) {
-                actions.push({ type: 'send_text', text: node.content });
-                actions.push({ type: 'end_flow' });
-                indexByNode[nodeId] = actionIndex;
-            } else {
-                actions.push({ type: 'end_flow' });
-                indexByNode[nodeId] = actionIndex;
-            }
-            return;
-        }
-    });
-
-    const resolveActionIndex = (targetId?: string) => {
-        let current = targetId;
-        const guard = new Set<string>();
-        while (current) {
-            if (indexByNode[current] !== undefined) return indexByNode[current];
-            if (guard.has(current)) return undefined;
-            guard.add(current);
-            const node = nodesById[current];
-            if (!node) return undefined;
-            current = pickFallbackNextId(node);
-        }
-        return undefined;
-    };
-
-    pendingQuestions.forEach(({ node, actionIndex, buttons }) => {
-        const routes: Record<string, number> = {};
-        buttons.forEach((button, idx) => {
-            const optionLabel = Array.isArray(node.options) ? node.options[idx] : button.title;
-            const targetId = node.connections?.[optionLabel];
-            const resolvedIndex = resolveActionIndex(targetId);
-            if (resolvedIndex !== undefined) {
-                routes[button.id] = resolvedIndex;
-            } else if (actionIndex + 1 < actions.length) {
-                routes[button.id] = actionIndex + 1;
-            }
-        });
-        if (Object.keys(routes).length > 0) {
-            (actions[actionIndex] as any).routes = routes;
-        }
-    });
-
-    pendingLists.forEach(({ node, actionIndex, rows }) => {
-        const routes: Record<string, number> = {};
-        rows.forEach((row) => {
-            const targetId = node.connections?.[row.handleId];
-            const resolvedIndex = resolveActionIndex(targetId);
-            if (resolvedIndex !== undefined) {
-                routes[row.id] = resolvedIndex;
-            } else if (actionIndex + 1 < actions.length) {
-                routes[row.id] = actionIndex + 1;
-            }
-        });
-        if (Object.keys(routes).length > 0) {
-            (actions[actionIndex] as any).routes = routes;
-        }
-    });
-
-    ordered.forEach((nodeId) => {
-        const node = nodesById[nodeId];
-        if (!node || node.type !== 'MESSAGE') return;
-        const actionIndex = indexByNode[nodeId];
-        if (actionIndex === undefined) return;
-        const resolvedIndex = resolveActionIndex(node.nextId);
-        if (resolvedIndex !== undefined && resolvedIndex !== actionIndex) {
-            (actions[actionIndex] as any).next_step = resolvedIndex;
-        }
-    });
-
-    return { actions, warnings };
-};
-
-const buildBuilderFromActions = (actions: any[], workflowId: string) => {
-    const nodes: any[] = [];
-    const startId = `node-start-${workflowId}`;
-    nodes.push({
-        id: startId,
-        type: 'START',
-        position: { x: 120, y: 80 },
-        nextId: ''
-    });
-
-    const indexToNodeId: Record<number, string> = {};
-    const nodeByActionIndex: Record<number, any> = {};
-    let lastId = startId;
-    let y = 220;
-
-    actions.forEach((action: any, idx: number) => {
-        if (!SUPPORTED_ACTION_TYPES.has(action?.type)) return;
-        const nodeId = `node-${workflowId}-${idx}`;
-        const base: any = {
-            id: nodeId,
-            position: { x: 120, y },
-            nextId: ''
-        };
-
-        if (action.type === 'send_text') {
-            base.type = 'MESSAGE';
-            base.content = action.text || '';
-        } else if (action.type === 'send_buttons') {
-            base.type = 'QUESTION';
-            base.content = action.text || '';
-            base.options = Array.isArray(action.buttons)
-                ? action.buttons.map((b: any) => b.title || b.id)
-                : [];
-            base.fallbackText = action.fallback_text || action.fallback || '';
-        } else if (action.type === 'send_list') {
-            base.type = 'LIST';
-            base.body = action.text || action.body || '';
-            base.buttonText = action.button_text || action.buttonText || action.button || 'View options';
-            base.headerText = action.header?.text || '';
-            base.footerText = action.footer || '';
-            base.sections = Array.isArray(action.sections) ? action.sections : [];
-            base.fallbackText = action.fallback_text || action.fallback || '';
-        } else if (action.type === 'send_cta_url') {
-            base.type = 'CTA_URL';
-            base.body = action.body || '';
-            base.buttonText = action.button_text || '';
-            base.url = action.url || '';
-            base.headerText = action.header?.text || '';
-            base.footerText = action.footer || '';
-        } else if (action.type === 'end_flow') {
-            base.type = 'END';
-            base.content = '';
-        } else {
-            return;
-        }
-
-        const prevNode = nodes.find(n => n.id === lastId);
-        if (prevNode) prevNode.nextId = nodeId;
-
-        nodes.push(base);
-        indexToNodeId[idx] = nodeId;
-        nodeByActionIndex[idx] = base;
-        lastId = nodeId;
-        y += 180;
-    });
-
-    Object.entries(nodeByActionIndex).forEach(([idxStr, node]) => {
-        const idx = Number(idxStr);
-        const action = actions[idx];
-        if (node.type !== 'QUESTION' || !action) return;
-        const connections: Record<string, string> = {};
-        const buttons = Array.isArray(action.buttons) ? action.buttons : [];
-        buttons.forEach((button: any, btnIdx: number) => {
-            const route = action.routes?.[button.id];
-            let targetIndex: number | undefined;
-            if (typeof route === 'number') {
-                targetIndex = route;
-            } else if (route && route.next_step !== undefined) {
-                targetIndex = route.next_step;
-            } else {
-                targetIndex = idx + 1;
-            }
-            if (targetIndex === undefined) return;
-            const targetNodeId = indexToNodeId[targetIndex];
-            if (targetNodeId) {
-                connections[node.options?.[btnIdx] || button.title || `Option ${btnIdx + 1}`] = targetNodeId;
-            }
-        });
-        if (Object.keys(connections).length > 0) {
-            node.connections = connections;
-        }
-    });
-
-    Object.entries(nodeByActionIndex).forEach(([idxStr, node]) => {
-        const idx = Number(idxStr);
-        const action = actions[idx];
-        if (node.type !== 'LIST' || !action) return;
-        const connections: Record<string, string> = {};
-        const sections = Array.isArray(node.sections) ? node.sections : [];
-        sections.forEach((section: any, sectionIdx: number) => {
-            const rows = Array.isArray(section?.rows) ? section.rows : [];
-            rows.forEach((row: any, rowIdx: number) => {
-                const rowId = row?.id;
-                if (!rowId) return;
-                const route = action.routes?.[rowId];
-                let targetIndex: number | undefined;
-                if (typeof route === 'number') {
-                    targetIndex = route;
-                } else if (route && route.next_step !== undefined) {
-                    targetIndex = route.next_step;
-                } else {
-                    targetIndex = idx + 1;
-                }
-                if (targetIndex === undefined) return;
-                const targetNodeId = indexToNodeId[targetIndex];
-                if (targetNodeId) {
-                    const handleId = `row-${sectionIdx}-${rowIdx}`;
-                    connections[handleId] = targetNodeId;
-                }
-            });
-        });
-        if (Object.keys(connections).length > 0) {
-            node.connections = connections;
-        }
-    });
-
-    return { id: workflowId, nodes };
-};
 
 export default function App() {
     // Auth State
@@ -759,6 +262,10 @@ export default function App() {
         }
     });
     const [messageText, setMessageText] = useState('');
+    const [composerMediaType, setComposerMediaType] = useState<'none' | 'image' | 'video' | 'document'>('none');
+    const [composerMediaUrl, setComposerMediaUrl] = useState('');
+    const [composerMediaFilename, setComposerMediaFilename] = useState('');
+    const [showMediaComposer, setShowMediaComposer] = useState(false);
     const [templateName, setTemplateName] = useState('');
     const [templateLanguage, setTemplateLanguage] = useState('en_US');
     const [templateComponents, setTemplateComponents] = useState('');
@@ -795,12 +302,20 @@ export default function App() {
     const [contactsSearchQuery, setContactsSearchQuery] = useState('');
     const [teamUsers, setTeamUsers] = useState<TeamUserLite[]>([]);
     const [teamUsersLoading, setTeamUsersLoading] = useState(false);
+    const [workflowTemplateOptions, setWorkflowTemplateOptions] = useState<WorkflowTemplateOption[]>([]);
     const [assignMenuContactId, setAssignMenuContactId] = useState<string | null>(null);
     const [assigningContactId, setAssigningContactId] = useState<string | null>(null);
     const [mediaCache, setMediaCache] = useState<Record<string, MediaData>>({});
     const [showContactInfo, setShowContactInfo] = useState(false);
     const [showNewChatModal, setShowNewChatModal] = useState(false);
     const [newPhoneNumber, setNewPhoneNumber] = useState('');
+    const [showOnboardingTutorial, setShowOnboardingTutorial] = useState(false);
+    const [onboardingStep, setOnboardingStep] = useState(0);
+    const [onboardingSetup, setOnboardingSetup] = useState<Record<OnboardingFieldKey, string>>({ ...ONBOARDING_SETUP_DEFAULTS });
+    const [onboardingValidationError, setOnboardingValidationError] = useState<string | null>(null);
+    const [onboardingConnectLoading, setOnboardingConnectLoading] = useState(false);
+    const [onboardingConnectError, setOnboardingConnectError] = useState<string | null>(null);
+    const [onboardingConnectSuccess, setOnboardingConnectSuccess] = useState<string | null>(null);
     const [showMenu, setShowMenu] = useState(false);
     const [now, setNow] = useState(Date.now());
     const [isOffline, setIsOffline] = useState(() => {
@@ -892,12 +407,304 @@ export default function App() {
         }] : [])
     ];
 
-    const scrollToSettingsSection = (id: string) => {
+    const isWabaProviderAdmin = useMemo(() => {
+        const userMeta: any = (session?.user?.user_metadata as any) || {};
+        const appMeta: any = (session?.user?.app_metadata as any) || {};
+        const candidates = [
+            userMeta.waba_admin,
+            userMeta.is_waba_admin,
+            appMeta.waba_admin,
+            appMeta.is_waba_admin,
+            userMeta.role,
+            appMeta.role
+        ];
+        return candidates.some((value) => {
+            if (typeof value === 'boolean') return value;
+            if (typeof value === 'string') {
+                const normalized = value.trim().toLowerCase();
+                return normalized === 'true' || normalized === 'waba_admin' || normalized === 'super_admin';
+            }
+            return false;
+        });
+    }, [session?.user?.app_metadata, session?.user?.user_metadata]);
+
+    const onboardingSteps = useMemo<OnboardingStepConfig[]>(() => ([
+        {
+            id: 'welcome',
+            title: 'Required first-time setup',
+            description: 'Complete these steps to activate your WhatsApp workspace.',
+            details: [
+                'This setup is required for company admins and cannot be skipped.',
+                'You will enter real Meta credentials and verify connection before continuing.'
+            ]
+        },
+        {
+            id: 'waba_id',
+            title: 'Step 1: WhatsApp Business Account ID',
+            description: 'Enter the WABA ID for the account you want to connect.',
+            details: [
+                'Use numbers only (example: 102290129340398).',
+                'Make sure this WABA belongs to the same Meta Business that owns the phone number.'
+            ],
+            fieldKey: 'wabaId',
+            fieldLabel: 'WABA ID',
+            fieldPlaceholder: 'e.g. 102290129340398',
+            fieldType: 'text',
+            whereToGet: [
+                'Meta App Dashboard > WhatsApp > API Setup > WhatsApp Business Account ID.',
+                'Or Meta Business Manager > WhatsApp Accounts > select account > copy ID.'
+            ],
+            guideLinks: [
+                { label: 'Cloud API Get Started', href: 'https://developers.facebook.com/docs/whatsapp/cloud-api/get-started' }
+            ]
+        },
+        {
+            id: 'phone_number_id',
+            title: 'Step 2: Business Phone Number ID',
+            description: 'Enter the phone number ID linked to your WABA.',
+            details: [
+                'Use numbers only (example: 106540352242922).',
+                'This is NOT your display phone number; it is the Meta phone number ID.'
+            ],
+            fieldKey: 'phoneNumberId',
+            fieldLabel: 'Phone Number ID',
+            fieldPlaceholder: 'e.g. 106540352242922',
+            fieldType: 'text',
+            whereToGet: [
+                'Meta App Dashboard > WhatsApp > API Setup > Phone number ID.',
+                'Use the ID from the number you want this workspace to send from.'
+            ],
+            guideLinks: [
+                { label: 'WhatsApp API Setup', href: 'https://developers.facebook.com/docs/whatsapp/cloud-api/phone-numbers' }
+            ]
+        },
+        {
+            id: 'access_token',
+            title: 'Step 3: Access Token',
+            description: 'Enter a valid token with WhatsApp permissions.',
+            details: [
+                'Use a system user long-lived token in production.',
+                'Token must allow WhatsApp Business messaging and management.'
+            ],
+            fieldKey: 'accessToken',
+            fieldLabel: 'Access Token',
+            fieldPlaceholder: 'Paste access token',
+            fieldType: 'password',
+            whereToGet: [
+                'Meta App Dashboard > WhatsApp > API Setup > temporary token (testing).',
+                'For production, use Business Settings > System Users > generate long-lived token.'
+            ],
+            guideLinks: [
+                { label: 'System User Access Tokens', href: 'https://developers.facebook.com/docs/whatsapp/business-management-api/get-started' }
+            ]
+        },
+        {
+            id: 'verify_token',
+            title: 'Step 4: Webhook Verify Token',
+            description: 'Create a verify token you can remember and use in Meta webhook settings.',
+            details: [
+                'This is your own secret string, not issued by Meta.',
+                'Use at least 8 characters with letters and numbers.'
+            ],
+            fieldKey: 'verifyToken',
+            fieldLabel: 'Verify Token',
+            fieldPlaceholder: 'e.g. mycompany_verify_2026',
+            fieldType: 'password',
+            whereToGet: [
+                'Create your own token value, then reuse the exact same value in Meta webhook verify token field.'
+            ],
+            guideLinks: [
+                { label: 'Webhook Verification', href: 'https://developers.facebook.com/docs/graph-api/webhooks/getting-started' }
+            ]
+        },
+        {
+            id: 'connect',
+            title: 'Step 5: Save and verify setup',
+            description: 'We will save config and verify it by subscribing your app to this WABA.',
+            details: [
+                'Click "Save and verify connection".',
+                'If verification fails, fix the value(s) and retry before continuing.'
+            ]
+        }
+    ]), []);
+
+    const scrollToSettingsSection = useCallback((id: string) => {
         const element = document.getElementById(id);
         if (element) {
             element.scrollIntoView({ behavior: 'smooth', block: 'start' });
         }
-    };
+    }, []);
+
+    const onboardingStorageKey = session?.user?.id
+        ? `${ONBOARDING_TOUR_STORAGE_PREFIX}${ONBOARDING_TOUR_VERSION}:${session.user.id}`
+        : null;
+
+    const resetOnboardingWizard = useCallback(() => {
+        setOnboardingStep(0);
+        setOnboardingSetup({ ...ONBOARDING_SETUP_DEFAULTS });
+        setOnboardingValidationError(null);
+        setOnboardingConnectError(null);
+        setOnboardingConnectSuccess(null);
+        setOnboardingConnectLoading(false);
+    }, []);
+
+    const completeOnboardingTutorial = useCallback(() => {
+        if (!onboardingStorageKey) return;
+        try {
+            window.localStorage.setItem(onboardingStorageKey, '1');
+        } catch {
+            // ignore storage errors
+        }
+    }, [onboardingStorageKey]);
+
+    const closeOnboardingTutorial = useCallback((markAsComplete: boolean) => {
+        if (markAsComplete) {
+            completeOnboardingTutorial();
+        }
+        setShowOnboardingTutorial(false);
+        resetOnboardingWizard();
+    }, [completeOnboardingTutorial, resetOnboardingWizard]);
+
+    const updateOnboardingField = useCallback((field: OnboardingFieldKey, value: string) => {
+        setOnboardingSetup(prev => ({ ...prev, [field]: value }));
+        setOnboardingValidationError(null);
+        setOnboardingConnectError(null);
+        setOnboardingConnectSuccess(null);
+    }, []);
+
+    const isNumericMetaId = useCallback((value: string) => /^\d{6,25}$/.test(value.trim()), []);
+    const isAccessTokenValid = useCallback((value: string) => value.trim().length >= 30, []);
+    const isVerifyTokenValid = useCallback((value: string) => value.trim().length >= 8, []);
+
+    const currentOnboardingStep = onboardingSteps[Math.min(onboardingStep, onboardingSteps.length - 1)] || onboardingSteps[0];
+    const isFinalOnboardingStep = onboardingStep >= onboardingSteps.length - 1;
+
+    const isCurrentOnboardingStepValid = useMemo(() => {
+        switch (currentOnboardingStep.id) {
+            case 'waba_id':
+                return isNumericMetaId(onboardingSetup.wabaId);
+            case 'phone_number_id':
+                return isNumericMetaId(onboardingSetup.phoneNumberId);
+            case 'access_token':
+                return isAccessTokenValid(onboardingSetup.accessToken);
+            case 'verify_token':
+                return isVerifyTokenValid(onboardingSetup.verifyToken);
+            case 'connect':
+                return Boolean(onboardingConnectSuccess);
+            default:
+                return true;
+        }
+    }, [
+        currentOnboardingStep.id,
+        isAccessTokenValid,
+        isNumericMetaId,
+        isVerifyTokenValid,
+        onboardingConnectSuccess,
+        onboardingSetup.accessToken,
+        onboardingSetup.phoneNumberId,
+        onboardingSetup.verifyToken,
+        onboardingSetup.wabaId
+    ]);
+
+    const validateCurrentOnboardingStep = useCallback((): string | null => {
+        switch (currentOnboardingStep.id) {
+            case 'waba_id':
+                return isNumericMetaId(onboardingSetup.wabaId) ? null : 'WABA ID must be numeric.';
+            case 'phone_number_id':
+                return isNumericMetaId(onboardingSetup.phoneNumberId) ? null : 'Phone Number ID must be numeric.';
+            case 'access_token':
+                return isAccessTokenValid(onboardingSetup.accessToken) ? null : 'Access token looks incomplete. Paste full token.';
+            case 'verify_token':
+                return isVerifyTokenValid(onboardingSetup.verifyToken) ? null : 'Verify token must be at least 8 characters.';
+            case 'connect':
+                return onboardingConnectSuccess ? null : 'Save and verify connection before continuing.';
+            default:
+                return null;
+        }
+    }, [
+        currentOnboardingStep.id,
+        isAccessTokenValid,
+        isNumericMetaId,
+        isVerifyTokenValid,
+        onboardingConnectSuccess,
+        onboardingSetup.accessToken,
+        onboardingSetup.phoneNumberId,
+        onboardingSetup.verifyToken,
+        onboardingSetup.wabaId
+    ]);
+
+    const handleOnboardingConnect = useCallback(async () => {
+        if (!session?.access_token) {
+            setOnboardingConnectError('You must be logged in to save setup.');
+            return;
+        }
+        if (!activeProfileId) {
+            setOnboardingConnectError('No active profile selected yet. Wait for profile to load and retry.');
+            return;
+        }
+        setOnboardingConnectLoading(true);
+        setOnboardingConnectError(null);
+        setOnboardingConnectSuccess(null);
+        try {
+            const res = await fetch(`${SOCKET_URL}/api/waba/manual-config`, {
+                method: 'POST',
+                headers: {
+                    Authorization: `Bearer ${session.access_token}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    profileId: activeProfileId,
+                    wabaId: onboardingSetup.wabaId.trim(),
+                    phoneNumberId: onboardingSetup.phoneNumberId.trim(),
+                    accessToken: onboardingSetup.accessToken.trim(),
+                    verifyToken: onboardingSetup.verifyToken.trim(),
+                    businessId: null,
+                    appId: null,
+                    appSecret: null,
+                    apiVersion: null
+                })
+            });
+            const data = await res.json().catch(() => null);
+            if (!res.ok || !data?.success) {
+                throw new Error(data?.error || 'Failed to save setup');
+            }
+            if (data?.subscribeError) {
+                throw new Error(`Saved, but Meta verification failed: ${data.subscribeError}`);
+            }
+            setOnboardingConnectSuccess('Connection verified successfully. You can continue.');
+        } catch (err: any) {
+            setOnboardingConnectError(err?.message || 'Failed to verify connection');
+        } finally {
+            setOnboardingConnectLoading(false);
+        }
+    }, [
+        activeProfileId,
+        onboardingSetup.accessToken,
+        onboardingSetup.phoneNumberId,
+        onboardingSetup.verifyToken,
+        onboardingSetup.wabaId,
+        session?.access_token
+    ]);
+
+    const handleOnboardingNext = useCallback(() => {
+        const validationError = validateCurrentOnboardingStep();
+        if (validationError) {
+            setOnboardingValidationError(validationError);
+            return;
+        }
+        setOnboardingValidationError(null);
+        if (onboardingStep >= onboardingSteps.length - 1) {
+            closeOnboardingTutorial(true);
+            return;
+        }
+        setOnboardingStep((prev) => prev + 1);
+    }, [closeOnboardingTutorial, onboardingStep, onboardingSteps.length, validateCurrentOnboardingStep]);
+
+    const handleOnboardingBack = useCallback(() => {
+        setOnboardingValidationError(null);
+        setOnboardingConnectError(null);
+        setOnboardingStep((prev) => Math.max(prev - 1, 0));
+    }, []);
 
     const pushLog = useCallback((message: string, level: 'info' | 'error' = 'error') => {
         if (!message) return;
@@ -990,6 +797,46 @@ export default function App() {
             setTeamUsersLoading(false);
         }
     }, [session?.access_token]);
+
+    const fetchWorkflowTemplateOptions = useCallback(async () => {
+        if (!activeProfileId || !session?.access_token) {
+            setWorkflowTemplateOptions([]);
+            return;
+        }
+
+        try {
+            const params = new URLSearchParams();
+            params.set('profileId', activeProfileId);
+            params.set('limit', '100');
+            params.set('status', 'APPROVED');
+            const res = await fetch(`${SOCKET_URL}/api/waba/templates?${params.toString()}`, {
+                headers: {
+                    Authorization: `Bearer ${session.access_token}`
+                }
+            });
+            const data = await res.json().catch(() => null);
+            if (!res.ok || !data?.success) {
+                throw new Error(data?.error || 'Failed to load templates');
+            }
+            const rows = Array.isArray(data?.data?.data) ? data.data.data : [];
+            const mapped: WorkflowTemplateOption[] = rows
+                .map((row: any) => ({
+                    id: typeof row?.id === 'string' ? row.id : '',
+                    name: typeof row?.name === 'string' ? row.name : '',
+                    language: typeof row?.language === 'string' ? row.language : 'en_US'
+                }))
+                .filter((tpl: WorkflowTemplateOption) => Boolean(tpl.name))
+                .sort((a: WorkflowTemplateOption, b: WorkflowTemplateOption) => {
+                    const nameCmp = a.name.localeCompare(b.name);
+                    if (nameCmp !== 0) return nameCmp;
+                    return a.language.localeCompare(b.language);
+                });
+            setWorkflowTemplateOptions(mapped);
+        } catch (err) {
+            console.error('Failed to load workflow template options:', err);
+            setWorkflowTemplateOptions([]);
+        }
+    }, [activeProfileId, session?.access_token]);
 
     const handleAssignContact = useCallback(
         async (jid: string, assigneeUserId: string | null) => {
@@ -1229,12 +1076,20 @@ export default function App() {
     useEffect(() => {
         if (!activeProfileId || !selectedChatId) {
             setMessageText('');
+            setComposerMediaType('none');
+            setComposerMediaUrl('');
+            setComposerMediaFilename('');
+            setShowMediaComposer(false);
             return;
         }
         try {
             const key = getDraftStorageKey(activeProfileId, selectedChatId);
             if (!key) {
                 setMessageText('');
+                setComposerMediaType('none');
+                setComposerMediaUrl('');
+                setComposerMediaFilename('');
+                setShowMediaComposer(false);
                 return;
             }
             const storedDraft = window.localStorage.getItem(key);
@@ -1316,6 +1171,14 @@ export default function App() {
     }, [workspaceSection, fetchTeamUsers]);
 
     useEffect(() => {
+        if (activeView !== 'chatflow') return;
+        if (!teamUsers.length && !teamUsersLoading) {
+            fetchTeamUsers();
+        }
+        fetchWorkflowTemplateOptions();
+    }, [activeView, teamUsers.length, teamUsersLoading, fetchTeamUsers, fetchWorkflowTemplateOptions]);
+
+    useEffect(() => {
         setAssignMenuContactId(null);
     }, [activeProfileId, workspaceSection]);
 
@@ -1324,6 +1187,8 @@ export default function App() {
         clearAllDrafts();
         setMessageText('');
         setHostAuthError(null);
+        setShowOnboardingTutorial(false);
+        resetOnboardingWizard();
         await supabase.auth.signOut();
         setSession(null);
     };
@@ -1373,6 +1238,30 @@ export default function App() {
             setSession(null);
         });
     }, [session]);
+
+    useEffect(() => {
+        if (authChecking || hostAuthError) return;
+        if (!session?.user?.id || !onboardingStorageKey || !isAdmin || isWabaProviderAdmin) {
+            setShowOnboardingTutorial(false);
+            resetOnboardingWizard();
+            return;
+        }
+
+        let hasSeen = false;
+        try {
+            hasSeen = window.localStorage.getItem(onboardingStorageKey) === '1';
+        } catch {
+            hasSeen = false;
+        }
+
+        if (hasSeen) {
+            setShowOnboardingTutorial(false);
+            return;
+        }
+
+        resetOnboardingWizard();
+        setShowOnboardingTutorial(true);
+    }, [authChecking, hostAuthError, isAdmin, isWabaProviderAdmin, onboardingStorageKey, resetOnboardingWizard, session?.user?.id]);
 
     useEffect(() => {
         if (!session) {
@@ -1888,6 +1777,64 @@ export default function App() {
         return list;
     }, [workflows]);
 
+    const workflowTagOptions = useMemo(() => {
+        const seen = new Set<string>();
+        Object.values(contacts).forEach((contact) => {
+            const tags = Array.isArray(contact?.tags) ? contact.tags : [];
+            tags.forEach((tag) => {
+                const value = typeof tag === 'string' ? tag.trim() : '';
+                if (value) seen.add(value);
+            });
+        });
+        contactTagsDraft.forEach((tag) => {
+            const value = typeof tag === 'string' ? tag.trim() : '';
+            if (value) seen.add(value);
+        });
+        return Array.from(seen).sort((a, b) => a.localeCompare(b));
+    }, [contacts, contactTagsDraft]);
+
+    const workflowTriggerOptions = useMemo(() => {
+        return workflows
+            .map((wf: any) => {
+                const id = typeof wf?.id === 'string' ? wf.id : '';
+                if (!id) return null;
+                const keyword = typeof wf?.trigger_keyword === 'string' ? wf.trigger_keyword.trim() : '';
+                return {
+                    id,
+                    name: keyword ? `${id} (${keyword})` : id
+                };
+            })
+            .filter(Boolean) as Array<{ id: string; name?: string }>;
+    }, [workflows]);
+
+    const workflowVariableOptions = useMemo(() => {
+        const seen = new Set<string>();
+
+        workflows.forEach((wf: any) => {
+            const actions = Array.isArray(wf?.actions) ? wf.actions : [];
+            actions.forEach((action: any) => {
+                if (action?.type !== 'ask_question') return;
+                const key = typeof action?.save_as === 'string'
+                    ? action.save_as.trim().toLowerCase().replace(/[^a-z0-9_]+/g, '_').replace(/^_+|_+$/g, '')
+                    : '';
+                if (key) seen.add(key);
+            });
+        });
+
+        allMessages.forEach((msg) => {
+            const vars = msg?.workflowState?.vars;
+            if (!vars || typeof vars !== 'object') return;
+            Object.keys(vars).forEach((rawKey) => {
+                const key = typeof rawKey === 'string'
+                    ? rawKey.trim().toLowerCase().replace(/[^a-z0-9_]+/g, '_').replace(/^_+|_+$/g, '')
+                    : '';
+                if (key) seen.add(key);
+            });
+        });
+
+        return Array.from(seen).sort((a, b) => a.localeCompare(b));
+    }, [workflows, allMessages]);
+
     useEffect(() => {
         if (startWorkflowId && !startableWorkflows.find(wf => wf.id === startWorkflowId)) {
             setStartWorkflowId('');
@@ -1899,6 +1846,47 @@ export default function App() {
             .filter(msg => msg.key.remoteJid === selectedChatId)
             .sort((a, b) => (a.messageTimestamp || 0) - (b.messageTimestamp || 0));
     }, [allMessages, selectedChatId]);
+
+    const selectedWorkflowMemory = useMemo(() => {
+        let vars: Record<string, string> = {};
+        let qaHistory: Array<{ key: string; question: string; answer: string; at: string }> = [];
+
+        for (let idx = currentChatMessages.length - 1; idx >= 0; idx -= 1) {
+            const state = currentChatMessages[idx]?.workflowState;
+            if (!state || typeof state !== 'object') continue;
+
+            if (Object.keys(vars).length === 0 && state.vars && typeof state.vars === 'object') {
+                const nextVars: Record<string, string> = {};
+                Object.entries(state.vars as Record<string, unknown>).forEach(([key, value]) => {
+                    if (typeof key !== 'string') return;
+                    const normalized = key.trim().toLowerCase().replace(/[^a-z0-9_]+/g, '_').replace(/^_+|_+$/g, '');
+                    if (!normalized) return;
+                    if (value === null || value === undefined) return;
+                    nextVars[normalized] = String(value);
+                });
+                if (Object.keys(nextVars).length > 0) vars = nextVars;
+            }
+
+            if (qaHistory.length === 0 && Array.isArray(state.qa_history)) {
+                const nextQa = state.qa_history
+                    .map((entry: any) => ({
+                        key: typeof entry?.key === 'string' ? entry.key : '',
+                        question: typeof entry?.question === 'string' ? entry.question : '',
+                        answer: typeof entry?.answer === 'string' ? entry.answer : '',
+                        at: typeof entry?.at === 'string' ? entry.at : ''
+                    }))
+                    .filter((entry: any) => entry.key && entry.answer);
+                if (nextQa.length > 0) qaHistory = nextQa;
+            }
+
+            if (Object.keys(vars).length > 0 && qaHistory.length > 0) break;
+        }
+
+        return {
+            vars,
+            qaHistory: qaHistory.slice(-20).reverse()
+        };
+    }, [currentChatMessages]);
 
     const messageRows = useMemo<MessageVirtualRow[]>(() => {
         const rows: MessageVirtualRow[] = [];
@@ -1997,6 +1985,7 @@ export default function App() {
             : null;
     const ctaFreeWindowOpen = ctaFreeWindowRemainingMs !== null && ctaFreeWindowRemainingMs > 0;
     const canSendText = windowOpen && !forceTemplateMode;
+    const hasComposerMedia = composerMediaType !== 'none' && composerMediaUrl.trim().length > 0;
     const quickReplyQuery = useMemo(() => {
         const trimmed = messageText.trim();
         if (!trimmed.startsWith('/')) return null;
@@ -2036,12 +2025,59 @@ export default function App() {
     }, [lastInboundMs]);
 
     const handleSendMessage = () => {
-        if (!socket || !activeProfileId || !selectedChatId || !messageText.trim()) return;
+        if (!socket || !activeProfileId || !selectedChatId) return;
         const outgoingText = messageText.trim();
-        socket.emit('sendMessage', { profileId: activeProfileId, jid: selectedChatId, text: outgoingText });
+        const mediaUrl = composerMediaUrl.trim();
+        const mediaType = composerMediaType;
+        const mediaFilename = composerMediaFilename.trim();
+        const sendMedia =
+            (mediaType === 'image' || mediaType === 'video' || mediaType === 'document') && mediaUrl
+                ? {
+                    type: mediaType,
+                    url: mediaUrl,
+                    ...(mediaType === 'document' && mediaFilename ? { filename: mediaFilename } : {})
+                }
+                : null;
+
+        if (!outgoingText && !sendMedia) return;
+
+        socket.emit('sendMessage', {
+            profileId: activeProfileId,
+            jid: selectedChatId,
+            text: outgoingText,
+            ...(sendMedia ? { media: sendMedia } : {})
+        });
         const tempMsg: Message = {
             key: { id: Math.random().toString(), remoteJid: selectedChatId, fromMe: true },
-            message: { conversation: outgoingText },
+            message: (() => {
+                if (!sendMedia) return { conversation: outgoingText };
+                if (sendMedia.type === 'image') {
+                    return {
+                        ...(outgoingText ? { conversation: outgoingText } : {}),
+                        imageMessage: {
+                            caption: outgoingText,
+                            url: sendMedia.url
+                        }
+                    };
+                }
+                if (sendMedia.type === 'video') {
+                    return {
+                        ...(outgoingText ? { conversation: outgoingText } : {}),
+                        videoMessage: {
+                            caption: outgoingText,
+                            url: sendMedia.url
+                        }
+                    };
+                }
+                return {
+                    ...(outgoingText ? { conversation: outgoingText } : {}),
+                    documentMessage: {
+                        caption: outgoingText,
+                        fileName: sendMedia.filename || 'document',
+                        url: sendMedia.url
+                    }
+                };
+            })(),
             messageTimestamp: Math.floor(Date.now() / 1000),
             status: 'sent',
             agent: {
@@ -2053,6 +2089,10 @@ export default function App() {
         setAllMessages(prev => [tempMsg, ...prev]);
         persistDraft('', activeProfileId, selectedChatId);
         setMessageText('');
+        setComposerMediaType('none');
+        setComposerMediaUrl('');
+        setComposerMediaFilename('');
+        setShowMediaComposer(false);
     };
 
     const handleStartWorkflow = () => {
@@ -2371,138 +2411,6 @@ export default function App() {
             {workspaceSection === 'team-inbox' ? (
                 <div className="flex h-screen pt-[72px] bg-[#f8f9fa] overflow-hidden text-[#111b21] font-sans">
             <div className="w-[400px] border-r border-[#eceff1] flex flex-col bg-white">
-                <header className="h-[60px] bg-[#f0f2f5] px-4 flex items-center justify-between border-b border-[#eceff1]">
-                    <div className="flex items-center gap-4">
-                        <div className="relative" ref={profileMenuRef}>
-                            <div
-                                onClick={() => setShowProfileMenu(!showProfileMenu)}
-                                className="w-10 h-10 rounded-full bg-white border border-[#eceff1] flex items-center justify-center overflow-hidden cursor-pointer relative shadow-sm"
-                            >
-                                <User className="text-[#54656f]" />
-                                {profiles.some(p => p.id !== activeProfileId && p.unreadCount > 0) && (
-                                    <div className="absolute top-0 right-0 w-3 h-3 bg-rose-500 rounded-full border-2 border-[#f0f2f5]" />
-                                )}
-                            </div>
-
-                            {showProfileMenu && (
-                                <div className="absolute left-0 mt-2 w-64 bg-white rounded-xl shadow-[0_8px_30px_rgba(0,0,0,0.1)] py-2 z-[101] border border-[#eceff1]">
-                                    <div className="px-4 py-2 text-xs font-bold text-[#54656f] uppercase border-b border-[#eceff1] mb-2 tracking-wider">Switch Profile</div>
-                                    <div className="max-h-[400px] overflow-y-auto custom-scrollbar">
-                                        {profiles.map(p => (
-                                            <div key={p.id} className="flex items-center hover:bg-[#f0f2f5] transition-colors pr-group group">
-                                                <button
-                                                    onClick={() => handleSwitchProfile(p.id)}
-                                                    className={`flex-1 text-left px-4 py-3 flex items-center justify-between ${p.id === activeProfileId ? 'bg-[#00a884]/5' : ''}`}
-                                                >
-                                                    <div className="flex items-center gap-3">
-                                                        <div className="w-9 h-9 rounded-full bg-[#f0f2f5] flex items-center justify-center border border-[#eceff1]">
-                                                            <User className="w-4 h-4 text-[#54656f]" />
-                                                        </div>
-                                                        <div className="flex flex-col">
-                                                            <span className="text-sm font-bold text-[#111b21] truncate max-w-[120px]">{p.name}</span>
-                                                            <span className="text-[10px] text-[#54656f] font-medium">{p.id === activeProfileId ? 'Active Now' : 'Click to switch'}</span>
-                                                        </div>
-                                                    </div>
-                                                    {p.unreadCount > 0 && (
-                                                        <span className="bg-[#00a884] text-white text-[10px] font-bold px-1.5 py-0.5 rounded-full min-w-[18px] text-center">
-                                                            {p.unreadCount}
-                                                        </span>
-                                                    )}
-                                                </button>
-                                                {!SINGLE_PROFILE_MODE && (
-                                                    <button
-                                                        onClick={() => handleDeleteProfile(p.id, p.name)}
-                                                        className="p-2 opacity-0 group-hover:opacity-100 text-[#54656f] hover:text-rose-500 transition-all"
-                                                    >
-                                                        <Trash2 className="w-4 h-4" />
-                                                    </button>
-                                                )}
-                                            </div>
-                                        ))}
-                                    </div>
-                                    {!SINGLE_PROFILE_MODE && (
-                                        <button
-                                            onClick={() => setShowAddProfileModal(true)}
-                                            className="w-full px-4 py-3 flex items-center gap-3 text-[#00a884] font-bold hover:bg-[#f8f9fa] transition-colors border-t border-[#eceff1]"
-                                        >
-                                            <Plus className="w-4 h-4" />
-                                            Add New Profile
-                                        </button>
-                                    )}
-                                    <div
-                                        onClick={handleSignOut}
-                                        className="w-full px-4 py-3 flex items-center gap-3 text-rose-500 font-bold hover:bg-[#f8f9fa] transition-colors cursor-pointer mt-2 border-t border-[#eceff1]"
-                                    >
-                                        <LogOut className="w-4 h-4" />
-                                        <span className="text-sm">Sign Out</span>
-                                    </div>
-                                </div>
-                            )}
-                        </div>
-
-                        {isAdmin && (
-                            <button
-                                onClick={() => setActiveView('admin')}
-                                className={`p-2 rounded-lg transition-colors ${activeView === 'admin' ? 'bg-[#00a884]/10 text-[#00a884]' : 'text-[#54656f] hover:bg-white hover:shadow-sm'}`}
-                                title="Admin Control Center"
-                            >
-                                <Shield className="w-6 h-6" />
-                            </button>
-                        )}
-                    </div>
-                    <div className="flex items-center gap-6 text-[#54656f] relative" ref={menuRef}>
-                        <Workflow
-                            className={`w-6 h-6 cursor-pointer transition-colors ${activeView === 'chatflow' ? 'text-[#00a884]' : 'hover:text-[#111b21]'}`}
-                            onClick={() => setActiveView(activeView === 'chatflow' ? 'dashboard' : 'chatflow')}
-                        />
-                        <Settings
-                            className={`w-6 h-6 cursor-pointer transition-colors ${activeView === 'settings' ? 'text-[#00a884]' : 'hover:text-[#111b21]'}`}
-                            onClick={() => setActiveView(activeView === 'settings' ? 'dashboard' : 'settings')}
-                        />
-                        <CircleDashed
-                            className={`w-6 h-6 cursor-pointer transition-colors ${showAnalytics ? 'text-[#00a884]' : 'hover:text-[#111b21]'}`}
-                            onClick={() => setShowAnalytics(true)}
-                        />
-
-                        <MessageSquare className="w-6 h-6 cursor-pointer" onClick={() => setShowNewChatModal(true)} />
-                        <div className="relative">
-                            <MoreVertical
-                                className={`w-6 h-6 cursor-pointer transition-colors ${showMenu ? 'text-[#00a884]' : 'hover:text-[#e9edef]'}`}
-                                onClick={() => setShowMenu(!showMenu)}
-                            />
-                            {showMenu && (
-                                <div className="absolute right-0 mt-2 w-72 bg-[#233138] rounded-lg shadow-2xl py-2 z-[100] border border-[#313d45]">
-                                    <div className="px-4 py-3 border-b border-[#313d45]">
-                                        <div className="flex items-center gap-2 mb-1">
-                                            <div className={`w-2 h-2 rounded-full ${connectionStatus === 'open' ? 'bg-[#00a884]' : connectionStatus === 'connecting' ? 'bg-yellow-500' : 'bg-rose-500'}`} />
-                                            <span className="text-sm font-medium text-[#e9edef]">
-                                                {connectionStatus === 'open' ? 'WABA connected' : 'WABA not configured'}
-                                            </span>
-                                        </div>
-                                        <p className="text-[11px] text-[#8696a0] leading-snug">
-                                            Configure Meta Cloud API credentials in `waba_configs` to enable messaging.
-                                        </p>
-                                    </div>
-                                    <button
-                                        onClick={() => { setActiveView('settings'); setShowMenu(false); }}
-                                        className="w-full text-left px-4 py-3 hover:bg-[#111b21] text-[#e9edef] text-[14.5px] transition-colors flex items-center gap-3"
-                                    >
-                                        <Settings className="w-4 h-4 text-[#00a884]" />
-                                        Settings
-                                    </button>
-                                    <button
-                                        onClick={() => setShowMenu(false)}
-                                        className="w-full text-left px-4 py-3 hover:bg-[#111b21] text-[#e9edef] text-[14.5px] transition-colors flex items-center gap-3 border-t border-[#313d45]"
-                                    >
-                                        <Settings className="w-4 h-4 text-[#8696a0]" />
-                                        Close
-                                    </button>
-                                </div>
-                            )}
-                        </div>
-                    </div>
-                </header>
-
                 <div className="px-3 py-2 border-b border-[#f0f2f5]">
                     <div className="bg-[#f0f2f5] rounded-xl flex items-center px-4 py-2 focus-within:bg-white focus-within:ring-1 focus-within:ring-[#00a884]/20 transition-all">
                         <Search className="w-4 h-4 text-[#54656f] mr-4" />
@@ -2876,10 +2784,17 @@ export default function App() {
                                                                 <div className="mt-1 mb-1 max-w-sm rounded-lg overflow-hidden cursor-pointer bg-[#fcfdfd] min-h-[100px] flex items-center justify-center relative border border-[#eceff1]">
                                                                     {(() => {
                                                                         const mediaId = msg.message?.imageMessage?.mediaId;
+                                                                        const directUrl = msg.message?.imageMessage?.url;
                                                                         const cacheEntry = mediaCache[msg.key.id!] || (mediaId ? mediaCache[mediaId] : undefined);
                                                                         return cacheEntry ? (
                                                                             <img
                                                                                 src={`data:${cacheEntry.mimetype};base64,${cacheEntry.data}`}
+                                                                                alt="WhatsApp Attachment"
+                                                                                className="max-w-full h-auto block"
+                                                                            />
+                                                                        ) : directUrl ? (
+                                                                            <img
+                                                                                src={directUrl}
                                                                                 alt="WhatsApp Attachment"
                                                                                 className="max-w-full h-auto block"
                                                                             />
@@ -2898,6 +2813,7 @@ export default function App() {
                                                                 const cacheEntry = mediaCache[msg.key.id!] || (mediaId ? mediaCache[mediaId] : undefined);
                                                                 const docName = doc.fileName || '';
                                                                 const docMime = doc.mimetype || '';
+                                                                const docUrl = doc.url || '';
                                                                 const isImageDoc = Boolean(
                                                                     docMime.startsWith('image/') ||
                                                                     /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(docName)
@@ -2919,6 +2835,12 @@ export default function App() {
                                                                                     alt={docName || 'Image'}
                                                                                     className="max-w-full h-auto block"
                                                                                 />
+                                                                            ) : docUrl ? (
+                                                                                <img
+                                                                                    src={docUrl}
+                                                                                    alt={docName || 'Image'}
+                                                                                    className="max-w-full h-auto block"
+                                                                                />
                                                                             ) : (
                                                                                 <div className="p-4 text-center">
                                                                                     <p className="text-xs text-[#54656f] font-bold">Loading image…</p>
@@ -2937,6 +2859,8 @@ export default function App() {
                                                                                 link.href = `data:${cacheEntry.mimetype};base64,${cacheEntry.data}`;
                                                                                 link.download = doc.fileName || 'document';
                                                                                 link.click();
+                                                                            } else if (docUrl) {
+                                                                                window.open(docUrl, '_blank');
                                                                             } else {
                                                                                 handleDownloadMedia(msg);
                                                                             }
@@ -2951,6 +2875,33 @@ export default function App() {
                                                                                 {Math.round((Number(doc.fileLength) || 0) / 1024)} KB • {doc.mimetype?.split('/')[1]?.toUpperCase() || 'FILE'}
                                                                             </p>
                                                                         </div>
+                                                                    </div>
+                                                                );
+                                                            })()}
+
+                                                            {msg.message?.videoMessage && (() => {
+                                                                const mediaId = msg.message?.videoMessage?.mediaId;
+                                                                const directUrl = msg.message?.videoMessage?.url;
+                                                                const cacheEntry = mediaCache[msg.key.id!] || (mediaId ? mediaCache[mediaId] : undefined);
+                                                                return (
+                                                                    <div className="mt-1 mb-1 max-w-sm rounded-lg overflow-hidden bg-[#fcfdfd] min-h-[100px] flex items-center justify-center relative border border-[#eceff1]">
+                                                                        {cacheEntry ? (
+                                                                            <video
+                                                                                controls
+                                                                                className="max-w-full h-auto block"
+                                                                                src={`data:${cacheEntry.mimetype};base64,${cacheEntry.data}`}
+                                                                            />
+                                                                        ) : directUrl ? (
+                                                                            <video
+                                                                                controls
+                                                                                className="max-w-full h-auto block"
+                                                                                src={directUrl}
+                                                                            />
+                                                                        ) : (
+                                                                            <div className="p-4 text-center" onClick={() => handleDownloadMedia(msg)}>
+                                                                                <p className="text-xs text-[#54656f] font-bold">Loading video…</p>
+                                                                            </div>
+                                                                        )}
                                                                     </div>
                                                                 );
                                                             })()}
@@ -3005,13 +2956,37 @@ export default function App() {
                             <button type="button" className="p-2 hover:bg-white rounded-xl transition-all cursor-pointer">
                                 <Smile className="w-6 h-6" />
                             </button>
-                            <button type="button" className="p-2 hover:bg-white rounded-xl transition-all cursor-pointer" title="Photo">
+                            <button
+                                type="button"
+                                onClick={() => {
+                                    setComposerMediaType('image');
+                                    setShowMediaComposer(true);
+                                }}
+                                className={`p-2 rounded-xl transition-all cursor-pointer ${composerMediaType === 'image' && showMediaComposer ? 'bg-[#00a884]/10 text-[#00a884]' : 'hover:bg-white'}`}
+                                title="Attach image"
+                            >
                                 <ImageIcon className="w-5 h-5" />
                             </button>
-                            <button type="button" className="p-2 hover:bg-white rounded-xl transition-all cursor-pointer" title="Document">
+                            <button
+                                type="button"
+                                onClick={() => {
+                                    setComposerMediaType('document');
+                                    setShowMediaComposer(true);
+                                }}
+                                className={`p-2 rounded-xl transition-all cursor-pointer ${composerMediaType === 'document' && showMediaComposer ? 'bg-[#00a884]/10 text-[#00a884]' : 'hover:bg-white'}`}
+                                title="Attach document"
+                            >
                                 <FileIcon className="w-5 h-5" />
                             </button>
-                            <button type="button" className="p-2 hover:bg-white rounded-xl transition-all cursor-pointer" title="Attachment">
+                            <button
+                                type="button"
+                                onClick={() => {
+                                    setComposerMediaType('video');
+                                    setShowMediaComposer(true);
+                                }}
+                                className={`p-2 rounded-xl transition-all cursor-pointer ${composerMediaType === 'video' && showMediaComposer ? 'bg-[#00a884]/10 text-[#00a884]' : 'hover:bg-white'}`}
+                                title="Attach video"
+                            >
                                 <Paperclip className="w-6 h-6 -rotate-45" />
                             </button>
                         </div>
@@ -3045,6 +3020,55 @@ export default function App() {
                                     )}
                                 </div>
                             )}
+                            {canSendText && showMediaComposer && (
+                                <div className="absolute bottom-[58px] left-0 right-0 bg-white border border-[#eceff1] rounded-2xl shadow-xl z-20 p-3 space-y-2">
+                                    <div className="flex items-center justify-between">
+                                        <div className="text-[11px] font-bold uppercase tracking-widest text-[#54656f]">Attach Media</div>
+                                        <button
+                                            type="button"
+                                            onClick={() => {
+                                                setShowMediaComposer(false);
+                                                setComposerMediaType('none');
+                                                setComposerMediaUrl('');
+                                                setComposerMediaFilename('');
+                                            }}
+                                            className="text-[#8696a0] hover:text-rose-500"
+                                        >
+                                            <X className="w-4 h-4" />
+                                        </button>
+                                    </div>
+                                    <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+                                        <select
+                                            value={composerMediaType}
+                                            onChange={(e) => setComposerMediaType(e.target.value as any)}
+                                            className="bg-[#f8f9fa] border border-[#eceff1] rounded-xl px-3 py-2 text-xs font-bold text-[#111b21] focus:outline-none focus:ring-1 focus:ring-[#00a884]/20"
+                                        >
+                                            <option value="image">Image</option>
+                                            <option value="video">Video</option>
+                                            <option value="document">Document</option>
+                                        </select>
+                                        <input
+                                            type="text"
+                                            placeholder="Public media URL (https://...)"
+                                            value={composerMediaUrl}
+                                            onChange={(e) => setComposerMediaUrl(e.target.value)}
+                                            className="md:col-span-2 bg-[#f8f9fa] border border-[#eceff1] rounded-xl px-3 py-2 text-xs font-mono text-[#111b21] focus:outline-none focus:ring-1 focus:ring-[#00a884]/20"
+                                        />
+                                    </div>
+                                    {composerMediaType === 'document' && (
+                                        <input
+                                            type="text"
+                                            placeholder="Document filename (optional)"
+                                            value={composerMediaFilename}
+                                            onChange={(e) => setComposerMediaFilename(e.target.value)}
+                                            className="w-full bg-[#f8f9fa] border border-[#eceff1] rounded-xl px-3 py-2 text-xs font-medium text-[#111b21] focus:outline-none focus:ring-1 focus:ring-[#00a884]/20"
+                                        />
+                                    )}
+                                    <p className="text-[11px] text-[#6b7280]">
+                                        Text + media will be sent in one message.
+                                    </p>
+                                </div>
+                            )}
                                 <input
                                     ref={messageInputRef}
                                     type="text"
@@ -3073,6 +3097,11 @@ export default function App() {
                                 }}
                                 className={`w-full border border-[#eceff1] rounded-xl px-4 py-3 text-[15px] focus:outline-none focus:ring-1 focus:ring-[#00a884]/20 placeholder:text-[#54656f]/50 ${canSendText ? 'bg-white text-[#111b21]' : 'bg-[#f8f9fa] text-[#9ca3af] cursor-not-allowed'}`}
                             />
+                            {hasComposerMedia && (
+                                <div className="mt-1 text-[11px] font-bold text-[#00a884]">
+                                    Attachment ready: {composerMediaType}
+                                </div>
+                            )}
                         </div>
                         <div className="text-[#54656f] flex items-center gap-2">
                             <div className="relative">
@@ -3128,7 +3157,7 @@ export default function App() {
                                 )}
                             </div>
                             {canSendText ? (
-                                messageText.trim() ? (
+                                (messageText.trim() || hasComposerMedia) ? (
                                     <div onClick={handleSendMessage} className="p-3 bg-[#00a884] shadow-sm rounded-xl cursor-pointer text-white transition-transform active:scale-95"><Send className="w-5 h-5" /></div>
                                 ) : (
                                     <div className="p-2 hover:bg-white rounded-xl transition-all cursor-pointer"><Mic className="w-6 h-6" /></div>
@@ -3258,6 +3287,37 @@ export default function App() {
                                         <span className="text-[13px] text-[#54656f] font-medium leading-relaxed">This conversation is handled through Meta's WhatsApp Business Cloud API.</span>
                                     </div>
                                     <div className="flex flex-col gap-2.5 pt-3 border-t border-[#eceff1]">
+                                        <span className="text-[10px] text-[#2563eb] font-bold uppercase tracking-wider">Saved Answers</span>
+                                        {Object.keys(selectedWorkflowMemory.vars).length === 0 ? (
+                                            <span className="text-[11px] text-[#8696a0]">No saved workflow variables yet</span>
+                                        ) : (
+                                            <div className="flex flex-col gap-1.5">
+                                                {Object.entries(selectedWorkflowMemory.vars).map(([key, value]) => (
+                                                    <div key={`var-${key}`} className="bg-white border border-[#eceff1] rounded-xl px-3 py-2">
+                                                        <div className="text-[10px] font-black uppercase tracking-wider text-[#2563eb]">{key}</div>
+                                                        <div className="text-[12px] font-semibold text-[#111b21] break-words">{value}</div>
+                                                    </div>
+                                                ))}
+                                            </div>
+                                        )}
+                                        {selectedWorkflowMemory.qaHistory.length > 0 && (
+                                            <div className="flex flex-col gap-1.5">
+                                                {selectedWorkflowMemory.qaHistory.map((entry, idx) => (
+                                                    <div key={`qa-${entry.key}-${idx}`} className="bg-white border border-[#eceff1] rounded-xl px-3 py-2">
+                                                        <div className="text-[10px] font-black uppercase tracking-wider text-[#54656f]">{entry.key}</div>
+                                                        {entry.question ? (
+                                                            <div className="text-[10px] text-[#64748b] mt-1 break-words">Q: {entry.question}</div>
+                                                        ) : null}
+                                                        <div className="text-[11px] font-semibold text-[#111b21] break-words mt-1">A: {entry.answer}</div>
+                                                        {entry.at ? (
+                                                            <div className="text-[10px] text-[#94a3b8] mt-1">{new Date(entry.at).toLocaleString()}</div>
+                                                        ) : null}
+                                                    </div>
+                                                ))}
+                                            </div>
+                                        )}
+                                    </div>
+                                    <div className="flex flex-col gap-2.5 pt-3 border-t border-[#eceff1]">
                                         <span className="text-[10px] text-[#00a884] font-bold uppercase tracking-wider">Tags</span>
                                         <div className="flex flex-wrap gap-2">
                                             {contactTagsDraft.length === 0 && (
@@ -3345,384 +3405,103 @@ export default function App() {
 
 
             {/* Add Profile Modal */}
-            {
-                !SINGLE_PROFILE_MODE && showAddProfileModal && (
-                    <div className="fixed inset-0 bg-white/60 backdrop-blur-md flex items-center justify-center z-[200]">
-                        <div className="bg-white p-8 rounded-3xl w-full max-w-md shadow-[0_20px_60px_rgba(0,0,0,0.1)] border border-[#eceff1]">
-                            <h2 className="text-2xl font-bold mb-6 text-[#111b21]">Add New Profile</h2>
-                            <label className="block text-sm text-[#54656f] mb-2 font-medium">Profile Name</label>
-                            <input
-                                type="text"
-                                placeholder="e.g. Sales Account, Support Bot"
-                                value={newProfileName}
-                                onChange={(e) => setNewProfileName(e.target.value)}
-                                className="w-full bg-[#f8f9fa] border border-[#eceff1] rounded-xl px-4 py-4 mb-6 focus:border-[#00a884] outline-none text-[#111b21] font-medium"
-                                autoFocus
-                                onKeyDown={(e) => e.key === 'Enter' && submitAddProfile()}
-                            />
-                            <div className="flex justify-end gap-3">
-                                <button
-                                    onClick={() => setShowAddProfileModal(false)}
-                                    className="px-6 py-3 text-[#54656f] font-bold hover:bg-[#f0f2f5] rounded-xl transition-all"
-                                >
-                                    Cancel
-                                </button>
-                                <button
-                                    onClick={submitAddProfile}
-                                    disabled={isCreatingProfile || !newProfileName.trim()}
-                                    className="bg-[#00a884] text-white px-8 py-3 rounded-xl font-bold shadow-[0_4px_12px_rgba(0,168,132,0.2)] hover:shadow-[0_8px_20px_rgba(0,168,132,0.3)] disabled:opacity-50 transition-all"
-                                >
-                                    {isCreatingProfile ? 'Creating...' : 'Create Profile'}
-                                </button>
-                            </div>
-                        </div>
-                    </div>
-                )
-            }
+            <AddProfileModal
+                open={!SINGLE_PROFILE_MODE && showAddProfileModal}
+                profileName={newProfileName}
+                isCreatingProfile={isCreatingProfile}
+                onProfileNameChange={setNewProfileName}
+                onClose={() => setShowAddProfileModal(false)}
+                onSubmit={submitAddProfile}
+            />
 
             {/* Edit Profile Modal */}
-            {
-                !SINGLE_PROFILE_MODE && showEditProfileModal && (
-                    <div className="fixed inset-0 bg-white/60 backdrop-blur-md flex items-center justify-center z-[200]">
-                        <div className="bg-white p-8 rounded-3xl w-full max-w-md shadow-[0_20px_60px_rgba(0,0,0,0.1)] border border-[#eceff1]">
-                            <h2 className="text-2xl font-bold mb-6 text-[#111b21]">Edit Profile Name</h2>
-                            <label className="block text-sm text-[#54656f] mb-2 font-medium">New Name</label>
-                            <input
-                                type="text"
-                                value={editingProfileName}
-                                onChange={(e) => setEditingProfileName(e.target.value)}
-                                autoFocus
-                                onKeyDown={(e) => e.key === 'Enter' && submitUpdateProfileName()}
-                                className="w-full bg-[#f8f9fa] border border-[#eceff1] rounded-xl px-4 py-4 mb-6 focus:border-[#00a884] outline-none text-[#111b21] font-medium"
-                            />
-                            <div className="flex justify-end gap-3">
-                                <button
-                                    onClick={() => setShowEditProfileModal(false)}
-                                    className="px-6 py-3 text-[#54656f] font-bold hover:bg-[#f0f2f5] rounded-xl transition-all"
-                                >
-                                    Cancel
-                                </button>
-                                <button
-                                    onClick={submitUpdateProfileName}
-                                    className="bg-[#00a884] text-white px-8 py-3 rounded-xl font-bold shadow-[0_4px_12px_rgba(0,168,132,0.2)] hover:shadow-[0_8px_20px_rgba(0,168,132,0.3)] transition-all"
-                                >
-                                    Save Changes
-                                </button>
-                            </div>
-                        </div>
-                    </div>
-                )
-            }
+            <EditProfileModal
+                open={!SINGLE_PROFILE_MODE && showEditProfileModal}
+                profileName={editingProfileName}
+                onProfileNameChange={setEditingProfileName}
+                onClose={() => setShowEditProfileModal(false)}
+                onSubmit={submitUpdateProfileName}
+            />
 
             {/* New Chat Modal */}
-            {
-                showNewChatModal && (
-                    <div className="fixed inset-0 bg-white/60 backdrop-blur-md flex items-center justify-center z-[200]">
-                        <div className="bg-white p-8 rounded-3xl w-full max-w-md shadow-[0_20px_60px_rgba(0,0,0,0.1)] border border-[#eceff1]">
-                            <h2 className="text-2xl font-bold mb-6 text-[#111b21]">Direct Message</h2>
-                            <p className="text-[#54656f] text-sm mb-4">Enter the phone number with country code (e.g. 60123456789)</p>
-                            <input
-                                type="text"
-                                placeholder="Phone number..."
-                                value={newPhoneNumber}
-                                onChange={(e) => setNewPhoneNumber(e.target.value)}
-                                className="w-full bg-[#f8f9fa] border border-[#eceff1] rounded-xl px-4 py-4 mb-6 focus:border-[#00a884] outline-none text-[#111b21] font-medium"
-                                autoFocus
-                                onKeyDown={(e) => e.key === 'Enter' && handleNewChat()}
-                            />
-                            <div className="flex justify-end gap-3">
-                                <button
-                                    onClick={() => setShowNewChatModal(false)}
-                                    className="px-6 py-3 text-[#54656f] font-bold hover:bg-[#f0f2f5] rounded-xl transition-all"
-                                >
-                                    Close
-                                </button>
-                                <button
-                                    onClick={handleNewChat}
-                                    className="bg-[#00a884] text-white px-8 py-3 rounded-xl font-bold shadow-[0_4px_12px_rgba(0,168,132,0.2)] hover:shadow-[0_8px_20px_rgba(0,168,132,0.3)] transition-all"
-                                >
-                                    Open Chat
-                                </button>
-                            </div>
-                        </div>
-                    </div>
-                )
-            }
+            <NewChatModal
+                open={showNewChatModal}
+                phoneNumber={newPhoneNumber}
+                onPhoneNumberChange={setNewPhoneNumber}
+                onClose={() => setShowNewChatModal(false)}
+                onSubmit={handleNewChat}
+            />
+
+            {/* First Login Onboarding */}
+            <OnboardingTutorialModal
+                open={showOnboardingTutorial}
+                currentStep={currentOnboardingStep}
+                steps={onboardingSteps}
+                stepIndex={onboardingStep}
+                onboardingSetup={onboardingSetup}
+                isCurrentStepValid={isCurrentOnboardingStepValid}
+                isFinalStep={isFinalOnboardingStep}
+                onboardingConnectLoading={onboardingConnectLoading}
+                activeProfileId={activeProfileId}
+                onboardingConnectError={onboardingConnectError}
+                onboardingConnectSuccess={onboardingConnectSuccess}
+                onboardingValidationError={onboardingValidationError}
+                onUpdateField={(field, value) => updateOnboardingField(field as OnboardingFieldKey, value)}
+                onConnect={handleOnboardingConnect}
+                onBack={handleOnboardingBack}
+                onNext={handleOnboardingNext}
+            />
 
             {/* Chat Flow Setup View */}
             {
                 activeView === 'chatflow' && (
-                    <div className="fixed inset-0 bg-[#f8f9fa] z-[150] flex flex-col">
-                        <header className="h-[70px] bg-[#f0f2f5] px-6 flex items-center justify-between border-b border-[#eceff1]">
-                            <div className="flex items-center gap-4">
-                                <Workflow className="text-[#00a884] w-8 h-8" />
-                                <h1 className="text-xl font-bold text-[#111b21]">WABA Workflow Builder</h1>
-                            </div>
-                            <div className="flex items-center gap-4">
-                                <button
-                                    onClick={() => handleSaveWorkflows(workflows)}
-                                    className="bg-[#00a884] hover:bg-[#008f6f] text-white px-5 py-2.5 rounded-xl font-bold flex items-center gap-2 transition-colors shadow-sm"
-                                >
-                                    <Save className="w-4 h-4" /> Save Workflows
-                                </button>
-                                <button onClick={() => setActiveView('dashboard')} className="p-2 hover:bg-white rounded-xl transition-all"><X className="w-6 h-6 text-[#54656f]" /></button>
-                            </div>
-                        </header>
-
-                        <div className="flex-1 overflow-hidden bg-white flex">
-                            {/* Sidebar */}
-                            <div className="w-80 border-r border-[#eceff1] flex flex-col bg-[#fcfdfd]">
-                                <div className="p-6 border-b border-[#eceff1]">
-                                    <div className="flex items-center justify-between mb-4">
-                                        <span className="text-xs font-bold text-[#54656f] uppercase tracking-wider">Your Workflows</span>
-                                        <div className="flex items-center gap-2">
-                                            <button
-                                                onClick={() => {
-                                                    const id = `wf-${Date.now()}`
-                                                    const actions = [{ type: 'send_text', text: 'Hello! How can we help you?' }]
-                                                    const newWf = {
-                                                        id,
-                                                        trigger_keyword: 'hai',
-                                                        actions,
-                                                        builder: buildBuilderFromActions(actions, id)
-                                                    }
-                                                    setWorkflows(prev => [...prev, newWf])
-                                                    setWorkflowDrafts(prev => ({
-                                                        ...prev,
-                                                        [id]: JSON.stringify(actions, null, 2)
-                                                    }))
-                                                    setSelectedWorkflowId(id)
-                                                }}
-                                                className="text-[#00a884] hover:bg-[#00a884]/10 p-1.5 rounded-lg transition-all"
-                                                title="Create 'hai' flow"
-                                            >
-                                                <Plus className="w-5 h-5" />
-                                            </button>
-                                            <button
-                                                onClick={() => {
-                                                    const id = `welcome-${Date.now()}`
-                                                    const actions = [{ type: 'send_text', text: 'Welcome! How can we help you?' }]
-                                                    const newWf = {
-                                                        id,
-                                                        trigger_keyword: 'request_welcome',
-                                                        actions,
-                                                        builder: buildBuilderFromActions(actions, id)
-                                                    }
-                                                    setWorkflows(prev => [...prev, newWf])
-                                                    setWorkflowDrafts(prev => ({
-                                                        ...prev,
-                                                        [id]: JSON.stringify(actions, null, 2)
-                                                    }))
-                                                    setSelectedWorkflowId(id)
-                                                }}
-                                                className="text-[#00a884] hover:bg-[#00a884]/10 p-1.5 rounded-lg transition-all"
-                                                title="Create welcome flow"
-                                            >
-                                                <MessageSquare className="w-5 h-5" />
-                                            </button>
-                                        </div>
-                                    </div>
-                                    <p className="text-[11px] text-[#8696a0] leading-relaxed">
-                                        Create a quick “hai” flow or a welcome flow (request_welcome).
-                                    </p>
-                                </div>
-
-                                <div className="flex-1 overflow-y-auto p-4 space-y-2">
-                                    {workflows.map((wf: any) => (
-                                        <div
-                                            key={wf.id}
-                                            onClick={() => setSelectedWorkflowId(wf.id)}
-                                            className={`group p-4 rounded-2xl cursor-pointer border-2 transition-all ${selectedWorkflowId === wf.id ? 'bg-[#00a884]/5 border-[#00a884]' : 'bg-white border-[#f0f2f5] hover:border-[#00a884]/30 hover:shadow-sm'}`}
-                                        >
-                                            <div className="flex items-center justify-between mb-2">
-                                                <span className={`text-sm font-bold ${selectedWorkflowId === wf.id ? 'text-[#111b21]' : 'text-[#54656f]'}`}>{wf.id}</span>
-                                                <Trash2
-                                                    className="w-4 h-4 text-rose-500 opacity-0 group-hover:opacity-100 cursor-pointer hover:scale-110 transition-all"
-                                                    onClick={(e) => {
-                                                        e.stopPropagation()
-                                                        setWorkflows(prev => prev.filter(item => item.id !== wf.id))
-                                                        setWorkflowDrafts(prev => {
-                                                            const next = { ...prev }
-                                                            delete next[wf.id]
-                                                            return next
-                                                        })
-                                                        if (selectedWorkflowId === wf.id) setSelectedWorkflowId(null)
-                                                    }}
-                                                />
-                                            </div>
-                                            <div className="flex gap-1.5 flex-wrap">
-                                                <span className="text-[10px] bg-white text-[#00a884] px-2 py-0.5 rounded-full border border-[#00a884]/20 font-bold uppercase tracking-tight">
-                                                    {wf.trigger_keyword || 'no-trigger'}
-                                                </span>
-                                            </div>
-                                        </div>
-                                    ))}
-                                </div>
-                            </div>
-
-                            {/* Editor */}
-                            <div className="flex-1 flex flex-col">
-                                {selectedWorkflowId ? (
-                                    <div className="flex-1 flex flex-col p-8 gap-6 overflow-y-auto">
-                                        {(() => {
-                                            const wf = workflows.find(w => w.id === selectedWorkflowId)
-                                            if (!wf) return null
-                                            return (
-                                                <>
-                                                    <div className="flex flex-col gap-2">
-                                                        <label className="text-xs font-bold text-[#54656f] uppercase tracking-wider">Trigger Keyword</label>
-                                                        <input
-                                                            className="bg-[#f8f9fa] border border-[#eceff1] rounded-xl px-4 py-3 text-[#111b21] text-sm font-bold focus:outline-none focus:border-[#00a884]"
-                                                            value={wf.trigger_keyword || ''}
-                                                            onChange={(e) => {
-                                                                const val = e.target.value
-                                                                setWorkflows(prev => prev.map(item => item.id === wf.id ? { ...item, trigger_keyword: val } : item))
-                                                            }}
-                                                            placeholder="e.g. hai"
-                                                        />
-                                                        <span className="text-[11px] text-[#8696a0]">
-                                                            Tip: use <code className="font-mono">first_message</code> to trigger on a user's first inbound message.
-                                                        </span>
-                                                    </div>
-                                                    <div className="flex items-center gap-3 flex-wrap">
-                                                        <button
-                                                            onClick={() => setWorkflowEditorMode('visual')}
-                                                            className={`px-4 py-2 rounded-xl text-xs font-bold border transition-all ${workflowEditorMode === 'visual'
-                                                                ? 'bg-[#00a884]/10 border-[#00a884] text-[#00a884]'
-                                                                : 'bg-white border-[#eceff1] text-[#54656f] hover:border-[#00a884]/30'
-                                                                }`}
-                                                        >
-                                                            Visual Builder
-                                                        </button>
-                                                        <button
-                                                            onClick={() => setWorkflowEditorMode('json')}
-                                                            className={`px-4 py-2 rounded-xl text-xs font-bold border transition-all ${workflowEditorMode === 'json'
-                                                                ? 'bg-[#00a884]/10 border-[#00a884] text-[#00a884]'
-                                                                : 'bg-white border-[#eceff1] text-[#54656f] hover:border-[#00a884]/30'
-                                                                }`}
-                                                        >
-                                                            JSON Actions
-                                                        </button>
-                                                        <span className="text-[11px] text-[#8696a0]">
-                                                            Visual builder supports `send_text`, `send_buttons`, `send_list`, `send_cta_url`. Saving visual overwrites actions.
-                                                        </span>
-                                                    </div>
-                                                    {workflowEditorMode === 'visual' ? (
-                                                        <div className="border border-[#eceff1] rounded-2xl overflow-hidden bg-white min-h-[560px] h-[70vh]">
-                                                            <Suspense fallback={<div className="h-full flex items-center justify-center text-sm text-[#54656f]">Loading flow editor…</div>}>
-                                                                <LazyFlowCanvas
-                                                                    flow={wf.builder || buildBuilderFromActions(wf.actions || [], wf.id)}
-                                                                    onSave={(nextFlow) => {
-                                                                        const { actions } = buildActionsFromBuilder(nextFlow);
-                                                                        const nextWorkflows = workflows.map(item =>
-                                                                            item.id === wf.id ? { ...item, actions, builder: nextFlow } : item
-                                                                        );
-                                                                        const nextDrafts = { ...workflowDrafts, [wf.id]: JSON.stringify(actions, null, 2) };
-                                                                        setWorkflows(nextWorkflows);
-                                                                        setWorkflowDrafts(nextDrafts);
-                                                                        // Persist immediately so visual builder Save works as expected.
-                                                                        handleSaveWorkflows(nextWorkflows, nextDrafts);
-                                                                    }}
-                                                                />
-                                                            </Suspense>
-                                                        </div>
-                                                    ) : (
-                                                        <div className="flex flex-col gap-2">
-                                                            <label className="text-xs font-bold text-[#54656f] uppercase tracking-wider">Actions (JSON)</label>
-                                                            <textarea
-                                                                className="bg-[#f8f9fa] border border-[#eceff1] rounded-xl px-4 py-3 text-[#111b21] text-xs h-64 font-mono focus:outline-none focus:border-[#00a884]"
-                                                                value={workflowDrafts[wf.id] || JSON.stringify(wf.actions || [], null, 2)}
-                                                                onChange={(e) => {
-                                                                    const next = e.target.value
-                                                                    setWorkflowDrafts(prev => ({ ...prev, [wf.id]: next }))
-                                                                }}
-                                                            />
-                                                            <p className="text-[11px] text-[#8696a0]">
-                                                                Examples:
-                                                                {" "}
-                                                                <code className="font-mono">[{`{ "type": "send_text", "text": "Hello!" }`}]</code>
-                                                                {" "}
-                                                                <code className="font-mono">[{`{ "type": "send_cta_url", "body": "Tap below", "button_text": "Open", "url": "https://example.com" }`}]</code>
-                                                            </p>
-                                                        </div>
-                                                    )}
-                                                </>
-                                            )
-                                        })()}
-                                    </div>
-                                ) : (
-                                    <div className="flex-1 flex flex-col items-center justify-center text-[#8696a0] opacity-50">
-                                        <GitBranch className="w-16 h-16 mb-4" />
-                                        <p>Select or create a workflow to start</p>
-                                    </div>
-                                )}
-                            </div>
-                        </div>
-                    </div>
+                    <ChatflowView
+                        open={activeView === 'chatflow'}
+                        selectedWorkflowId={selectedWorkflowId}
+                        workflows={workflows}
+                        workflowDrafts={workflowDrafts}
+                        workflowEditorMode={workflowEditorMode}
+                        setWorkflowEditorMode={setWorkflowEditorMode}
+                        setWorkflows={setWorkflows}
+                        setWorkflowDrafts={setWorkflowDrafts}
+                        setSelectedWorkflowId={setSelectedWorkflowId}
+                        onSaveWorkflows={handleSaveWorkflows}
+                        onClose={() => setActiveView('dashboard')}
+                        onBackToAutomations={() => {
+                            setActiveView('dashboard');
+                            setWorkspaceSection('automations');
+                        }}
+                        buildBuilderFromActions={buildBuilderFromActions}
+                        buildActionsFromBuilder={buildActionsFromBuilder}
+                        FlowCanvasComponent={LazyFlowCanvas}
+                        workflowTagOptions={workflowTagOptions}
+                        workflowVariableOptions={workflowVariableOptions}
+                        teamUsers={teamUsers}
+                        workflowTriggerOptions={workflowTriggerOptions}
+                        workflowTemplateOptions={workflowTemplateOptions}
+                    />
                 )
             }
 
             {/* Settings View */}
             {
                 activeView === 'settings' && (
-                    <div className="fixed inset-0 bg-[#f8f9fa] z-[150] flex flex-col">
-                        <header className="h-[70px] bg-[#f0f2f5] px-6 flex items-center justify-between border-b border-[#eceff1]">
-                            <div className="flex items-center gap-4">
-                                <Settings className="text-[#00a884] w-8 h-8" />
-                                <h1 className="text-xl font-bold text-[#111b21]">Settings</h1>
-                            </div>
-                            <div className="flex items-center gap-3">
-                                <button
-                                    onClick={handleSignOut}
-                                    className="px-4 py-2 rounded-xl bg-white text-rose-500 font-bold border border-[#eceff1] hover:bg-rose-50 transition-all flex items-center gap-2"
-                                >
-                                    <LogOut className="w-4 h-4" />
-                                    Log Out
-                                </button>
-                                <button onClick={() => setActiveView('dashboard')} className="p-2 hover:bg-white rounded-xl transition-all">
-                                    <X className="w-6 h-6 text-[#54656f]" />
-                                </button>
-                            </div>
-                        </header>
-                        <div className="flex-1 flex overflow-hidden">
-                            <aside className="w-64 bg-white border-r border-[#eceff1] px-5 py-6 overflow-y-auto">
-                                <p className="text-[10px] font-black uppercase tracking-widest text-[#54656f] mb-4">Settings</p>
-                                <div className="space-y-6">
-                                    {settingsNav.map(section => (
-                                        <div key={section.group}>
-                                            <p className="text-[10px] font-black uppercase tracking-widest text-[#8696a0] mb-2">{section.group}</p>
-                                            <div className="flex flex-col gap-2">
-                                                {section.items.map(item => (
-                                                    <button
-                                                        key={item.id}
-                                                        onClick={() => scrollToSettingsSection(item.id)}
-                                                        className="text-left px-3 py-2 rounded-xl text-sm font-bold text-[#111b21] hover:bg-[#f0f2f5] transition-all"
-                                                    >
-                                                        {item.label}
-                                                    </button>
-                                                ))}
-                                            </div>
-                                        </div>
-                                    ))}
-                                </div>
-                            </aside>
-                            <div className="flex-1 overflow-y-auto">
-                                <Suspense fallback={<div className="p-8 text-sm text-[#54656f]">Loading settings…</div>}>
-                                    <LazyWebhookView
-                                        profileId={activeProfileId || ''}
-                                        sessionToken={session?.access_token || null}
-                                        isAdmin={isAdmin}
-                                        quickReplies={quickReplies}
-                                        quickRepliesLoading={quickRepliesLoading}
-                                        quickRepliesSaving={quickRepliesSaving}
-                                        quickRepliesError={quickRepliesError}
-                                        onRefreshQuickReplies={fetchQuickReplies}
-                                        onSaveQuickReplies={saveQuickReplies}
-                                    />
-                                </Suspense>
-                            </div>
-                        </div>
-                    </div>
+                    <SettingsView
+                        settingsNav={settingsNav}
+                        onScrollToSettingsSection={scrollToSettingsSection}
+                        onSignOut={handleSignOut}
+                        onClose={() => setActiveView('dashboard')}
+                        profileId={activeProfileId || ''}
+                        sessionToken={session?.access_token || null}
+                        isAdmin={isAdmin}
+                        quickReplies={quickReplies}
+                        quickRepliesLoading={quickRepliesLoading}
+                        quickRepliesSaving={quickRepliesSaving}
+                        quickRepliesError={quickRepliesError}
+                        onRefreshQuickReplies={fetchQuickReplies}
+                        onSaveQuickReplies={saveQuickReplies}
+                        WebhookViewComponent={LazyWebhookView}
+                    />
                 )
             }
 
@@ -3985,187 +3764,46 @@ export default function App() {
             ` }} />
                 </div>
             ) : workspaceSection === 'broadcast' ? (
-                <div className="h-screen pt-[72px] bg-[#f1f3f6] text-[#111b21] font-sans">
-                    <div className="h-full flex">
-                        <aside className="w-72 bg-white border-r border-[#eceff1] p-5">
-                            <div className="mb-4">
-                                <h2 className="text-xl font-black text-[#111b21]">Broadcast</h2>
-                                <p className="text-xs text-[#6b7280] mt-1">Campaign and template workspace</p>
-                            </div>
-                            <div className="space-y-2">
-                                {broadcastNav.map((item) => (
-                                    <button
-                                        key={item.id}
-                                        onClick={() => setBroadcastSection(item.id)}
-                                        className={`w-full text-left px-3 py-2.5 rounded-xl text-sm font-bold transition-all ${broadcastSection === item.id
-                                            ? 'bg-[#00a884]/10 text-[#00a884]'
-                                            : 'text-[#111b21] hover:bg-[#f3f4f6]'
-                                            }`}
-                                    >
-                                        {item.label}
-                                    </button>
-                                ))}
-                            </div>
-                        </aside>
-
-                        <main className="flex-1 overflow-hidden">
-                            {broadcastSection === 'template-library' && (
-                                <Suspense fallback={<div className="p-8 text-sm text-[#54656f]">Loading template builder…</div>}>
-                                    <LazyBroadcastTemplateBuilder
-                                        profileId={activeProfileId || ''}
-                                        sessionToken={session?.access_token || null}
-                                        onClose={() => setBroadcastSection('my-templates')}
-                                        embedded
-                                    />
-                                </Suspense>
-                            )}
-                            {broadcastSection === 'my-templates' && (
-                                <Suspense fallback={<div className="p-8 text-sm text-[#54656f]">Loading templates…</div>}>
-                                    <LazyBroadcastTemplatesList
-                                        profileId={activeProfileId || ''}
-                                        sessionToken={session?.access_token || null}
-                                        title="Template Gallery"
-                                    />
-                                </Suspense>
-                            )}
-                            {broadcastSection === 'broadcast-history' && (
-                                <div className="h-full p-6 overflow-y-auto custom-scrollbar">
-                                    <div className="bg-white rounded-3xl border border-[#eceff1] p-8 shadow-[0_10px_30px_rgba(0,0,0,0.05)]">
-                                        <h3 className="text-2xl font-black text-[#111b21] mb-2">Broadcast History</h3>
-                                        <p className="text-sm text-[#54656f]">
-                                            Broadcast send logs will appear here once you start campaigns.
-                                        </p>
-                                    </div>
-                                </div>
-                            )}
-                            {broadcastSection === 'scheduled-broadcasts' && (
-                                <div className="h-full p-6 overflow-y-auto custom-scrollbar">
-                                    <div className="bg-white rounded-3xl border border-[#eceff1] p-8 shadow-[0_10px_30px_rgba(0,0,0,0.05)]">
-                                        <h3 className="text-2xl font-black text-[#111b21] mb-2">Scheduled Broadcasts</h3>
-                                        <p className="text-sm text-[#54656f]">
-                                            Upcoming scheduled broadcasts will appear here.
-                                        </p>
-                                    </div>
-                                </div>
-                            )}
-                        </main>
-                    </div>
-                </div>
+                <BroadcastView
+                    broadcastNav={broadcastNav}
+                    broadcastSection={broadcastSection}
+                    setBroadcastSection={setBroadcastSection}
+                    activeProfileId={activeProfileId}
+                    sessionToken={session?.access_token || null}
+                    BroadcastTemplateBuilder={LazyBroadcastTemplateBuilder}
+                    BroadcastTemplatesList={LazyBroadcastTemplatesList}
+                />
+            ) : workspaceSection === 'automations' ? (
+                <AutomationsView
+                    startableWorkflows={startableWorkflows}
+                    onOpenBuilder={(workflowId) => {
+                        setSelectedWorkflowId(workflowId);
+                        setActiveView('chatflow');
+                    }}
+                    onCreateWorkflow={() => setActiveView('chatflow')}
+                    onRunWorkflow={(workflowId) => {
+                        setWorkspaceSection('team-inbox');
+                        setShowWorkflowStarter(true);
+                        setStartWorkflowId(workflowId);
+                    }}
+                />
             ) : workspaceSection === 'contacts' ? (
-                <div className="h-screen pt-[72px] bg-[#f8f9fa] text-[#111b21] font-sans">
-                    <div className="h-full flex flex-col p-6 gap-4 overflow-hidden">
-                        <div className="bg-white border border-[#eceff1] rounded-3xl p-5 shadow-[0_10px_30px_rgba(0,0,0,0.05)]">
-                            <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
-                                <div>
-                                    <h2 className="text-2xl font-black text-[#111b21]">Saved Contacts</h2>
-                                    <p className="text-sm text-[#54656f] mt-1">
-                                        New contacts are auto-saved when messages are received or sent.
-                                    </p>
-                                    <p className="text-[11px] text-[#8696a0] mt-1">
-                                        {teamUsersLoading ? 'Loading staff…' : `${teamUsers.length} staff available for assignment`}
-                                    </p>
-                                </div>
-                                <div className="w-full md:w-[360px] bg-[#f0f2f5] rounded-xl flex items-center px-4 py-2.5 focus-within:bg-white focus-within:ring-1 focus-within:ring-[#00a884]/20 transition-all">
-                                    <Search className="w-4 h-4 text-[#54656f] mr-3" />
-                                    <input
-                                        type="text"
-                                        placeholder="Search contact, phone or tag"
-                                        value={contactsSearchQuery}
-                                        onChange={(e) => setContactsSearchQuery(e.target.value)}
-                                        className="bg-transparent border-none text-[14px] w-full focus:outline-none placeholder:text-[#54656f]"
-                                    />
-                                </div>
-                            </div>
-                        </div>
-
-                        <div className="flex-1 min-h-0 bg-white border border-[#eceff1] rounded-3xl shadow-[0_10px_30px_rgba(0,0,0,0.05)] overflow-hidden">
-                            {contactsList.length === 0 ? (
-                                <div className="h-full flex flex-col items-center justify-center text-center px-6">
-                                    <Users className="w-12 h-12 text-[#aebac1] mb-3" />
-                                    <p className="text-[#111b21] font-bold">No saved contacts</p>
-                                    <p className="text-sm text-[#8696a0] mt-1">
-                                        Contacts will appear here automatically when conversations happen.
-                                    </p>
-                                </div>
-                            ) : (
-                                <div className="h-full overflow-y-auto custom-scrollbar">
-                                    <div className="grid grid-cols-[minmax(260px,1.5fr)_minmax(180px,1fr)_120px_140px_190px_120px] sticky top-0 z-10 bg-[#f8f9fa] border-b border-[#eceff1] text-[10px] font-black uppercase tracking-widest text-[#54656f]">
-                                        <div className="px-4 py-3">Contact</div>
-                                        <div className="px-4 py-3">Tags</div>
-                                        <div className="px-4 py-3">Messages</div>
-                                        <div className="px-4 py-3">Assignee</div>
-                                        <div className="px-4 py-3">Last Inbound</div>
-                                        <div className="px-4 py-3">Action</div>
-                                    </div>
-                                    {contactsList.map((row) => (
-                                        <div key={row.id} className="grid grid-cols-[minmax(260px,1.5fr)_minmax(180px,1fr)_120px_140px_190px_120px] border-b border-[#f0f2f5] hover:bg-[#fcfdfd] transition-colors">
-                                            <div className="px-4 py-3 min-w-0">
-                                                <div className="font-bold text-[#111b21] truncate">{row.name}</div>
-                                                <div className="text-[12px] text-[#00a884] font-bold mt-0.5">{row.phone}</div>
-                                            </div>
-                                            <div className="px-4 py-3 min-w-0">
-                                                {row.tags.length === 0 ? (
-                                                    <span className="text-[12px] text-[#9ca3af]">-</span>
-                                                ) : (
-                                                    <div className="flex flex-wrap gap-1">
-                                                        {row.tags.slice(0, 3).map((tag) => (
-                                                            <span key={tag} className="px-2 py-0.5 rounded-full bg-[#f0f2f5] border border-[#eceff1] text-[10px] font-bold text-[#54656f]">
-                                                                {tag}
-                                                            </span>
-                                                        ))}
-                                                        {row.tags.length > 3 && (
-                                                            <span className="text-[11px] text-[#8696a0] font-bold">+{row.tags.length - 3}</span>
-                                                        )}
-                                                    </div>
-                                                )}
-                                            </div>
-                                            <div className="px-4 py-3 text-[13px] font-bold text-[#111b21]">{row.totalMessages}</div>
-                                            <div className="px-4 py-3 min-w-0">
-                                                <button
-                                                    type="button"
-                                                    onClick={() => {
-                                                        if (!teamUsers.length && !teamUsersLoading) fetchTeamUsers();
-                                                        setAssignMenuContactId(prev => (prev === row.id ? null : row.id));
-                                                    }}
-                                                    disabled={assigningContactId === row.id}
-                                                    className="inline-flex max-w-full items-center gap-1 px-2 py-1 rounded-full border text-[10px] font-bold hover:opacity-85 transition-all disabled:opacity-60"
-                                                    style={{
-                                                        backgroundColor: row.assigneeName
-                                                            ? withHexAlpha(row.assigneeColor, '20', '#f3f4f6')
-                                                            : '#f8f9fa',
-                                                        borderColor: row.assigneeName
-                                                            ? withHexAlpha(row.assigneeColor, '66', '#d1d5db')
-                                                            : '#eceff1',
-                                                        color: row.assigneeName
-                                                            ? textColor(row.assigneeColor, '#374151')
-                                                            : '#9ca3af'
-                                                    }}
-                                                >
-                                                    <span>{getInitials(row.assigneeName || 'Unassigned')}</span>
-                                                    <span className="truncate">{row.assigneeName || 'Unassigned'}</span>
-                                                </button>
-                                            </div>
-                                            <div className="px-4 py-3 text-[12px] text-[#54656f] font-medium">
-                                                {row.lastInboundAt ? new Date(row.lastInboundAt).toLocaleString() : '-'}
-                                            </div>
-                                            <div className="px-4 py-3">
-                                                <button
-                                                    onClick={() => {
-                                                        setSelectedChatId(row.id);
-                                                        setWorkspaceSection('team-inbox');
-                                                    }}
-                                                    className="px-3 py-1.5 rounded-lg bg-[#00a884] text-white text-[10px] font-bold uppercase tracking-wider hover:bg-[#008f6f] transition-all"
-                                                >
-                                                    Open Chat
-                                                </button>
-                                            </div>
-                                        </div>
-                                    ))}
-                                </div>
-                            )}
-                        </div>
-                    </div>
-                </div>
+                <ContactsView
+                    contactsList={contactsList}
+                    teamUsersLoading={teamUsersLoading}
+                    teamUsers={teamUsers}
+                    contactsSearchQuery={contactsSearchQuery}
+                    onContactsSearchChange={setContactsSearchQuery}
+                    assigningContactId={assigningContactId}
+                    onToggleAssignMenu={(contactId) => {
+                        if (!teamUsers.length && !teamUsersLoading) fetchTeamUsers();
+                        setAssignMenuContactId(prev => (prev === contactId ? null : contactId));
+                    }}
+                    onOpenChat={(contactId) => {
+                        setSelectedChatId(contactId);
+                        setWorkspaceSection('team-inbox');
+                    }}
+                />
             ) : (
                 <div className="h-screen pt-[72px] bg-[#f8f9fa] text-[#111b21] font-sans">
                     <div className="h-full flex items-center justify-center p-6">

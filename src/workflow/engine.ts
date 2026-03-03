@@ -1,8 +1,8 @@
 import type { WabaClient } from '../waba/client'
-import { extractCtaReferralSource, findOrCreateUser, getCompanyFallbackSettings, getLastMessage, getWorkflowById, getWorkflows, insertMessage, updateMessageWorkflowState, updateUserCtaReferral, updateUserLastInbound, updateUserTags } from '../services/wa-store'
+import { extractCtaReferralSource, findOrCreateUser, getCompanyFallbackSettings, getLastMessage, getLatestWorkflowMemory, getWorkflowById, getWorkflows, insertMessage, setUserAssignee, updateMessageWorkflowState, updateUserCtaReferral, updateUserLastInbound, updateUserTags } from '../services/wa-store'
 import type { User } from '../services/wa-store'
 import { sendWhatsAppMessage } from '../services/whatsapp'
-import type { WorkflowAction, WorkflowState } from './types'
+import type { WorkflowState } from './types'
 
 export type InboundContext = {
     companyId: string
@@ -56,9 +56,9 @@ function matchTrigger(keyword: string, text: string) {
     return tokens.includes(cleanedKeyword)
 }
 
-function parseActions(actions: any): WorkflowAction[] {
+function parseActions(actions: any): any[] {
     if (!Array.isArray(actions)) return []
-    return actions as WorkflowAction[]
+    return actions as any[]
 }
 
 function resolveRoute(
@@ -110,6 +110,146 @@ function extractListRowIds(
     return ids
 }
 
+function normalizeVariableKey(value: unknown): string {
+    if (typeof value !== 'string') return ''
+    return value
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9_]+/g, '_')
+        .replace(/^_+|_+$/g, '')
+}
+
+function sanitizeVars(raw: any): Record<string, string> {
+    if (!raw || typeof raw !== 'object') return {}
+    const vars: Record<string, string> = {}
+    Object.entries(raw as Record<string, unknown>).forEach(([key, value]) => {
+        const normalized = normalizeVariableKey(key)
+        if (!normalized) return
+        if (value === null || value === undefined) return
+        vars[normalized] = String(value)
+    })
+    return vars
+}
+
+function sanitizeQaHistory(raw: any): Array<{ key: string; question: string; answer: string; at: string }> {
+    if (!Array.isArray(raw)) return []
+    return raw
+        .map((entry: any) => ({
+            key: normalizeVariableKey(entry?.key),
+            question: typeof entry?.question === 'string' ? entry.question : '',
+            answer: typeof entry?.answer === 'string' ? entry.answer : '',
+            at: typeof entry?.at === 'string' ? entry.at : ''
+        }))
+        .filter((entry: any) => entry.key && entry.answer)
+}
+
+function getInboundAnswer(ctx: InboundContext): string {
+    const text = typeof ctx.text === 'string' ? ctx.text.trim() : ''
+    if (text) return text
+    const buttonTitle = typeof ctx.buttonTitle === 'string' ? ctx.buttonTitle.trim() : ''
+    if (buttonTitle) return buttonTitle
+    const buttonId = typeof ctx.buttonId === 'string' ? ctx.buttonId.trim() : ''
+    if (buttonId) return buttonId
+    const caption = typeof ctx.media?.caption === 'string' ? ctx.media.caption.trim() : ''
+    if (caption) return caption
+    return ''
+}
+
+function resolveDynamicContext(state: WorkflowState, user: User, ctx: InboundContext) {
+    const vars = sanitizeVars(state.vars)
+    const contactName = (user.name || '').trim()
+    const phone = user.phone_number || ctx.phoneNumber || ''
+    const context: Record<string, string> = {
+        ...vars,
+        contact_name: contactName,
+        name: contactName,
+        phone_number: phone,
+        phone,
+        workflow_state: state.state || '',
+        state: state.state || '',
+        inbound_text: getInboundAnswer(ctx)
+    }
+    return context
+}
+
+function renderDynamicText(value: unknown, state: WorkflowState, user: User, ctx: InboundContext): string {
+    if (typeof value !== 'string') return ''
+    const map = resolveDynamicContext(state, user, ctx)
+    return value.replace(/\{\{\s*([a-zA-Z0-9_.-]+)\s*\}\}/g, (match, keyRaw) => {
+        const key = normalizeVariableKey(String(keyRaw))
+        if (!key) return match
+        const next = map[key]
+        if (next === undefined || next === null) return match
+        return String(next)
+    })
+}
+
+function getConditionLeftValue(action: any, state: WorkflowState, user: User, ctx: InboundContext): string {
+    const rawSource = typeof action?.source === 'string' ? action.source.trim() : ''
+    if (!rawSource) return ''
+    const source = rawSource.toLowerCase()
+    const vars = sanitizeVars(state.vars)
+
+    if (source.startsWith('vars.')) {
+        const key = normalizeVariableKey(source.slice(5))
+        return vars[key] || ''
+    }
+    if (source.startsWith('contact.')) {
+        const field = source.slice(8)
+        if (field === 'name') return user.name || ''
+        if (field === 'phone' || field === 'phone_number') return user.phone_number || ctx.phoneNumber || ''
+        if (field === 'tags') return Array.isArray(user.tags) ? user.tags.join(',') : ''
+        if (field === 'last_inbound_at') return user.last_inbound_at || ''
+        return ''
+    }
+
+    const normalized = normalizeVariableKey(source)
+    if (normalized && vars[normalized] !== undefined) return vars[normalized]
+    if (normalized === 'contact_name' || normalized === 'name') return user.name || ''
+    if (normalized === 'phone' || normalized === 'phone_number') return user.phone_number || ctx.phoneNumber || ''
+    if (normalized === 'inbound_text' || normalized === 'last_message') return getInboundAnswer(ctx)
+    return ''
+}
+
+function evaluateCondition(action: any, state: WorkflowState, user: User, ctx: InboundContext): boolean {
+    const left = getConditionLeftValue(action, state, user, ctx)
+    const operatorRaw = typeof action?.operator === 'string' ? action.operator.trim().toLowerCase() : ''
+    const operator = operatorRaw || 'contains'
+    const right = renderDynamicText(
+        action?.value === null || action?.value === undefined ? '' : String(action.value),
+        state,
+        user,
+        ctx
+    )
+
+    if (operator === 'exists') {
+        return left.trim().length > 0
+    }
+    if (operator === 'equals' || operator === '==') {
+        return left.trim().toLowerCase() === right.trim().toLowerCase()
+    }
+    if (operator === 'not_equals' || operator === '!=') {
+        return left.trim().toLowerCase() !== right.trim().toLowerCase()
+    }
+    if (operator === 'starts_with') {
+        return left.trim().toLowerCase().startsWith(right.trim().toLowerCase())
+    }
+    if (operator === 'greater_than' || operator === '>') {
+        const leftNum = Number(left)
+        const rightNum = Number(right)
+        if (!Number.isFinite(leftNum) || !Number.isFinite(rightNum)) return false
+        return leftNum > rightNum
+    }
+    if (operator === 'less_than' || operator === '<') {
+        const leftNum = Number(left)
+        const rightNum = Number(right)
+        if (!Number.isFinite(leftNum) || !Number.isFinite(rightNum)) return false
+        return leftNum < rightNum
+    }
+
+    return left.trim().toLowerCase().includes(right.trim().toLowerCase())
+}
+
 export class WorkflowEngine {
     public async processInbound(ctx: InboundContext): Promise<{ error?: string }> {
         const user = await findOrCreateUser(ctx.companyId, ctx.phoneNumber)
@@ -132,7 +272,20 @@ export class WorkflowEngine {
         }
 
         const lastMessage = await getLastMessage(user.id)
-        const currentState = (lastMessage?.workflow_state || null) as WorkflowState | null
+        let currentState = (lastMessage?.workflow_state || null) as WorkflowState | null
+        const memory = await getLatestWorkflowMemory(user.id)
+        if (currentState) {
+            currentState.vars = {
+                ...sanitizeVars(memory.vars),
+                ...sanitizeVars(currentState.vars)
+            }
+            const existingQa = sanitizeQaHistory(currentState.qa_history)
+            if (existingQa.length > 0) {
+                currentState.qa_history = existingQa
+            } else {
+                currentState.qa_history = sanitizeQaHistory(memory.qa_history)
+            }
+        }
         const isFirstMessage = !lastMessage
 
         const inboundRecord = await insertMessage({
@@ -166,7 +319,10 @@ export class WorkflowEngine {
         if (workflow) {
             const actions = parseActions(workflow.actions)
             const stepIndex = state?.step_index ?? 0
-            const awaiting = state?.awaiting_buttons && state.awaiting_buttons.length > 0
+            const awaiting = Boolean(
+                (state?.awaiting_buttons && state.awaiting_buttons.length > 0) ||
+                state?.awaiting_input?.save_as
+            )
             const completed =
                 actions.length === 0 ||
                 (!awaiting && (stepIndex >= actions.length || actions[stepIndex]?.type === 'end_flow'))
@@ -176,6 +332,75 @@ export class WorkflowEngine {
             }
         } else {
             state = null
+        }
+
+        if (state?.awaiting_input?.save_as) {
+            const answer = getInboundAnswer(ctx)
+            const companyFallback = await getCompanyFallbackSettings(ctx.companyId)
+            const retryLimit = normalizeFallbackLimit(
+                state.awaiting_input.retry_limit,
+                normalizeFallbackLimit(companyFallback?.fallback_limit, DEFAULT_FALLBACK_LIMIT)
+            )
+            if (!answer) {
+                const nextFallbackCount = (state.fallback_count || 0) + 1
+                state.fallback_count = nextFallbackCount
+
+                if (retryLimit > 0 && nextFallbackCount > retryLimit) {
+                    if (inboundRecord?.id) {
+                        await updateMessageWorkflowState(inboundRecord.id, state)
+                    }
+                    return {}
+                }
+
+                const fallbackText =
+                    state.awaiting_input.fallback_text ||
+                    companyFallback?.fallback_text ||
+                    'Please type your answer.'
+                const trimmedFallback = typeof fallbackText === 'string' ? fallbackText.trim() : ''
+                if (!trimmedFallback) {
+                    if (inboundRecord?.id) {
+                        await updateMessageWorkflowState(inboundRecord.id, state)
+                    }
+                    return {}
+                }
+
+                try {
+                    await sendWhatsAppMessage({
+                        client: ctx.client,
+                        userId: user.id,
+                        to: ctx.phoneNumber,
+                        type: 'text',
+                        content: { text: renderDynamicText(trimmedFallback, state, user, ctx) },
+                        workflowState: state
+                    })
+                } catch (error: any) {
+                    console.warn('[Workflow] ask_question fallback failed:', error?.message || error)
+                }
+                return {}
+            }
+
+            const key = normalizeVariableKey(state.awaiting_input.save_as)
+            if (key) {
+                const nextVars = {
+                    ...sanitizeVars(state.vars),
+                    [key]: answer
+                }
+                state.vars = nextVars
+                const nextHistory = sanitizeQaHistory(state.qa_history)
+                nextHistory.push({
+                    key,
+                    question: state.awaiting_input.question || '',
+                    answer,
+                    at: new Date().toISOString()
+                })
+                state.qa_history = nextHistory.slice(-100)
+            }
+
+            state.awaiting_input = undefined
+            state.fallback_count = 0
+            if (inboundRecord?.id) {
+                await updateMessageWorkflowState(inboundRecord.id, state)
+            }
         }
 
         if (state?.awaiting_buttons && state.awaiting_buttons.length > 0) {
@@ -253,7 +478,9 @@ export class WorkflowEngine {
                 workflow = triggered
                 state = {
                     workflow_id: triggered.id,
-                    step_index: 0
+                    step_index: 0,
+                    vars: sanitizeVars(memory.vars),
+                    qa_history: sanitizeQaHistory(memory.qa_history)
                 }
             }
         }
@@ -275,9 +502,13 @@ export class WorkflowEngine {
             return { error: 'Workflow not found for this company.' }
         }
 
+        const memory = await getLatestWorkflowMemory(user.id)
+
         const state: WorkflowState = {
             workflow_id: workflow.id,
-            step_index: 0
+            step_index: 0,
+            vars: sanitizeVars(memory.vars),
+            qa_history: sanitizeQaHistory(memory.qa_history)
         }
 
         return this.runWorkflowActions(ctx, user, workflow, state)
@@ -289,6 +520,9 @@ export class WorkflowEngine {
         workflow: any,
         state: WorkflowState
     ): Promise<{ error?: string }> {
+        state.vars = sanitizeVars(state.vars)
+        state.qa_history = sanitizeQaHistory(state.qa_history)
+
         if (state.awaiting_buttons && state.awaiting_buttons.length > 0) {
             if (!ctx.buttonId) return {}
             if (!state.awaiting_buttons.includes(ctx.buttonId)) return {}
@@ -301,6 +535,9 @@ export class WorkflowEngine {
             if (route?.next_step !== undefined) {
                 state.step_index = route.next_step
             }
+        }
+        if (state.awaiting_input?.save_as) {
+            return {}
         }
 
         state.awaiting_buttons = undefined
@@ -321,14 +558,35 @@ export class WorkflowEngine {
 
             if (action.type === 'set_tag') {
                 await updateUserTags(user.id, action.tag)
-                index += 1
+                const nextIndex =
+                    typeof (action as any).next_step === 'number' && (action as any).next_step > index
+                        ? (action as any).next_step
+                        : index + 1
+                index = nextIndex
                 state.step_index = index
                 continue
             }
 
             if (action.type === 'update_state') {
                 state.state = action.state
-                index += 1
+                const nextIndex =
+                    typeof (action as any).next_step === 'number' && (action as any).next_step > index
+                        ? (action as any).next_step
+                        : index + 1
+                index = nextIndex
+                state.step_index = index
+                continue
+            }
+
+            if (action.type === 'condition') {
+                const matched = evaluateCondition(action, state, user, ctx)
+                const preferredIndex = matched ? action.true_step : action.false_step
+                let nextIndex =
+                    typeof preferredIndex === 'number' && preferredIndex >= 0
+                        ? preferredIndex
+                        : index + 1
+                if (nextIndex === index) nextIndex = index + 1
+                index = nextIndex
                 state.step_index = index
                 continue
             }
@@ -336,13 +594,30 @@ export class WorkflowEngine {
             if (action.type === 'send_text') {
                 state.step_index = index + 1
                 try {
+                    const mediaType = (action as any)?.media?.type
+                    const mediaLink = (action as any)?.media?.link
+                    const mediaFilename = (action as any)?.media?.filename
+                    const media =
+                        (mediaType === 'image' || mediaType === 'video' || mediaType === 'document') &&
+                        typeof mediaLink === 'string' &&
+                        mediaLink.trim()
+                            ? {
+                                type: mediaType,
+                                link: mediaLink.trim(),
+                                ...(mediaType === 'document' && typeof mediaFilename === 'string' && mediaFilename.trim()
+                                    ? { filename: mediaFilename.trim() }
+                                    : {})
+                            }
+                            : undefined
+
                     await sendWhatsAppMessage({
                         client: ctx.client,
                         userId: user.id,
                         to: ctx.phoneNumber,
                         type: 'text',
                         content: {
-                            text: action.text,
+                            text: renderDynamicText(action.text, state, user, ctx),
+                            ...(media ? { media } : {}),
                             template: action.template
                         },
                         workflowState: state
@@ -361,18 +636,170 @@ export class WorkflowEngine {
                 const chainInteractive =
                     nextAction &&
                     ['send_buttons', 'send_list', 'send_cta_url'].includes(nextAction.type)
-                if (chainInteractive || (nextAction && nextAction.type === 'send_text')) {
+                if (chainInteractive || (nextAction && ['send_text', 'send_template', 'add_tags', 'assign_staff', 'ask_question', 'condition', 'set_tag', 'update_state'].includes(nextAction.type))) {
                     index = nextIndex
                     continue
                 }
                 break
             }
 
+            if (action.type === 'ask_question') {
+                state.step_index = index + 1
+                const variableKey = normalizeVariableKey(action.save_as)
+                if (!variableKey) {
+                    lastError = 'ask_question failed: save_as is required'
+                    break
+                }
+                const question = renderDynamicText(action.question, state, user, ctx)
+                if (!question.trim()) {
+                    lastError = 'ask_question failed: question text is required'
+                    break
+                }
+                state.awaiting_input = {
+                    save_as: variableKey,
+                    question,
+                    fallback_text: typeof action.fallback_text === 'string' ? action.fallback_text : undefined,
+                    retry_limit: normalizeFallbackLimit(action.retry_limit, DEFAULT_FALLBACK_LIMIT)
+                }
+                state.fallback_count = 0
+                try {
+                    await sendWhatsAppMessage({
+                        client: ctx.client,
+                        userId: user.id,
+                        to: ctx.phoneNumber,
+                        type: 'text',
+                        content: {
+                            text: question
+                        },
+                        workflowState: state
+                    })
+                } catch (error: any) {
+                    const msg = error?.message || String(error)
+                    console.warn('[Workflow] ask_question failed:', msg)
+                    lastError = `ask_question failed: ${msg}`
+                }
+                break
+            }
+
+            if (action.type === 'send_template') {
+                state.step_index = index + 1
+                const templateName = renderDynamicText(action.name, state, user, ctx).trim()
+                if (!templateName) {
+                    lastError = 'send_template failed: template name is required'
+                    break
+                }
+                try {
+                    await sendWhatsAppMessage({
+                        client: ctx.client,
+                        userId: user.id,
+                        to: ctx.phoneNumber,
+                        type: 'template',
+                        content: {
+                            name: templateName,
+                            language: renderDynamicText(
+                                (typeof action.language === 'string' && action.language.trim()) ? action.language : 'en_US',
+                                state,
+                                user,
+                                ctx
+                            ) || 'en_US',
+                            components: Array.isArray(action.components) ? action.components : undefined
+                        },
+                        workflowState: state
+                    })
+                } catch (error: any) {
+                    const msg = error?.message || String(error)
+                    console.warn('[Workflow] send_template failed:', msg)
+                    lastError = `send_template failed: ${msg}`
+                    break
+                }
+                const nextIndex =
+                    typeof (action as any).next_step === 'number'
+                        ? (action as any).next_step
+                        : index + 1
+                if (nextIndex > index && nextIndex < actions.length) {
+                    index = nextIndex
+                    continue
+                }
+                break
+            }
+
+            if (action.type === 'add_tags') {
+                const nextTags = Array.isArray(action.tags)
+                    ? action.tags.map((tag: any) => (typeof tag === 'string' ? tag.trim() : '')).filter(Boolean)
+                    : []
+                for (const tag of nextTags) {
+                    await updateUserTags(user.id, tag)
+                }
+                const nextIndex =
+                    typeof (action as any).next_step === 'number' && (action as any).next_step > index
+                        ? (action as any).next_step
+                        : index + 1
+                index = nextIndex
+                state.step_index = index
+                continue
+            }
+
+            if (action.type === 'assign_staff') {
+                const assigneeUserId = typeof action.assignee_user_id === 'string' ? action.assignee_user_id.trim() : ''
+                if (!assigneeUserId) {
+                    await setUserAssignee(user.id, null)
+                } else {
+                    await setUserAssignee(user.id, {
+                        userId: assigneeUserId,
+                        name: typeof action.assignee_name === 'string' ? action.assignee_name.trim() : assigneeUserId,
+                        color: typeof action.assignee_color === 'string' ? action.assignee_color.trim() : '#6b7280'
+                    })
+                }
+                const nextIndex =
+                    typeof (action as any).next_step === 'number' && (action as any).next_step > index
+                        ? (action as any).next_step
+                        : index + 1
+                index = nextIndex
+                state.step_index = index
+                continue
+            }
+
+            if (action.type === 'trigger_workflow') {
+                const targetWorkflowId = typeof action.workflow_id === 'string' ? action.workflow_id.trim() : ''
+                if (!targetWorkflowId) {
+                    lastError = 'trigger_workflow failed: workflow_id is required'
+                    break
+                }
+                if (targetWorkflowId === workflow.id) {
+                    lastError = 'trigger_workflow failed: cannot trigger the same workflow.'
+                    break
+                }
+                const targetWorkflow = await getWorkflowById(targetWorkflowId)
+                if (!targetWorkflow) {
+                    lastError = `trigger_workflow failed: workflow not found (${targetWorkflowId})`
+                    break
+                }
+                if (targetWorkflow.company_id && targetWorkflow.company_id !== ctx.companyId) {
+                    lastError = 'trigger_workflow failed: target workflow is outside this company.'
+                    break
+                }
+                const targetState: WorkflowState = {
+                    workflow_id: targetWorkflow.id,
+                    step_index: 0,
+                    vars: sanitizeVars(state.vars),
+                    qa_history: sanitizeQaHistory(state.qa_history),
+                    ...(state.state ? { state: state.state } : {})
+                }
+                return this.runWorkflowActions(ctx, user, targetWorkflow, targetState)
+            }
+
             if (action.type === 'send_buttons') {
                 state.step_index = index + 1
-                const buttons = normalizeButtons(action.buttons || [])
+                const buttons = normalizeButtons(action.buttons || []).map((button: any, buttonIndex: number) => ({
+                    id: typeof button?.id === 'string' && button.id.trim() ? button.id.trim() : `option_${buttonIndex + 1}`,
+                    title: renderDynamicText(button?.title || '', state, user, ctx) || `Option ${buttonIndex + 1}`
+                }))
                 state.awaiting_buttons = buttons.map(b => b.id)
                 state.awaiting_routes = action.routes
+                const header =
+                    action.header?.type === 'text'
+                        ? { ...action.header, text: renderDynamicText(action.header?.text || '', state, user, ctx) }
+                        : action.header
 
                 try {
                     await sendWhatsAppMessage({
@@ -381,10 +808,10 @@ export class WorkflowEngine {
                         to: ctx.phoneNumber,
                         type: 'buttons',
                         content: {
-                            text: action.text,
+                            text: renderDynamicText(action.text, state, user, ctx),
                             buttons,
-                            header: action.header,
-                            footer: action.footer,
+                            header,
+                            footer: renderDynamicText(action.footer || '', state, user, ctx),
                             template: action.template
                         },
                         workflowState: state
@@ -400,9 +827,27 @@ export class WorkflowEngine {
 
             if (action.type === 'send_list') {
                 state.step_index = index + 1
-                const rowIds = extractListRowIds(action.sections || [])
+                const sections = Array.isArray(action.sections)
+                    ? action.sections.map((section: any) => ({
+                        ...(section?.title ? { title: renderDynamicText(section.title, state, user, ctx) } : {}),
+                        rows: Array.isArray(section?.rows)
+                            ? section.rows.map((row: any, rowIndex: number) => ({
+                                id: typeof row?.id === 'string' && row.id.trim() ? row.id.trim() : `row_${rowIndex + 1}`,
+                                title: renderDynamicText(row?.title || '', state, user, ctx),
+                                ...(row?.description
+                                    ? { description: renderDynamicText(row.description, state, user, ctx) }
+                                    : {})
+                            }))
+                            : []
+                    }))
+                    : []
+                const rowIds = extractListRowIds(sections)
                 state.awaiting_buttons = rowIds
                 state.awaiting_routes = action.routes
+                const header =
+                    action.header?.type === 'text'
+                        ? { ...action.header, text: renderDynamicText(action.header?.text || '', state, user, ctx) }
+                        : action.header
 
                 try {
                     await sendWhatsAppMessage({
@@ -411,11 +856,11 @@ export class WorkflowEngine {
                         to: ctx.phoneNumber,
                         type: 'list',
                         content: {
-                            text: action.text,
-                            button_text: action.button_text,
-                            sections: action.sections,
-                            header: action.header,
-                            footer: action.footer,
+                            text: renderDynamicText(action.text, state, user, ctx),
+                            button_text: renderDynamicText(action.button_text, state, user, ctx),
+                            sections,
+                            header,
+                            footer: renderDynamicText(action.footer || '', state, user, ctx),
                             template: action.template
                         },
                         workflowState: state
@@ -431,6 +876,10 @@ export class WorkflowEngine {
 
             if (action.type === 'send_cta_url') {
                 state.step_index = index + 1
+                const header =
+                    action.header?.type === 'text'
+                        ? { ...action.header, text: renderDynamicText(action.header?.text || '', state, user, ctx) }
+                        : action.header
                 try {
                     await sendWhatsAppMessage({
                         client: ctx.client,
@@ -438,11 +887,11 @@ export class WorkflowEngine {
                         to: ctx.phoneNumber,
                         type: 'cta_url',
                         content: {
-                            body: action.body,
-                            button_text: action.button_text,
-                            url: action.url,
-                            header: action.header,
-                            footer: action.footer,
+                            body: renderDynamicText(action.body, state, user, ctx),
+                            button_text: renderDynamicText(action.button_text, state, user, ctx),
+                            url: renderDynamicText(action.url, state, user, ctx),
+                            header,
+                            footer: renderDynamicText(action.footer || '', state, user, ctx),
                             template: action.template
                         },
                         workflowState: state
@@ -456,16 +905,11 @@ export class WorkflowEngine {
             }
 
             if (action.type === 'end_flow') {
-                state = null
                 break
             }
 
             index += 1
             state.step_index = index
-        }
-
-        if (index >= actions.length) {
-            state = null
         }
 
         return lastError ? { error: lastError } : {}

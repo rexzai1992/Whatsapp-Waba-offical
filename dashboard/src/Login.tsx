@@ -258,9 +258,20 @@ export default function Login({
                         </form>
                     </div>
 
-                    <p className="mt-8 text-center text-[#54656f] text-sm">
-                        By continuing, you agree to Nexus WA's <span className="text-[#111b21] font-medium cursor-pointer hover:underline">Terms</span> and <span className="text-[#111b21] font-medium cursor-pointer hover:underline">Privacy</span>.
-                    </p>
+                    <div className="mt-8 text-center text-[#54656f] text-sm space-y-2">
+                        <p>
+                            Need help?
+                            {' '}
+                            <a href="mailto:hello@2fast.xyz" className="text-[#111b21] font-semibold hover:underline">hello@2fast.xyz</a>
+                        </p>
+                        <p>
+                            <a href="/support" className="text-[#111b21] font-medium hover:underline">Support</a>
+                            {' · '}
+                            <a href="/privacy-policy" className="text-[#111b21] font-medium hover:underline">Privacy Policy</a>
+                            {' · '}
+                            <a href="/terms-and-conditions" className="text-[#111b21] font-medium hover:underline">Terms & Conditions</a>
+                        </p>
+                    </div>
                 </div>
             </div>
 
