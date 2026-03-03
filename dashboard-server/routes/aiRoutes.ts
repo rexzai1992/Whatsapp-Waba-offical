@@ -4,14 +4,9 @@ import {
     DEFAULT_COMPANY_AI_SETTINGS,
     type CompanyAiSettingsRecord
 } from '../services/aiSettingsStore'
+import { loadOpenAiMemoryForUser, requestOpenAiCompletion, type OpenAiChatMessage } from '../services/openaiAssistant'
 
 const ENCRYPTED_TOKEN_PREFIX = 'enc:v1:'
-const OPENAI_CHAT_COMPLETIONS_URL = 'https://api.openai.com/v1/chat/completions'
-
-type ChatMessage = {
-    role: 'system' | 'user' | 'assistant'
-    content: string
-}
 
 function normalizePhoneNumber(input: string | null | undefined): string {
     if (!input) return ''
@@ -22,36 +17,6 @@ function maskApiKey(value: string): string {
     if (!value) return ''
     if (value.length <= 8) return '********'
     return `${value.slice(0, 4)}******${value.slice(-4)}`
-}
-
-function extractOutgoingText(content: any): string {
-    if (!content || typeof content !== 'object') return ''
-    const candidates = [
-        content.text,
-        content.payload?.text,
-        content.payload?.body,
-        content.caption,
-        content.button_title
-    ]
-    for (const candidate of candidates) {
-        if (typeof candidate === 'string' && candidate.trim()) return candidate.trim()
-    }
-    if (typeof content.type === 'string' && content.type.trim()) {
-        const kind = content.type.trim().toLowerCase()
-        if (kind === 'image') return '[image]'
-        if (kind === 'video') return '[video]'
-        if (kind === 'document') return '[document]'
-    }
-    return ''
-}
-
-function toAiMessage(direction: string, content: any): ChatMessage | null {
-    const text = extractOutgoingText(content)
-    if (!text) return null
-    return {
-        role: direction === 'out' ? 'assistant' : 'user',
-        content: text
-    }
 }
 
 function clampTemperature(value: unknown, fallback: number): number {
@@ -70,33 +35,6 @@ function clampMemoryMessages(value: unknown, fallback: number): number {
     const numeric = Number(value)
     if (!Number.isFinite(numeric)) return fallback
     return Math.min(80, Math.max(0, Math.floor(numeric)))
-}
-
-function pickFirstTextContent(value: any): string {
-    if (typeof value === 'string') return value.trim()
-    if (Array.isArray(value)) {
-        const chunks = value
-            .map((chunk) => {
-                if (typeof chunk === 'string') return chunk
-                if (chunk && typeof chunk === 'object') {
-                    if (typeof chunk.text === 'string') return chunk.text
-                    if (typeof chunk?.type === 'string' && chunk.type === 'text' && typeof chunk?.text?.value === 'string') {
-                        return chunk.text.value
-                    }
-                }
-                return ''
-            })
-            .filter(Boolean)
-        return chunks.join('\n').trim()
-    }
-    return ''
-}
-
-function extractCompletionText(payload: any): string {
-    const firstChoice = payload?.choices?.[0]
-    const candidate = firstChoice?.message?.content
-    const text = pickFirstTextContent(candidate)
-    return text
 }
 
 function toPublicSettings(settings: CompanyAiSettingsRecord) {
@@ -121,12 +59,12 @@ function toPublicSettings(settings: CompanyAiSettingsRecord) {
     }
 }
 
-async function loadMemoryMessages(
+async function loadMemoryMessagesByContact(
     supabase: any,
     companyId: string,
     contactJid: string,
     memoryMessages: number
-): Promise<ChatMessage[]> {
+): Promise<OpenAiChatMessage[]> {
     if (!memoryMessages || memoryMessages <= 0) return []
     const cleanPhone = normalizePhoneNumber(contactJid)
     if (!cleanPhone) return []
@@ -144,29 +82,9 @@ async function loadMemoryMessages(
     }
 
     const matchedUser = users.find((row: any) => row.phone_number === cleanPhone) || users[0]
-    const userId = matchedUser?.id
-    if (!userId) return []
+    if (!matchedUser?.id) return []
 
-    const fetchLimit = Math.max(memoryMessages * 3, 24)
-    const { data: rows, error: rowsError } = await supabase
-        .from('messages')
-        .select('direction, content, created_at')
-        .eq('user_id', userId)
-        .order('created_at', { ascending: false })
-        .limit(fetchLimit)
-
-    if (rowsError || !Array.isArray(rows)) {
-        return []
-    }
-
-    const history = rows
-        .slice()
-        .reverse()
-        .map((row: any) => toAiMessage(row.direction, row.content))
-        .filter(Boolean) as ChatMessage[]
-
-    if (history.length <= memoryMessages) return history
-    return history.slice(-memoryMessages)
+    return loadOpenAiMemoryForUser(supabase, matchedUser.id, memoryMessages)
 }
 
 export function registerAiRoutes(app: Express, ctx: any) {
@@ -178,10 +96,11 @@ export function registerAiRoutes(app: Express, ctx: any) {
         supabase,
         encryptToken,
         decryptToken,
-        getTokenEncryptionKey
+        getTokenEncryptionKey,
+        aiSettingsStore
     } = ctx
 
-    const settingsStore = createCompanyAiSettingsStore(resolvePath('company_ai_settings.json'))
+    const settingsStore = aiSettingsStore || createCompanyAiSettingsStore(resolvePath('company_ai_settings.json'))
 
     const encryptApiKeyForStore = (value: string): string => {
         if (!value) return value
@@ -287,10 +206,10 @@ export function registerAiRoutes(app: Express, ctx: any) {
 
             const contactJid = readTrimmed(req.body?.contactJid)
             const memoryMessages = settings.memory_enabled
-                ? await loadMemoryMessages(supabase, access.companyId, contactJid, settings.memory_messages)
+                ? await loadMemoryMessagesByContact(supabase, access.companyId, contactJid, settings.memory_messages)
                 : []
 
-            const requestMessages: ChatMessage[] = []
+            const requestMessages: OpenAiChatMessage[] = []
             const trimmedSystemPrompt = (settings.system_prompt || '').trim()
             if (trimmedSystemPrompt) {
                 requestMessages.push({
@@ -304,63 +223,25 @@ export function registerAiRoutes(app: Express, ctx: any) {
                 content: prompt
             })
 
-            const controller = new AbortController()
-            const timeout = setTimeout(() => controller.abort(), 45000)
-
-            let upstreamBody = ''
-            let upstreamPayload: any = null
-            let upstreamStatus = 500
-            try {
-                const upstream = await fetch(OPENAI_CHAT_COMPLETIONS_URL, {
-                    method: 'POST',
-                    headers: {
-                        'content-type': 'application/json',
-                        authorization: `Bearer ${decryptedApiKey}`
-                    },
-                    body: JSON.stringify({
-                        model: settings.model,
-                        messages: requestMessages,
-                        temperature: settings.temperature,
-                        max_tokens: settings.max_tokens
-                    }),
-                    signal: controller.signal
-                })
-                upstreamStatus = upstream.status
-                upstreamBody = await upstream.text()
-                if (upstreamBody) {
-                    try {
-                        upstreamPayload = JSON.parse(upstreamBody)
-                    } catch {
-                        upstreamPayload = null
-                    }
-                }
-            } finally {
-                clearTimeout(timeout)
-            }
-
-            if (upstreamStatus < 200 || upstreamStatus >= 300) {
-                const detail = upstreamPayload?.error?.message || upstreamBody || `OpenAI request failed (${upstreamStatus})`
-                return res.status(502).json({ success: false, error: detail })
-            }
-
-            const reply = extractCompletionText(upstreamPayload)
-            if (!reply) {
-                return res.status(502).json({ success: false, error: 'OpenAI response did not include text output' })
-            }
+            const completion = await requestOpenAiCompletion({
+                apiKey: decryptedApiKey,
+                model: settings.model,
+                temperature: settings.temperature,
+                maxTokens: settings.max_tokens,
+                messages: requestMessages,
+                timeoutMs: 45000
+            })
 
             return res.json({
                 success: true,
                 data: {
-                    reply,
-                    model: upstreamPayload?.model || settings.model,
-                    usage: upstreamPayload?.usage || null,
+                    reply: completion.reply,
+                    model: completion.model || settings.model,
+                    usage: completion.usage,
                     memoryMessagesUsed: memoryMessages.length
                 }
             })
         } catch (error: any) {
-            if (error?.name === 'AbortError') {
-                return res.status(504).json({ success: false, error: 'OpenAI request timed out' })
-            }
             return res.status(500).json({ success: false, error: error?.message || 'Failed to generate AI reply' })
         }
     })

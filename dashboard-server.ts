@@ -14,8 +14,8 @@ import { supabase } from './src/supabase'
 import { WabaRegistry } from './src/waba/registry'
 import { parseWabaWebhook, verifyWabaSignature } from './src/waba/webhook'
 import type { WabaInboundMessage, WabaStatus, WabaConfig } from './src/waba/types'
-import { resolveCompanyId, findOrCreateUser, getMessagesForUsers, getUsersForCompany, insertMessage, getUserByPhone, deleteMessagesForUser, normalizePhoneNumber, updateMessageStatusByMessageId, updateUserName, setUserTags, getUsersWithExpiringWindow, updateUserWindowReminder, activateUserCtaFreeWindow, getUserById, assignUserToAgentIfUnassigned, setUserAssignee } from './src/services/wa-store'
-import type { MessageRecord } from './src/services/wa-store'
+import { resolveCompanyId, findOrCreateUser, getMessagesForUsers, getUsersForCompany, insertMessage, getUserByPhone, deleteMessagesForUser, normalizePhoneNumber, updateMessageStatusByMessageId, updateUserName, setUserTags, getUsersWithExpiringWindow, updateUserWindowReminder, activateUserCtaFreeWindow, getUserById, assignUserToAgentIfUnassigned, setUserAssignee, hasHumanTakeover, setUserHumanTakeover } from './src/services/wa-store'
+import type { MessageRecord, User as WaStoreUser } from './src/services/wa-store'
 import { sendWhatsAppMessage } from './src/services/whatsapp'
 import { WorkflowEngine } from './src/workflow/engine'
 import { encryptToken, decryptToken, getTokenEncryptionKey } from './src/services/token-vault'
@@ -27,6 +27,8 @@ import { registerPublicInfoRoutes } from './dashboard-server/routes/publicInfoRo
 import { registerWabaRoutes } from './dashboard-server/routes/wabaRoutes'
 import { registerCompanyRoutes } from './dashboard-server/routes/companyRoutes'
 import { registerAiRoutes } from './dashboard-server/routes/aiRoutes'
+import { createCompanyAiSettingsStore } from './dashboard-server/services/aiSettingsStore'
+import { loadOpenAiMemoryForUser, requestOpenAiCompletion, type OpenAiChatMessage } from './dashboard-server/services/openaiAssistant'
 import { registerSocketHandlers } from './dashboard-server/socket/registerSocketHandlers'
 import { errorHandler } from './dashboard-server/middleware/error'
 import { requireSupabaseUser } from './dashboard-server/middleware/auth'
@@ -177,6 +179,7 @@ function buildContactPayload(user: any) {
         name: user?.name || phone || user?.phone_number || '',
         lastInboundAt: user?.last_inbound_at || null,
         tags: user?.tags || [],
+        humanTakeover: hasHumanTakeover(user),
         assigneeUserId: user?.assigned_to_user_id || null,
         assigneeName: user?.assigned_to_name || null,
         assigneeColor: user?.assigned_to_color || null,
@@ -2594,6 +2597,7 @@ const apiKeyStore = createApiKeyStore(resolvePath('api_keys.json'))
 const verifyApiKey = apiKeyStore.middleware
 
 const webhookStore = createWebhookStore(resolvePath('webhooks.json'))
+const aiSettingsStore = createCompanyAiSettingsStore(resolvePath('company_ai_settings.json'))
 
 // ============================================
 // PUBLIC API ENDPOINTS
@@ -2844,7 +2848,8 @@ registerAiRoutes(app, {
     supabase,
     encryptToken,
     decryptToken,
-    getTokenEncryptionKey
+    getTokenEncryptionKey,
+    aiSettingsStore
 })
 
 // WABA WEBHOOK (Meta Cloud API)
@@ -3828,6 +3833,100 @@ function recordToSyntheticMessage(
     }
 }
 
+function isAiAutoReplyInboundType(type: string) {
+    const normalized = (type || '').toLowerCase()
+    return normalized === 'text' || normalized === 'interactive' || normalized === 'button' || normalized === 'request_welcome'
+}
+
+function decryptAiApiKey(storedValue: string | null | undefined): string {
+    if (!storedValue) return ''
+    if (!storedValue.startsWith('enc:v1:')) return storedValue
+    try {
+        return decryptToken(storedValue)
+    } catch {
+        return ''
+    }
+}
+
+async function maybeSendAutoAiReply(params: {
+    companyId: string
+    profileId: string
+    client: any
+    user: WaStoreUser | null
+    phoneNumber: string
+    inboundType: string
+    inboundText: string
+    workflowHandled: boolean
+}): Promise<{ sent: boolean; reason?: string }> {
+    if (params.workflowHandled) return { sent: false, reason: 'workflow_handled' }
+    if (!params.user) return { sent: false, reason: 'missing_user' }
+    if (hasHumanTakeover(params.user)) return { sent: false, reason: 'human_takeover' }
+    if (!isAiAutoReplyInboundType(params.inboundType)) return { sent: false, reason: 'unsupported_inbound_type' }
+
+    const inboundText = (params.inboundText || '').trim()
+    if (!inboundText) return { sent: false, reason: 'empty_inbound_text' }
+
+    const settings = aiSettingsStore.get(params.companyId)
+    if (!settings.enabled) return { sent: false, reason: 'ai_disabled' }
+
+    const apiKey = decryptAiApiKey(settings.api_key)
+    if (!apiKey) return { sent: false, reason: 'missing_api_key' }
+
+    const memoryMessages = settings.memory_enabled
+        ? await loadOpenAiMemoryForUser(supabase, params.user.id, settings.memory_messages)
+        : []
+
+    const promptMessages: OpenAiChatMessage[] = []
+    const systemPrompt = (settings.system_prompt || '').trim()
+    if (systemPrompt) {
+        promptMessages.push({
+            role: 'system',
+            content: systemPrompt
+        })
+    }
+    promptMessages.push(...memoryMessages)
+
+    const lastMemoryMessage = promptMessages[promptMessages.length - 1]
+    const duplicateUserInput =
+        lastMemoryMessage?.role === 'user' &&
+        typeof lastMemoryMessage.content === 'string' &&
+        lastMemoryMessage.content.trim() === inboundText
+
+    if (!duplicateUserInput) {
+        promptMessages.push({
+            role: 'user',
+            content: inboundText
+        })
+    }
+
+    const completion = await requestOpenAiCompletion({
+        apiKey,
+        model: settings.model,
+        temperature: settings.temperature,
+        maxTokens: settings.max_tokens,
+        messages: promptMessages,
+        timeoutMs: 45000
+    })
+
+    const reply = (completion.reply || '').trim()
+    if (!reply) {
+        return { sent: false, reason: 'empty_ai_reply' }
+    }
+
+    await sendWhatsAppMessage({
+        client: params.client,
+        userId: params.user.id,
+        to: params.phoneNumber,
+        type: 'text',
+        content: {
+            text: reply
+        },
+        workflowState: null
+    })
+
+    return { sent: true }
+}
+
 async function handleInboundMessage(config: WabaConfig, inbound: WabaInboundMessage) {
     const { syntheticMsg, remoteJid, text } = buildSyntheticMessage(inbound)
     const profileId = config.profileId
@@ -3840,11 +3939,15 @@ async function handleInboundMessage(config: WabaConfig, inbound: WabaInboundMess
         return
     }
 
+    const baseUser = await findOrCreateUser(companyId, phoneNumber)
+    const humanTakeoverActive = hasHumanTakeover(baseUser)
+
     const workflowResult = await workflowEngine.processInbound({
         companyId,
         profileId,
         client,
         phoneNumber,
+        automationDisabled: humanTakeoverActive,
         messageType: inbound.type,
         text,
         buttonId: inbound.buttonReplyId,
@@ -3853,7 +3956,7 @@ async function handleInboundMessage(config: WabaConfig, inbound: WabaInboundMess
         raw: inbound.raw
     })
 
-    const user = await getUserByPhone(companyId, phoneNumber)
+    const user = (await getUserByPhone(companyId, phoneNumber)) || baseUser
     if (user && inbound.contactName) {
         const trimmedName = inbound.contactName.trim()
         const nameDigits = trimmedName.replace(/\D/g, '')
@@ -3880,6 +3983,26 @@ async function handleInboundMessage(config: WabaConfig, inbound: WabaInboundMess
 
     if (profile && workflowResult?.error) {
         io.to(getCompanyRoom(companyId)).emit('profile.error', { message: `Workflow error: ${workflowResult.error}` })
+    }
+
+    if (user) {
+        try {
+            const aiResult = await maybeSendAutoAiReply({
+                companyId,
+                profileId,
+                client,
+                user,
+                phoneNumber,
+                inboundType: inbound.type,
+                inboundText: text || '',
+                workflowHandled: Boolean(workflowResult?.handled)
+            })
+            if (aiResult.sent) {
+                console.log(`[${profileId}] Auto AI reply sent to ${phoneNumber}`)
+            }
+        } catch (error: any) {
+            console.warn(`[${profileId}] Auto AI reply skipped:`, error?.message || error)
+        }
     }
 
     if (profile) {
@@ -4024,6 +4147,7 @@ registerSocketHandlers(io, {
     findOrCreateUser,
     updateUserName,
     setUserTags,
+    setUserHumanTakeover,
     getUserByPhone,
     readTrimmed,
     deriveAgentName,

@@ -49,6 +49,18 @@ export default function ChatflowView({
     workflowTemplateOptions
 }: ChatflowViewProps) {
     if (!open) return null;
+    const flowFallbackCacheRef = React.useRef<Record<string, any>>({});
+    const getWorkflowFlow = React.useCallback((wf: any) => {
+        if (wf?.builder && Array.isArray(wf.builder.nodes)) {
+            flowFallbackCacheRef.current[wf.id] = wf.builder;
+            return wf.builder;
+        }
+        const cached = flowFallbackCacheRef.current[wf.id];
+        if (cached && Array.isArray(cached.nodes)) return cached;
+        const built = buildBuilderFromActions(Array.isArray(wf?.actions) ? wf.actions : [], wf.id);
+        flowFallbackCacheRef.current[wf.id] = built;
+        return built;
+    }, [buildBuilderFromActions]);
 
     return (
         <div className="fixed inset-0 bg-[#f8f9fa] z-[150] flex flex-col">
@@ -143,7 +155,7 @@ export default function ChatflowView({
                                         <div className="border border-[#eceff1] rounded-2xl overflow-hidden bg-white min-h-[560px] h-[70vh]">
                                             <Suspense fallback={<div className="h-full flex items-center justify-center text-sm text-[#54656f]">Loading flow editor…</div>}>
                                                 <FlowCanvasComponent
-                                                    flow={wf.builder || buildBuilderFromActions(wf.actions || [], wf.id)}
+                                                    flow={getWorkflowFlow(wf)}
                                                     tagOptions={workflowTagOptions}
                                                     variableOptions={workflowVariableOptions}
                                                     staffOptions={teamUsers}
@@ -151,6 +163,7 @@ export default function ChatflowView({
                                                     templateOptions={workflowTemplateOptions}
                                                     onSave={(nextFlow: any) => {
                                                         const { actions } = buildActionsFromBuilder(nextFlow);
+                                                        flowFallbackCacheRef.current[wf.id] = nextFlow;
                                                         const nextWorkflows = workflows.map(item =>
                                                             item.id === wf.id ? { ...item, actions, builder: nextFlow } : item
                                                         );

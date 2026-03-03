@@ -184,6 +184,12 @@ type ServerStats = {
     timestamp?: number;
 };
 
+type AppToast = {
+    id: number;
+    message: string;
+    tone: 'success' | 'error';
+};
+
 type OnboardingStepId = 'welcome' | 'waba_id' | 'phone_number_id' | 'access_token' | 'verify_token' | 'connect';
 
 type OnboardingFieldKey = 'wabaId' | 'phoneNumberId' | 'accessToken' | 'verifyToken';
@@ -208,6 +214,7 @@ type ContactMeta = {
     name?: string;
     lastInboundAt?: string | null;
     tags?: string[];
+    humanTakeover?: boolean;
     assigneeUserId?: string | null;
     assigneeName?: string | null;
     assigneeColor?: string | null;
@@ -278,6 +285,7 @@ export default function App() {
     const [lastProfileError, setLastProfileError] = useState<string | null>(null);
     const [logEntries, setLogEntries] = useState<LogEntry[]>([]);
     const [logOpen, setLogOpen] = useState(false);
+    const [appToast, setAppToast] = useState<AppToast | null>(null);
     const [loadingChats, setLoadingChats] = useState(false);
     const [serverStats, setServerStats] = useState<ServerStats | null>(null);
     const [contactDraftName, setContactDraftName] = useState('');
@@ -306,6 +314,7 @@ export default function App() {
     const [workflowTemplateOptions, setWorkflowTemplateOptions] = useState<WorkflowTemplateOption[]>([]);
     const [assignMenuContactId, setAssignMenuContactId] = useState<string | null>(null);
     const [assigningContactId, setAssigningContactId] = useState<string | null>(null);
+    const [humanTakeoverSaving, setHumanTakeoverSaving] = useState(false);
     const [mediaCache, setMediaCache] = useState<Record<string, MediaData>>({});
     const [showContactInfo, setShowContactInfo] = useState(false);
     const [showNewChatModal, setShowNewChatModal] = useState(false);
@@ -722,6 +731,23 @@ export default function App() {
             return next.slice(-200);
         });
     }, []);
+
+    const showToast = useCallback((message: string, tone: 'success' | 'error' = 'success') => {
+        if (!message) return;
+        setAppToast({
+            id: Date.now(),
+            message,
+            tone
+        });
+    }, []);
+
+    useEffect(() => {
+        if (!appToast) return;
+        const timer = window.setTimeout(() => {
+            setAppToast((current) => (current?.id === appToast.id ? null : current));
+        }, 2400);
+        return () => window.clearTimeout(timer);
+    }, [appToast]);
 
     const getDraftStorageKey = useCallback((profileId?: string | null, chatId?: string | null) => {
         if (!profileId || !chatId) return null;
@@ -1507,13 +1533,21 @@ export default function App() {
     }, [session, activeProfileId, loadingChats, recoverSocketConnection]);
 
     const applyWorkflowsFromServer = (list: any[]) => {
-        setWorkflows(list);
-        const nextSelected = list[0]?.id || null;
-        if (!selectedWorkflowId || !list.find((f: any) => f.id === selectedWorkflowId)) {
+        const normalized = (Array.isArray(list) ? list : []).map((wf: any) => {
+            if (wf?.builder && Array.isArray(wf.builder.nodes)) return wf;
+            return {
+                ...wf,
+                builder: buildBuilderFromActions(Array.isArray(wf?.actions) ? wf.actions : [], wf.id)
+            };
+        });
+
+        setWorkflows(normalized);
+        const nextSelected = normalized[0]?.id || null;
+        if (!selectedWorkflowId || !normalized.find((f: any) => f.id === selectedWorkflowId)) {
             setSelectedWorkflowId(nextSelected);
         }
         const drafts: Record<string, string> = {};
-        list.forEach((wf: any) => {
+        normalized.forEach((wf: any) => {
             drafts[wf.id] = JSON.stringify(wf.actions || [], null, 2);
         });
         setWorkflowDrafts(drafts);
@@ -1586,9 +1620,9 @@ export default function App() {
             const list = Array.isArray(refreshedPayload?.workflows) ? refreshedPayload.workflows : [];
             applyWorkflowsFromServer(list);
 
-            alert('Workflows saved to Supabase!');
+            showToast('Workflows saved', 'success');
         } catch (err: any) {
-            alert(err?.message || 'Failed to save workflows');
+            showToast(err?.message || 'Failed to save workflows', 'error');
         }
     };
 
@@ -1984,6 +2018,7 @@ export default function App() {
         })
         : null;
     const selectedContact = selectedChatId ? contacts[selectedChatId] : null;
+    const selectedHumanTakeover = Boolean(selectedContact?.humanTakeover);
     const selectedAssigneeName = selectedContact?.assigneeName || null;
     const selectedAssigneeColor = selectedContact?.assigneeColor || '#6b7280';
     const selectedAssigneeInitials = getInitials(selectedAssigneeName || 'Unassigned');
@@ -2116,45 +2151,49 @@ export default function App() {
         setShowMediaComposer(false);
     };
 
-    const sendAiMessageToContact = useCallback(async (jid: string, text: string) => {
-        if (!socket || !activeProfileId) {
-            return { success: false, error: 'No active connection or profile.' };
-        }
-
-        const cleanText = text.trim();
-        if (!cleanText) {
-            return { success: false, error: 'Message text is required.' };
-        }
-
-        const normalizedDigits = jid.replace(/@s\.whatsapp\.net$/, '').replace(/\D/g, '');
-        if (!normalizedDigits) {
-            return { success: false, error: 'Valid contact JID is required.' };
-        }
-        const normalizedJid = jid.includes('@') ? jid : `${normalizedDigits}@s.whatsapp.net`;
-
-        socket.emit('sendMessage', {
-            profileId: activeProfileId,
-            jid: normalizedJid,
-            text: cleanText
-        });
-
-        const tempMsg: Message = {
-            key: { id: `ai-${Date.now()}`, remoteJid: normalizedJid, fromMe: true },
-            message: { conversation: cleanText },
-            messageTimestamp: Math.floor(Date.now() / 1000),
-            status: 'sent',
-            agent: {
-                user_id: session?.user?.id,
-                name: currentAgentName,
-                color: '#6b7280'
-            }
-        };
-        setAllMessages(prev => [tempMsg, ...prev]);
-        setSelectedChatId(normalizedJid);
+    const openSettingsFromMore = useCallback(() => {
         setWorkspaceSection('team-inbox');
+        requestAnimationFrame(() => {
+            setActiveView('settings');
+        });
+    }, []);
 
-        return { success: true };
-    }, [activeProfileId, currentAgentName, session?.user?.id, socket]);
+    const openAnalyticsFromMore = useCallback(() => {
+        setWorkspaceSection('team-inbox');
+        requestAnimationFrame(() => {
+            setShowAnalytics(true);
+        });
+    }, []);
+
+    const handleToggleHumanTakeover = useCallback(async () => {
+        if (!socket || !activeProfileId || !selectedChatId) return;
+        if (selectedChatId.endsWith('@g.us')) return;
+
+        const nextEnabled = !selectedHumanTakeover;
+        setHumanTakeoverSaving(true);
+        try {
+            const response: any = await new Promise((resolve) => {
+                const timeout = setTimeout(() => {
+                    resolve({ success: false, error: 'Request timed out. Please try again.' });
+                }, 8000);
+                socket.emit(
+                    'contact.human_takeover',
+                    { profileId: activeProfileId, jid: selectedChatId, enabled: nextEnabled },
+                    (ack: any) => {
+                        clearTimeout(timeout);
+                        resolve(ack);
+                    }
+                );
+            });
+            if (!response?.success) {
+                throw new Error(response?.error || 'Failed to update human takeover');
+            }
+        } catch (err: any) {
+            alert(err?.message || 'Failed to update human takeover');
+        } finally {
+            setHumanTakeoverSaving(false);
+        }
+    }, [activeProfileId, selectedChatId, selectedHumanTakeover, socket]);
 
     const handleStartWorkflow = () => {
         if (!socket || !selectedChatId || !activeProfileId || !startWorkflowId) return;
@@ -2466,7 +2505,7 @@ export default function App() {
                             <MoreVertical className="w-5 h-5" />
                         </button>
                         <button
-                            onClick={() => setActiveView('settings')}
+                            onClick={openSettingsFromMore}
                             className="w-10 h-10 rounded-full bg-[#f3f4f6] text-[#6b7280] flex items-center justify-center"
                         >
                             <User className="w-5 h-5" />
@@ -2698,6 +2737,23 @@ export default function App() {
                                                 >
                                                     {selectedAssigneeInitials}
                                                     <span>{selectedAssigneeName || 'Unassigned'}</span>
+                                                </button>
+                                            </span>
+                                            <span className="ml-2 inline-block">
+                                                <button
+                                                    type="button"
+                                                    onClick={(e) => {
+                                                        e.stopPropagation();
+                                                        handleToggleHumanTakeover();
+                                                    }}
+                                                    disabled={humanTakeoverSaving}
+                                                    className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold border transition-all disabled:opacity-60 ${selectedHumanTakeover
+                                                            ? 'bg-emerald-50 border-emerald-300 text-emerald-700'
+                                                            : 'bg-amber-50 border-amber-300 text-amber-700 hover:bg-amber-100'
+                                                        }`}
+                                                >
+                                                    <Shield className="w-3 h-3" />
+                                                    <span>{selectedHumanTakeover ? 'Human' : 'Bot'}</span>
                                                 </button>
                                             </span>
                                         </>
@@ -3859,9 +3915,7 @@ export default function App() {
                 <ChatbotsView
                     profileId={activeProfileId}
                     sessionToken={session?.access_token || null}
-                    selectedChatId={selectedChatId}
                     apiBaseUrl={SOCKET_URL}
-                    onSendMessage={sendAiMessageToContact}
                 />
             ) : workspaceSection === 'more' ? (
                 <div className="h-screen pt-[72px] bg-[#f8f9fa] text-[#111b21] font-sans">
@@ -3877,8 +3931,8 @@ export default function App() {
                             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                                 <button
                                     type="button"
-                                    onClick={() => setActiveView('settings')}
-                                    className="text-left bg-white border border-[#eceff1] rounded-2xl p-5 hover:bg-[#f8f9fa] transition-all"
+                                    onClick={openSettingsFromMore}
+                                    className="text-left bg-white border border-[#eceff1] rounded-2xl p-5 hover:bg-[#f8f9fa] transition-all cursor-pointer pointer-events-auto"
                                 >
                                     <div className="flex items-center gap-3 mb-2">
                                         <div className="w-9 h-9 rounded-xl bg-[#00a884]/10 border border-[#00a884]/20 text-[#00a884] flex items-center justify-center">
@@ -3893,8 +3947,8 @@ export default function App() {
 
                                 <button
                                     type="button"
-                                    onClick={() => setShowAnalytics(true)}
-                                    className="text-left bg-white border border-[#eceff1] rounded-2xl p-5 hover:bg-[#f8f9fa] transition-all"
+                                    onClick={openAnalyticsFromMore}
+                                    className="text-left bg-white border border-[#eceff1] rounded-2xl p-5 hover:bg-[#f8f9fa] transition-all cursor-pointer pointer-events-auto"
                                 >
                                     <div className="flex items-center gap-3 mb-2">
                                         <div className="w-9 h-9 rounded-xl bg-[#111b21]/5 border border-[#111b21]/10 text-[#111b21] flex items-center justify-center">
@@ -4015,6 +4069,18 @@ export default function App() {
                                 })
                             )}
                         </div>
+                    </div>
+                </div>
+            )}
+            {appToast && (
+                <div className="fixed top-4 right-4 z-[280] max-w-[360px]">
+                    <div
+                        className={`rounded-xl border px-4 py-2.5 text-sm font-semibold shadow-lg ${appToast.tone === 'success'
+                                ? 'bg-emerald-50 border-emerald-200 text-emerald-700'
+                                : 'bg-rose-50 border-rose-200 text-rose-700'
+                            }`}
+                    >
+                        {appToast.message}
                     </div>
                 </div>
             )}

@@ -21,6 +21,7 @@ export function registerSocketHandlers(io: Server, ctx: any) {
         findOrCreateUser,
         updateUserName,
         setUserTags,
+        setUserHumanTakeover,
         getUserByPhone,
         readTrimmed,
         deriveAgentName,
@@ -292,6 +293,72 @@ io.on('connection', async (socket) => {
             }
         } catch (err: any) {
             socket.emit('profile.error', { message: err?.message || 'Failed to update contact.' })
+        }
+    })
+
+    socket.on('contact.human_takeover', async (payload, ack) => {
+        try {
+            const profileId = readTrimmed(payload?.profileId)
+            const jid = readTrimmed(payload?.jid)
+            const enabled = Boolean(payload?.enabled)
+
+            if (!profileId || !jid) {
+                const error = 'profileId and jid are required.'
+                if (typeof ack === 'function') ack({ success: false, error })
+                return
+            }
+            if (jid.endsWith('@g.us')) {
+                const error = 'Human takeover is not supported for groups.'
+                if (typeof ack === 'function') ack({ success: false, error })
+                return
+            }
+
+            const companyId = await getCompanyIdForProfile(profileId)
+            if (!companyId) {
+                const error = 'Company not found.'
+                if (typeof ack === 'function') ack({ success: false, error })
+                return
+            }
+
+            const phoneNumber = jid.replace(/@s\\.whatsapp\\.net$/, '').replace(/\\D/g, '')
+            if (!phoneNumber) {
+                const error = 'Invalid contact phone number.'
+                if (typeof ack === 'function') ack({ success: false, error })
+                return
+            }
+
+            const user = await findOrCreateUser(companyId, phoneNumber)
+            if (!user) {
+                const error = 'Failed to resolve contact.'
+                if (typeof ack === 'function') ack({ success: false, error })
+                return
+            }
+
+            const updated = await setUserHumanTakeover(user.id, enabled)
+            if (!updated) {
+                const error = 'Failed to update human takeover.'
+                if (typeof ack === 'function') ack({ success: false, error })
+                return
+            }
+
+            const contactPayload = { ...buildContactPayload(updated), id: `${phoneNumber}@s.whatsapp.net` }
+            io.to(getCompanyRoom(companyId)).emit('contacts.update', {
+                profileId,
+                contacts: [contactPayload]
+            })
+
+            if (typeof ack === 'function') {
+                ack({
+                    success: true,
+                    data: {
+                        contact: contactPayload
+                    }
+                })
+            }
+        } catch (err: any) {
+            const error = err?.message || 'Failed to update human takeover.'
+            if (typeof ack === 'function') ack({ success: false, error })
+            else socket.emit('profile.error', { message: error })
         }
     })
 

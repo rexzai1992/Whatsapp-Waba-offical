@@ -789,6 +789,16 @@ export default function FlowCanvas({
 }: FlowCanvasProps) {
     const [nodes, setNodes, onNodesChange] = useNodesState<Node>([]);
     const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
+    const nodesRef = React.useRef<Node[]>([]);
+    const edgesRef = React.useRef<Edge[]>([]);
+
+    useEffect(() => {
+        nodesRef.current = nodes;
+    }, [nodes]);
+
+    useEffect(() => {
+        edgesRef.current = edges;
+    }, [edges]);
 
     // Initialize nodes and edges from flow data
     useEffect(() => {
@@ -856,7 +866,7 @@ export default function FlowCanvas({
 
         setNodes(initialNodes);
         setEdges(initialEdges);
-    }, [flow?.id, flow?.nodes, tagOptions, variableOptions, staffOptions, workflowOptions, templateOptions]);
+    }, [flow?.id, flow?.nodes]);
 
     useEffect(() => {
         setNodes((nds) =>
@@ -885,27 +895,14 @@ export default function FlowCanvas({
         );
     }, []);
 
-    const handleNodeDelete = useCallback((id: string) => {
-        setNodes((nds) => nds.filter((node) => node.id !== id));
-        setEdges((eds) => eds.filter((edge) => edge.source !== id && edge.target !== id));
-    }, []);
-
-    const onConnect = useCallback((params: Connection) => {
-        setEdges((eds) => addEdge({
-            ...params,
-            animated: true,
-            className: 'stroke-[#00a884] stroke-2'
-        }, eds));
-    }, []);
-
-    const handleSave = () => {
-        const updatedNodes = nodes.map((n) => {
+    const buildFlowPayload = useCallback((inputNodes: Node[], inputEdges: Edge[]) => {
+        const updatedNodes = inputNodes.map((n) => {
             const nodeData = { ...n.data };
             delete nodeData.onChange;
             delete nodeData.onDelete;
 
             // Convert edges back to nextId/connections
-            const sourceEdges = edges.filter(e => e.source === n.id);
+            const sourceEdges = inputEdges.filter(e => e.source === n.id);
 
             if (n.type === 'QUESTION') {
                 const connections: any = {};
@@ -932,9 +929,28 @@ export default function FlowCanvas({
                 return { ...nodeData, type: n.type, position: n.position, nextId: nextEdge?.target || '' };
             }
         });
+        return { ...flow, nodes: updatedNodes };
+    }, [flow]);
 
-        onSave({ ...flow, nodes: updatedNodes });
-    };
+    const handleNodeDelete = useCallback((id: string) => {
+        const nextNodes = nodesRef.current.filter((node) => node.id !== id);
+        const nextEdges = edgesRef.current.filter((edge) => edge.source !== id && edge.target !== id);
+        setNodes(nextNodes);
+        setEdges(nextEdges);
+        onSave(buildFlowPayload(nextNodes, nextEdges));
+    }, [onSave, buildFlowPayload]);
+
+    const onConnect = useCallback((params: Connection) => {
+        setEdges((eds) => addEdge({
+            ...params,
+            animated: true,
+            className: 'stroke-[#00a884] stroke-2'
+        }, eds));
+    }, []);
+
+    const handleSave = useCallback(() => {
+        onSave(buildFlowPayload(nodesRef.current, edgesRef.current));
+    }, [onSave, buildFlowPayload]);
 
     const addNode = (type: string) => {
         const id = `node-${Date.now()}`;

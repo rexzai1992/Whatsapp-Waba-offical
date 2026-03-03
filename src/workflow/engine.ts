@@ -9,6 +9,7 @@ export type InboundContext = {
     profileId: string
     client: WabaClient
     phoneNumber: string
+    automationDisabled?: boolean
     messageType: string
     text?: string
     buttonId?: string
@@ -309,9 +310,9 @@ function evaluateCondition(action: any, state: WorkflowState, user: User, ctx: I
 }
 
 export class WorkflowEngine {
-    public async processInbound(ctx: InboundContext): Promise<{ error?: string }> {
+    public async processInbound(ctx: InboundContext): Promise<{ error?: string; handled: boolean }> {
         const user = await findOrCreateUser(ctx.companyId, ctx.phoneNumber)
-        if (!user) return {}
+        if (!user) return { handled: false }
 
         const inboundTimestamp = ctx.raw?.timestamp ? Number(ctx.raw.timestamp) * 1000 : null
         const inboundIso = inboundTimestamp && !Number.isNaN(inboundTimestamp)
@@ -369,6 +370,14 @@ export class WorkflowEngine {
             workflowState: currentState
         })
 
+        // Human takeover can pause all automation while still storing inbound messages.
+        if (ctx.automationDisabled) {
+            if (inboundRecord?.id && currentState) {
+                await updateMessageWorkflowState(inboundRecord.id, currentState)
+            }
+            return { handled: false }
+        }
+
         let workflow = null
         let state: WorkflowState | null = currentState
 
@@ -411,7 +420,7 @@ export class WorkflowEngine {
                     if (inboundRecord?.id) {
                         await updateMessageWorkflowState(inboundRecord.id, state)
                     }
-                    return {}
+                    return { handled: true }
                 }
 
                 const fallbackText =
@@ -423,7 +432,7 @@ export class WorkflowEngine {
                     if (inboundRecord?.id) {
                         await updateMessageWorkflowState(inboundRecord.id, state)
                     }
-                    return {}
+                    return { handled: true }
                 }
 
                 try {
@@ -438,7 +447,7 @@ export class WorkflowEngine {
                 } catch (error: any) {
                     console.warn('[Workflow] ask_question fallback failed:', error?.message || error)
                 }
-                return {}
+                return { handled: true }
             }
 
             const key = normalizeVariableKey(state.awaiting_input.save_as)
@@ -496,7 +505,7 @@ export class WorkflowEngine {
                     if (inboundRecord?.id) {
                         await updateMessageWorkflowState(inboundRecord.id, state)
                     }
-                    return {}
+                    return { handled: true }
                 }
 
                 const trimmedFallback = typeof fallbackText === 'string' ? fallbackText.trim() : ''
@@ -504,7 +513,7 @@ export class WorkflowEngine {
                     if (inboundRecord?.id) {
                         await updateMessageWorkflowState(inboundRecord.id, state)
                     }
-                    return {}
+                    return { handled: true }
                 }
 
                 try {
@@ -519,7 +528,7 @@ export class WorkflowEngine {
                 } catch (error: any) {
                     console.warn('[Workflow] fallback message failed:', error?.message || error)
                 }
-                return {}
+                return { handled: true }
             }
             if (matchedButtonId !== ctx.buttonId) {
                 ctx = { ...ctx, buttonId: matchedButtonId }
@@ -558,20 +567,20 @@ export class WorkflowEngine {
         }
 
         if (!workflow || !state) {
-            return {}
+            return { handled: false }
         }
 
         return this.runWorkflowActions(ctx, user, workflow, state)
     }
 
-    public async startWorkflow(ctx: InboundContext, workflowId: string): Promise<{ error?: string }> {
+    public async startWorkflow(ctx: InboundContext, workflowId: string): Promise<{ error?: string; handled: boolean }> {
         const user = await findOrCreateUser(ctx.companyId, ctx.phoneNumber)
-        if (!user) return {}
+        if (!user) return { handled: false }
 
         const workflow = await getWorkflowById(workflowId)
-        if (!workflow) return { error: 'Workflow not found.' }
+        if (!workflow) return { error: 'Workflow not found.', handled: false }
         if (workflow.company_id && workflow.company_id !== ctx.companyId) {
-            return { error: 'Workflow not found for this company.' }
+            return { error: 'Workflow not found for this company.', handled: false }
         }
 
         const memory = await getLatestWorkflowMemory(user.id)
@@ -591,13 +600,13 @@ export class WorkflowEngine {
         user: User,
         workflow: any,
         state: WorkflowState
-    ): Promise<{ error?: string }> {
+    ): Promise<{ error?: string; handled: boolean }> {
         state.vars = sanitizeVars(state.vars)
         state.qa_history = sanitizeQaHistory(state.qa_history)
 
         if (state.awaiting_buttons && state.awaiting_buttons.length > 0) {
             const matchedButtonId = resolveAwaitingButtonId(ctx, state.awaiting_buttons)
-            if (!matchedButtonId) return {}
+            if (!matchedButtonId) return { handled: true }
             state.fallback_count = 0
 
             const route = resolveRoute(state.awaiting_routes, matchedButtonId)
@@ -609,7 +618,7 @@ export class WorkflowEngine {
             }
         }
         if (state.awaiting_input?.save_as) {
-            return {}
+            return { handled: true }
         }
 
         state.awaiting_buttons = undefined
@@ -984,6 +993,6 @@ export class WorkflowEngine {
             state.step_index = index
         }
 
-        return lastError ? { error: lastError } : {}
+        return lastError ? { error: lastError, handled: true } : { handled: true }
     }
 }

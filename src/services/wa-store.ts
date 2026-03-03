@@ -35,6 +35,8 @@ export type MessageRecord = {
     created_at: string
 }
 
+export const HUMAN_TAKEOVER_TAG = 'human_takeover'
+
 const CTA_REPLY_WINDOW_MS = 24 * 60 * 60 * 1000
 const CTA_FREE_WINDOW_MS = 72 * 60 * 60 * 1000
 
@@ -374,6 +376,50 @@ export async function setUserTags(userId: string, tags: string[]): Promise<void>
     if (error) {
         console.warn('[DB] Failed to set user tags:', error.message)
     }
+}
+
+export function hasHumanTakeover(user: { tags?: string[] | null } | null | undefined): boolean {
+    if (!user || !Array.isArray(user.tags)) return false
+    return user.tags.some((tag) => String(tag).trim().toLowerCase() === HUMAN_TAKEOVER_TAG)
+}
+
+export async function setUserHumanTakeover(userId: string, enabled: boolean): Promise<User | null> {
+    const user = await getUserById(userId)
+    if (!user) return null
+
+    const tags = Array.isArray(user.tags) ? user.tags : []
+    const normalized = Array.from(
+        new Set(
+            tags
+                .map((tag) => (typeof tag === 'string' ? tag.trim() : ''))
+                .filter(Boolean)
+        )
+    )
+
+    const hasTag = normalized.some((tag) => tag.toLowerCase() === HUMAN_TAKEOVER_TAG)
+    if (enabled && !hasTag) {
+        normalized.push(HUMAN_TAKEOVER_TAG)
+    } else if (!enabled && hasTag) {
+        for (let i = normalized.length - 1; i >= 0; i -= 1) {
+            if (normalized[i].toLowerCase() === HUMAN_TAKEOVER_TAG) {
+                normalized.splice(i, 1)
+            }
+        }
+    }
+
+    const { data, error } = await supabase
+        .from('users')
+        .update({ tags: normalized })
+        .eq('id', userId)
+        .select('*')
+        .maybeSingle()
+
+    if (error) {
+        console.warn('[DB] Failed to set human takeover:', error.message)
+        return null
+    }
+
+    return (data || null) as User | null
 }
 
 export async function updateUserName(userId: string, name: string): Promise<void> {

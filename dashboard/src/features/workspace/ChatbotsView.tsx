@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { Bot, KeyRound, Loader2, RefreshCw, Save, Send, Sparkles, Trash2 } from 'lucide-react';
+import { Bot, KeyRound, Loader2, RefreshCw, Save, Trash2 } from 'lucide-react';
 
 type AiSettingsPayload = {
     enabled: boolean;
@@ -14,14 +14,10 @@ type AiSettingsPayload = {
     updatedAt?: string;
 };
 
-type SendResult = { success: boolean; error?: string };
-
 type ChatbotsViewProps = {
     profileId: string | null;
     sessionToken: string | null;
-    selectedChatId: string | null;
     apiBaseUrl: string;
-    onSendMessage: (jid: string, text: string) => Promise<SendResult> | SendResult;
 };
 
 const MODEL_OPTIONS = [
@@ -53,9 +49,7 @@ function formatSavedTime(value?: string): string {
 export default function ChatbotsView({
     profileId,
     sessionToken,
-    selectedChatId,
-    apiBaseUrl,
-    onSendMessage
+    apiBaseUrl
 }: ChatbotsViewProps) {
     const [settings, setSettings] = useState<AiSettingsPayload>(DEFAULT_SETTINGS);
     const [apiKeyInput, setApiKeyInput] = useState('');
@@ -63,20 +57,6 @@ export default function ChatbotsView({
     const [saving, setSaving] = useState(false);
     const [settingsError, setSettingsError] = useState<string | null>(null);
     const [settingsNotice, setSettingsNotice] = useState<string | null>(null);
-
-    const [contactJid, setContactJid] = useState('');
-    const [customerPrompt, setCustomerPrompt] = useState('');
-    const [generatedReply, setGeneratedReply] = useState('');
-    const [generating, setGenerating] = useState(false);
-    const [sending, setSending] = useState(false);
-    const [generateError, setGenerateError] = useState<string | null>(null);
-    const [generateMeta, setGenerateMeta] = useState<string | null>(null);
-
-    useEffect(() => {
-        if (!contactJid && selectedChatId) {
-            setContactJid(selectedChatId);
-        }
-    }, [contactJid, selectedChatId]);
 
     const canUseApi = useMemo(() => {
         return Boolean(profileId && sessionToken);
@@ -163,72 +143,10 @@ export default function ChatbotsView({
         }
     }, [apiBaseUrl, apiKeyInput, profileId, sessionToken, settings]);
 
-    const handleGenerate = useCallback(async () => {
-        if (!profileId || !sessionToken) return;
-        const prompt = customerPrompt.trim();
-        if (!prompt) {
-            setGenerateError('Enter customer text first.');
-            return;
-        }
-
-        setGenerating(true);
-        setGenerateError(null);
-        setGenerateMeta(null);
-        try {
-            const res = await fetch(`${apiBaseUrl}/api/company/ai/generate`, {
-                method: 'POST',
-                headers: {
-                    authorization: `Bearer ${sessionToken}`,
-                    'content-type': 'application/json'
-                },
-                body: JSON.stringify({
-                    profileId,
-                    prompt,
-                    contactJid: contactJid.trim()
-                })
-            });
-            const payload = await res.json().catch(() => null);
-            if (!res.ok || !payload?.success || !payload?.data?.reply) {
-                throw new Error(payload?.error || 'Failed to generate AI reply');
-            }
-            const reply = String(payload.data.reply || '').trim();
-            setGeneratedReply(reply);
-            const memoryCount = Number(payload.data.memoryMessagesUsed || 0);
-            const model = payload.data.model ? String(payload.data.model) : settings.model;
-            setGenerateMeta(`Model: ${model} | Memory messages: ${memoryCount}`);
-        } catch (error: any) {
-            setGenerateError(error?.message || 'Failed to generate AI reply');
-        } finally {
-            setGenerating(false);
-        }
-    }, [apiBaseUrl, contactJid, customerPrompt, profileId, sessionToken, settings.model]);
-
-    const handleSendGenerated = useCallback(async () => {
-        const jid = contactJid.trim();
-        const text = generatedReply.trim();
-        if (!jid || !text) {
-            setGenerateError('Contact JID and generated reply are required.');
-            return;
-        }
-        setSending(true);
-        setGenerateError(null);
-        try {
-            const result = await onSendMessage(jid, text);
-            if (!result?.success) {
-                throw new Error(result?.error || 'Failed to send generated message');
-            }
-            setGenerateMeta('Generated reply sent to WhatsApp.');
-        } catch (error: any) {
-            setGenerateError(error?.message || 'Failed to send generated message');
-        } finally {
-            setSending(false);
-        }
-    }, [contactJid, generatedReply, onSendMessage]);
-
     return (
         <div className="h-screen pt-[72px] bg-[#f8f9fa] text-[#111b21] font-sans">
             <div className="h-full p-6 overflow-y-auto custom-scrollbar">
-                <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,420px)_minmax(0,1fr)] gap-5">
+                <div className="max-w-[860px] mx-auto">
                     <section className="bg-white border border-[#eceff1] rounded-3xl shadow-[0_10px_30px_rgba(0,0,0,0.05)] p-5">
                         <div className="flex items-start justify-between gap-3">
                             <div>
@@ -270,7 +188,7 @@ export default function ChatbotsView({
                             <label className="flex items-center justify-between gap-3 rounded-2xl border border-[#eceff1] bg-[#f8f9fa] px-4 py-3">
                                 <div>
                                     <div className="text-sm font-bold text-[#111b21]">Enable AI assistant</div>
-                                    <div className="text-[11px] text-[#6b7280]">Use ChatGPT to draft replies.</div>
+                                    <div className="text-[11px] text-[#6b7280]">Auto-reply when no workflow is triggered, and use generator manually.</div>
                                 </div>
                                 <input
                                     type="checkbox"
@@ -409,82 +327,6 @@ export default function ChatbotsView({
                                     Save Settings
                                 </button>
                             </div>
-                        </div>
-                    </section>
-
-                    <section className="bg-white border border-[#eceff1] rounded-3xl shadow-[0_10px_30px_rgba(0,0,0,0.05)] p-5">
-                        <div className="flex items-center gap-2">
-                            <Sparkles className="w-5 h-5 text-[#00a884]" />
-                            <h3 className="text-xl font-black text-[#111b21]">Reply Generator</h3>
-                        </div>
-                        <p className="text-sm text-[#54656f] mt-1">
-                            Generate a customer reply and send it directly to WhatsApp.
-                        </p>
-
-                        <div className="mt-5 space-y-4">
-                            <label className="block space-y-1">
-                                <span className="text-[11px] font-black uppercase tracking-widest text-[#54656f]">Contact JID</span>
-                                <input
-                                    type="text"
-                                    value={contactJid}
-                                    onChange={(e) => setContactJid(e.target.value)}
-                                    placeholder={selectedChatId || '60123456789@s.whatsapp.net'}
-                                    className="w-full rounded-xl border border-[#eceff1] bg-white px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-[#00a884]/20"
-                                />
-                            </label>
-
-                            <label className="block space-y-1">
-                                <span className="text-[11px] font-black uppercase tracking-widest text-[#54656f]">Customer Text</span>
-                                <textarea
-                                    rows={5}
-                                    value={customerPrompt}
-                                    onChange={(e) => setCustomerPrompt(e.target.value)}
-                                    placeholder="Paste the customer message here"
-                                    className="w-full rounded-xl border border-[#eceff1] bg-white px-3 py-2.5 text-sm text-[#111b21] focus:outline-none focus:ring-2 focus:ring-[#00a884]/20 resize-y"
-                                />
-                            </label>
-
-                            <button
-                                type="button"
-                                onClick={handleGenerate}
-                                disabled={!canUseApi || generating}
-                                className="px-4 py-2.5 rounded-xl bg-[#111b21] text-white text-xs font-bold uppercase tracking-wider hover:bg-[#202c33] transition-all disabled:opacity-60 flex items-center gap-2"
-                            >
-                                {generating ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
-                                Generate Reply
-                            </button>
-
-                            <label className="block space-y-1">
-                                <span className="text-[11px] font-black uppercase tracking-widest text-[#54656f]">Generated Reply</span>
-                                <textarea
-                                    rows={7}
-                                    value={generatedReply}
-                                    onChange={(e) => setGeneratedReply(e.target.value)}
-                                    placeholder="AI reply will appear here"
-                                    className="w-full rounded-xl border border-[#eceff1] bg-[#f8f9fa] px-3 py-2.5 text-sm text-[#111b21] focus:outline-none focus:ring-2 focus:ring-[#00a884]/20 resize-y"
-                                />
-                            </label>
-
-                            {generateError && (
-                                <div className="px-3 py-2 rounded-xl bg-rose-50 border border-rose-200 text-rose-600 text-xs font-semibold">
-                                    {generateError}
-                                </div>
-                            )}
-                            {generateMeta && (
-                                <div className="px-3 py-2 rounded-xl bg-[#f0f7ff] border border-[#dbeafe] text-[#1d4ed8] text-xs font-semibold">
-                                    {generateMeta}
-                                </div>
-                            )}
-
-                            <button
-                                type="button"
-                                onClick={handleSendGenerated}
-                                disabled={sending || !generatedReply.trim() || !contactJid.trim()}
-                                className="px-4 py-2.5 rounded-xl bg-[#00a884] text-white text-xs font-bold uppercase tracking-wider hover:bg-[#008f6f] transition-all disabled:opacity-60 flex items-center gap-2"
-                            >
-                                {sending ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
-                                Send To WhatsApp
-                            </button>
                         </div>
                     </section>
                 </div>
