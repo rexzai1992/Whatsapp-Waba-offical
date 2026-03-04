@@ -1,5 +1,77 @@
 import express, { type Express } from 'express'
 
+const COMMAND_MAX_COUNT = 30
+const COMMAND_NAME_MAX_LENGTH = 32
+const COMMAND_DESCRIPTION_MAX_LENGTH = 256
+const COMMAND_NAME_REGEX = /^[a-z0-9_-]+$/
+const EMOJI_REGEX = /\p{Extended_Pictographic}/u
+
+type ConversationalCommand = {
+    command_name: string
+    command_description: string
+}
+
+function trimText(value: any): string {
+    return typeof value === 'string' ? value.trim() : ''
+}
+
+function sanitizeCommandName(value: any): string {
+    return trimText(value).replace(/^\/+/, '').toLowerCase()
+}
+
+function sanitizeConversationalCommands(rawCommands: any): ConversationalCommand[] {
+    if (!Array.isArray(rawCommands)) return []
+
+    const cleaned: ConversationalCommand[] = []
+    const seen = new Set<string>()
+
+    for (let index = 0; index < rawCommands.length; index += 1) {
+        const item = rawCommands[index] || {}
+        const commandName = sanitizeCommandName(item.command_name)
+        const commandDescription = trimText(item.command_description)
+        const label = `commands[${index}]`
+
+        if (!commandName && !commandDescription) continue
+        if (!commandName || !commandDescription) {
+            throw new Error(`${label} requires both command_name and command_description`)
+        }
+        if (commandName.length > COMMAND_NAME_MAX_LENGTH) {
+            throw new Error(`${label}.command_name must be at most ${COMMAND_NAME_MAX_LENGTH} characters`)
+        }
+        if (commandDescription.length > COMMAND_DESCRIPTION_MAX_LENGTH) {
+            throw new Error(`${label}.command_description must be at most ${COMMAND_DESCRIPTION_MAX_LENGTH} characters`)
+        }
+        if (!COMMAND_NAME_REGEX.test(commandName)) {
+            throw new Error(`${label}.command_name supports lowercase letters, numbers, underscore, and hyphen only`)
+        }
+        if (EMOJI_REGEX.test(commandName) || EMOJI_REGEX.test(commandDescription)) {
+            throw new Error(`${label} does not support emoji`)
+        }
+        if (seen.has(commandName)) {
+            throw new Error(`Duplicate command_name "${commandName}" is not allowed`)
+        }
+
+        seen.add(commandName)
+        cleaned.push({
+            command_name: commandName,
+            command_description: commandDescription
+        })
+    }
+
+    if (cleaned.length > COMMAND_MAX_COUNT) {
+        throw new Error(`commands supports up to ${COMMAND_MAX_COUNT} items`)
+    }
+
+    return cleaned
+}
+
+function sanitizeConversationalPrompts(rawPrompts: any): string[] {
+    if (!Array.isArray(rawPrompts)) return []
+    return rawPrompts
+        .map((value) => trimText(value))
+        .filter(Boolean)
+}
+
 export function registerWabaRoutes(app: Express, ctx: any) {
     const {
         assertProfileCompany,
@@ -74,7 +146,17 @@ app.post('/api/waba/conversational-automation', async (req: any, res: any) => {
             return res.status(503).json({ success: false, error: 'WABA not configured for this profile.' })
         }
 
-        const { enable_welcome_message, commands, prompts } = req.body || {}
+        let commands: ConversationalCommand[] = []
+        let prompts: string[] = []
+        try {
+            commands = sanitizeConversationalCommands(req.body?.commands)
+            prompts = sanitizeConversationalPrompts(req.body?.prompts)
+        } catch (validationError: any) {
+            return res.status(400).json({ success: false, error: validationError?.message || 'Invalid conversational components payload' })
+        }
+
+        const enableWelcomeRaw = req.body?.enable_welcome_message
+        const enable_welcome_message = enableWelcomeRaw === undefined ? undefined : Boolean(enableWelcomeRaw)
         const response = await client.setConversationalAutomation({
             enable_welcome_message,
             commands,

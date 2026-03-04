@@ -27,6 +27,11 @@ type TeamUser = {
     lastSignInAt?: string | null;
 };
 
+type ConversationalCommand = {
+    command_name: string;
+    command_description: string;
+};
+
 const TEAM_DEPARTMENT_OPTIONS: Array<{ value: TeamDepartment; label: string }> = [
     { value: 'finance', label: 'Finance' },
     { value: 'sales', label: 'Sales' },
@@ -41,6 +46,70 @@ const normalizeTeamDepartment = (value: unknown): TeamDepartment => {
         return lower;
     }
     return 'custom';
+};
+
+const COMMAND_MAX_COUNT = 30;
+const COMMAND_NAME_MAX_LENGTH = 32;
+const COMMAND_DESCRIPTION_MAX_LENGTH = 256;
+const COMMAND_NAME_REGEX = /^[a-z0-9_-]+$/;
+const EMOJI_REGEX = /\p{Extended_Pictographic}/u;
+
+const normalizeCommandName = (value: unknown): string =>
+    (typeof value === 'string' ? value.trim() : '').replace(/^\/+/, '').toLowerCase();
+
+const normalizeCommandDescription = (value: unknown): string =>
+    typeof value === 'string' ? value.trim() : '';
+
+const sanitizeCommandInput = (value: unknown): ConversationalCommand[] => {
+    if (!Array.isArray(value)) return [];
+    const next: ConversationalCommand[] = [];
+    value.forEach((item: any) => {
+        const command_name = normalizeCommandName(item?.command_name);
+        const command_description = normalizeCommandDescription(item?.command_description);
+        if (!command_name && !command_description) return;
+        next.push({ command_name, command_description });
+    });
+    return next.slice(0, COMMAND_MAX_COUNT);
+};
+
+const validateCommandsForSave = (commands: ConversationalCommand[]): { commands: ConversationalCommand[]; error: string | null } => {
+    if (commands.length > COMMAND_MAX_COUNT) {
+        return { commands: [], error: `Maximum ${COMMAND_MAX_COUNT} commands are allowed.` };
+    }
+
+    const seen = new Set<string>();
+    const cleaned: ConversationalCommand[] = [];
+
+    for (let i = 0; i < commands.length; i += 1) {
+        const command_name = normalizeCommandName(commands[i]?.command_name);
+        const command_description = normalizeCommandDescription(commands[i]?.command_description);
+        const label = `Command ${i + 1}`;
+
+        if (!command_name && !command_description) continue;
+        if (!command_name || !command_description) {
+            return { commands: [], error: `${label}: both command and hint are required.` };
+        }
+        if (command_name.length > COMMAND_NAME_MAX_LENGTH) {
+            return { commands: [], error: `${label}: command must be at most ${COMMAND_NAME_MAX_LENGTH} characters.` };
+        }
+        if (command_description.length > COMMAND_DESCRIPTION_MAX_LENGTH) {
+            return { commands: [], error: `${label}: hint must be at most ${COMMAND_DESCRIPTION_MAX_LENGTH} characters.` };
+        }
+        if (!COMMAND_NAME_REGEX.test(command_name)) {
+            return { commands: [], error: `${label}: command supports a-z, 0-9, underscore, and hyphen only.` };
+        }
+        if (EMOJI_REGEX.test(command_name) || EMOJI_REGEX.test(command_description)) {
+            return { commands: [], error: `${label}: emojis are not supported.` };
+        }
+        if (seen.has(command_name)) {
+            return { commands: [], error: `${label}: duplicate command "/${command_name}" is not allowed.` };
+        }
+
+        seen.add(command_name);
+        cleaned.push({ command_name, command_description });
+    }
+
+    return { commands: cleaned, error: null };
 };
 
 type WebhookViewProps = {
@@ -73,7 +142,7 @@ export default function WebhookView({
     const [autoConfig, setAutoConfig] = useState<{
         enable_welcome_message: boolean;
         prompts: string[];
-        commands: Array<{ command_name: string; command_description: string }>;
+        commands: ConversationalCommand[];
     }>({
         enable_welcome_message: false,
         prompts: [],
@@ -81,6 +150,7 @@ export default function WebhookView({
     });
     const [autoLoading, setAutoLoading] = useState(false);
     const [autoSaving, setAutoSaving] = useState(false);
+    const [autoError, setAutoError] = useState<string | null>(null);
     const [reminderConfig, setReminderConfig] = useState<{
         enabled: boolean;
         minutes: number | '';
@@ -646,6 +716,7 @@ export default function WebhookView({
     const fetchAutomation = () => {
         if (!sessionToken || !profileId) return;
         setAutoLoading(true);
+        setAutoError(null);
         fetch(`${SOCKET_URL}/api/waba/conversational-automation?profileId=${profileId}`, {
             headers: {
                 Authorization: `Bearer ${sessionToken}`
@@ -665,7 +736,7 @@ export default function WebhookView({
                 setAutoConfig({
                     enable_welcome_message: Boolean(ca.enable_welcome_message),
                     prompts: Array.isArray(ca.prompts) ? ca.prompts : [],
-                    commands: Array.isArray(ca.commands) ? ca.commands : []
+                    commands: sanitizeCommandInput(ca.commands)
                 });
             })
             .finally(() => setAutoLoading(false));
@@ -701,16 +772,26 @@ export default function WebhookView({
 
     const handleSaveAutomation = () => {
         if (!sessionToken) return;
+        setAutoError(null);
+        const validatedCommands = validateCommandsForSave(autoConfig.commands || []);
+        if (validatedCommands.error) {
+            setAutoError(validatedCommands.error);
+            return;
+        }
+
+        const prompts = (autoConfig.prompts || []).map(p => p.trim()).filter(Boolean);
+        const commands = validatedCommands.commands;
+
+        setAutoConfig(prev => ({
+            ...prev,
+            prompts,
+            commands
+        }));
         setAutoSaving(true);
         const payload = {
             enable_welcome_message: autoConfig.enable_welcome_message,
-            prompts: (autoConfig.prompts || []).map(p => p.trim()).filter(Boolean),
-            commands: (autoConfig.commands || [])
-                .map(c => ({
-                    command_name: (c.command_name || '').trim(),
-                    command_description: (c.command_description || '').trim()
-                }))
-                .filter(c => c.command_name && c.command_description),
+            prompts,
+            commands,
             profileId
         };
         fetch(`${SOCKET_URL}/api/waba/conversational-automation`, {
@@ -732,8 +813,10 @@ export default function WebhookView({
             })
             .then(data => {
                 if (data?.success) {
+                    setAutoError(null);
                     alert('Conversational components saved.');
                 } else {
+                    setAutoError(data?.error || 'Failed to save conversational components');
                     alert(data?.error || 'Failed to save conversational components');
                 }
             })
@@ -1338,7 +1421,7 @@ export default function WebhookView({
                                             prompts: [...(prev.prompts || []), '']
                                         }))
                                     }}
-                                    className="text-[11px] font-bold text-[#00a884] hover:underline"
+                                    className="text-[11px] font-bold text-[#00a884] hover:underline disabled:opacity-50 disabled:no-underline"
                                 >
                                     + Add
                                 </button>
@@ -1378,32 +1461,50 @@ export default function WebhookView({
                                 <span className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Commands</span>
                                 <button
                                     onClick={() => {
+                                        if ((autoConfig.commands || []).length >= COMMAND_MAX_COUNT) {
+                                            setAutoError(`Maximum ${COMMAND_MAX_COUNT} commands are allowed.`);
+                                            return;
+                                        }
+                                        setAutoError(null);
                                         setAutoConfig(prev => ({
                                             ...prev,
                                             commands: [...(prev.commands || []), { command_name: '', command_description: '' }]
                                         }))
                                     }}
+                                    disabled={(autoConfig.commands || []).length >= COMMAND_MAX_COUNT}
                                     className="text-[11px] font-bold text-[#00a884] hover:underline"
                                 >
                                     + Add
                                 </button>
                             </div>
+                            <p className="text-[11px] text-[#8696a0] leading-relaxed mb-3">
+                                Add up to {COMMAND_MAX_COUNT} slash commands. Users type <code className="font-mono">/command</code> in WhatsApp.
+                                Command max {COMMAND_NAME_MAX_LENGTH} chars and hint max {COMMAND_DESCRIPTION_MAX_LENGTH} chars. Emojis are not supported.
+                            </p>
                             <div className="space-y-3">
                                 {(autoConfig.commands || []).map((cmd, idx) => (
                                     <div key={idx} className="space-y-2 bg-white p-3 rounded-xl border border-[#eceff1]">
-                                        <input
-                                            className="w-full bg-[#f8f9fa] border border-[#eceff1] rounded-lg px-3 py-2 text-xs font-bold text-[#111b21] focus:outline-none focus:border-[#00a884]"
-                                            value={cmd.command_name}
-                                            onChange={(e) => {
-                                                const next = [...(autoConfig.commands || [])];
-                                                next[idx] = { ...next[idx], command_name: e.target.value };
-                                                setAutoConfig(prev => ({ ...prev, commands: next }));
-                                            }}
-                                            placeholder="tickets"
-                                        />
+                                        <div className="flex items-center gap-2">
+                                            <span className="text-xs font-bold text-[#54656f] w-4 text-center">/</span>
+                                            <input
+                                                className="flex-1 bg-[#f8f9fa] border border-[#eceff1] rounded-lg px-3 py-2 text-xs font-bold text-[#111b21] focus:outline-none focus:border-[#00a884]"
+                                                value={cmd.command_name}
+                                                maxLength={COMMAND_NAME_MAX_LENGTH}
+                                                onChange={(e) => {
+                                                    const next = [...(autoConfig.commands || [])];
+                                                    next[idx] = { ...next[idx], command_name: e.target.value };
+                                                    setAutoConfig(prev => ({ ...prev, commands: next }));
+                                                }}
+                                                placeholder="tickets"
+                                            />
+                                            <span className="text-[10px] text-[#8696a0] w-14 text-right">
+                                                {normalizeCommandName(cmd.command_name).length}/{COMMAND_NAME_MAX_LENGTH}
+                                            </span>
+                                        </div>
                                         <input
                                             className="w-full bg-[#f8f9fa] border border-[#eceff1] rounded-lg px-3 py-2 text-xs text-[#111b21] focus:outline-none focus:border-[#00a884]"
                                             value={cmd.command_description}
+                                            maxLength={COMMAND_DESCRIPTION_MAX_LENGTH}
                                             onChange={(e) => {
                                                 const next = [...(autoConfig.commands || [])];
                                                 next[idx] = { ...next[idx], command_description: e.target.value };
@@ -1411,6 +1512,14 @@ export default function WebhookView({
                                             }}
                                             placeholder="Book flight tickets"
                                         />
+                                        <div className="flex items-center justify-between">
+                                            <p className="text-[10px] text-[#8696a0]">
+                                                Hint shown in WhatsApp command menu.
+                                            </p>
+                                            <span className="text-[10px] text-[#8696a0]">
+                                                {normalizeCommandDescription(cmd.command_description).length}/{COMMAND_DESCRIPTION_MAX_LENGTH}
+                                            </span>
+                                        </div>
                                         <button
                                             onClick={() => {
                                                 const next = (autoConfig.commands || []).filter((_, i) => i !== idx);
@@ -1428,6 +1537,12 @@ export default function WebhookView({
                             </div>
                         </div>
                     </div>
+
+                    {autoError && (
+                        <div className="mt-5 bg-rose-50 border border-rose-200 text-rose-700 rounded-2xl px-4 py-3 text-sm font-medium">
+                            {autoError}
+                        </div>
+                    )}
 
                     <div className="mt-6 flex items-center justify-end gap-3">
                         <button
