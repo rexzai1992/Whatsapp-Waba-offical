@@ -232,6 +232,7 @@ const CHAT_ROW_HEIGHT = 86;
 const MESSAGE_DRAFT_STORAGE_PREFIX = 'draftMessage:';
 const ONBOARDING_TOUR_STORAGE_PREFIX = 'onboardingTourSeen:';
 const ONBOARDING_TOUR_VERSION = 'v1';
+const ENABLE_FIRST_TIME_SETUP = false;
 const ONBOARDING_SETUP_DEFAULTS: Record<OnboardingFieldKey, string> = {
     wabaId: '',
     phoneNumberId: '',
@@ -1291,6 +1292,11 @@ export default function App() {
     }, [session]);
 
     useEffect(() => {
+        if (!ENABLE_FIRST_TIME_SETUP) {
+            setShowOnboardingTutorial(false);
+            resetOnboardingWizard();
+            return;
+        }
         if (authChecking || hostAuthError) return;
         if (!session?.user?.id || !onboardingStorageKey || !isAdmin || isWabaProviderAdmin) {
             setShowOnboardingTutorial(false);
@@ -3582,7 +3588,7 @@ export default function App() {
 
             {/* First Login Onboarding */}
             <OnboardingTutorialModal
-                open={showOnboardingTutorial}
+                open={ENABLE_FIRST_TIME_SETUP && showOnboardingTutorial}
                 currentStep={currentOnboardingStep}
                 steps={onboardingSteps}
                 stepIndex={onboardingStep}
