@@ -4174,9 +4174,29 @@ app.use(errorHandler)
 const frontendPath = path.join(process.cwd(), 'dashboard/dist')
 if (fs.existsSync(frontendPath)) {
     console.log('Serving frontend from:', frontendPath)
-    app.use(express.static(frontendPath))
-    // Express 5 + path-to-regexp v6: use regex fallback instead of '*' patterns
-    app.get(/^(?!\/api|\/addon|\/socket\.io).*/, (req: any, res: any) => {
+    const assetsPath = path.join(frontendPath, 'assets')
+    if (fs.existsSync(assetsPath)) {
+        app.use('/assets', express.static(assetsPath, {
+            fallthrough: false,
+            immutable: true,
+            maxAge: '1y'
+        }))
+    }
+    app.use(express.static(frontendPath, {
+        index: false,
+        setHeaders: (res, filePath) => {
+            if (filePath.endsWith('.html')) {
+                res.setHeader('Cache-Control', 'no-cache')
+            }
+        }
+    }))
+    // Express 5 + path-to-regexp v6: use regex fallback instead of '*' patterns.
+    // Do not fallback requests that look like static files (e.g. *.js, *.css).
+    app.get(/^(?!\/api|\/addon|\/socket\.io|\/assets\/).*/, (req: any, res: any) => {
+        if (path.extname(req.path || '')) {
+            return res.status(404).send('Not Found')
+        }
+        res.setHeader('Cache-Control', 'no-cache')
         res.sendFile(path.join(frontendPath, 'index.html'))
     })
 }
