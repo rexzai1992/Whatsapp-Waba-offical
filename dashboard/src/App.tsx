@@ -74,6 +74,7 @@ import {
 
 const SOCKET_URL = getSocketUrl();
 const SINGLE_PROFILE_MODE = true;
+const OAUTH_PENDING_COMPANY_KEY = 'pendingOAuthCompanyId';
 
 const LazyWebhookView = lazy(() => import('./WebhookView'));
 const LazyBroadcastTemplateBuilder = lazy(() => import('./BroadcastTemplateBuilder'));
@@ -1216,6 +1217,11 @@ export default function App() {
         setHostAuthError(null);
         setShowOnboardingTutorial(false);
         resetOnboardingWizard();
+        try {
+            window.localStorage.removeItem(OAUTH_PENDING_COMPANY_KEY);
+        } catch {
+            // ignore
+        }
         await supabase.auth.signOut();
         setSession(null);
     };
@@ -1240,8 +1246,16 @@ export default function App() {
             return;
         }
 
+        let pendingCompanyId = '';
+        try {
+            pendingCompanyId = window.localStorage.getItem(OAUTH_PENDING_COMPANY_KEY) || '';
+        } catch {
+            pendingCompanyId = '';
+        }
+
         const hostCompanyId = resolveCompanyIdFromLocation();
-        if (!hostCompanyId) {
+        const requiredCompanyId = String(hostCompanyId || pendingCompanyId || '').trim().toLowerCase();
+        if (!requiredCompanyId) {
             setHostAuthError(null);
             return;
         }
@@ -1251,7 +1265,12 @@ export default function App() {
             (session.user.app_metadata as any)?.company_id ||
             '';
         const userCompany = String(userCompanyRaw || '').trim().toLowerCase();
-        if (userCompany === hostCompanyId) {
+        if (userCompany === requiredCompanyId) {
+            try {
+                window.localStorage.removeItem(OAUTH_PENDING_COMPANY_KEY);
+            } catch {
+                // ignore
+            }
             setHostAuthError(null);
             return;
         }
@@ -1261,6 +1280,11 @@ export default function App() {
             : 'This account is not assigned to any company. Ask your admin to set up your account first.';
 
         setHostAuthError(message);
+        try {
+            window.localStorage.removeItem(OAUTH_PENDING_COMPANY_KEY);
+        } catch {
+            // ignore
+        }
         supabase.auth.signOut().finally(() => {
             setSession(null);
         });
@@ -2402,7 +2426,7 @@ export default function App() {
     if (!session) {
         return (
             <Login
-                forcedMessage={resolveCompanyIdFromLocation() ? hostAuthError : null}
+                forcedMessage={hostAuthError}
                 onLogin={(nextSession) => {
                     setHostAuthError(null);
                     setSession(nextSession);

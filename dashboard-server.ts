@@ -24,6 +24,7 @@ import { createApiKeyStore } from './dashboard-server/services/apiKeyStore'
 import { createWebhookStore } from './dashboard-server/services/webhookStore'
 import { registerFlowRoutes } from './dashboard-server/routes/flowRoutes'
 import { registerPublicInfoRoutes } from './dashboard-server/routes/publicInfoRoutes'
+import { registerPublicAuthRoutes } from './dashboard-server/routes/publicAuthRoutes'
 import { registerWabaRoutes } from './dashboard-server/routes/wabaRoutes'
 import { registerCompanyRoutes } from './dashboard-server/routes/companyRoutes'
 import { registerAiRoutes } from './dashboard-server/routes/aiRoutes'
@@ -2588,6 +2589,8 @@ registerFlowRoutes(app, {
     lowerBound,
     WINDOW_MS
 })
+
+registerPublicAuthRoutes(app, { supabase })
 
 // ============================================
 // API KEY AUTHENTICATION MIDDLEWARE
