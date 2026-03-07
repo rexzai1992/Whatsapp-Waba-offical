@@ -33,10 +33,24 @@ type InvoiceListItem = {
 
 type DraftInvoiceItem = {
     id: string;
+    product_id: string;
     item_name: string;
     description: string;
     quantity: string;
     unit_price: string;
+};
+
+type StoreProduct = {
+    id: string;
+    name: string;
+    slug: string;
+    sku: string | null;
+    description: string | null;
+    price: number;
+    currency: string;
+    stock_qty: number;
+    image_url: string | null;
+    is_active: boolean;
 };
 
 type GenerationOutput = {
@@ -57,6 +71,7 @@ type InvoicesViewProps = {
 
 const createDraftItem = (): DraftInvoiceItem => ({
     id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    product_id: '',
     item_name: '',
     description: '',
     quantity: '1',
@@ -133,6 +148,15 @@ export default function InvoicesView({
     const [saveClient, setSaveClient] = useState(false);
 
     const [items, setItems] = useState<DraftInvoiceItem[]>([createDraftItem()]);
+    const [productsLoading, setProductsLoading] = useState(false);
+    const [productsError, setProductsError] = useState<string | null>(null);
+    const [products, setProducts] = useState<StoreProduct[]>([]);
+    const [catalogPickId, setCatalogPickId] = useState('');
+    const [newProductName, setNewProductName] = useState('');
+    const [newProductPrice, setNewProductPrice] = useState('0');
+    const [newProductSku, setNewProductSku] = useState('');
+    const [newProductDescription, setNewProductDescription] = useState('');
+    const [productSubmitting, setProductSubmitting] = useState(false);
 
     const canUseApi = Boolean(sessionToken);
 
@@ -232,10 +256,44 @@ export default function InvoicesView({
         }
     }, [apiBaseUrl, sessionToken]);
 
+    const loadProducts = useCallback(async () => {
+        if (!sessionToken) return;
+        setProductsLoading(true);
+        setProductsError(null);
+        try {
+            const res = await fetch(`${apiBaseUrl}/api/store/products?limit=200`, {
+                headers: { authorization: `Bearer ${sessionToken}` }
+            });
+            const payload = await res.json().catch(() => null);
+            if (!res.ok || !payload?.success || !Array.isArray(payload?.data)) {
+                throw new Error(payload?.error || 'Failed to load products');
+            }
+            const mapped: StoreProduct[] = payload.data.map((row: any) => ({
+                id: safeString(row.id),
+                name: safeString(row.name),
+                slug: safeString(row.slug),
+                sku: typeof row.sku === 'string' ? row.sku : null,
+                description: typeof row.description === 'string' ? row.description : null,
+                price: Number(row.price || 0),
+                currency: safeString(row.currency || 'USD'),
+                stock_qty: Number(row.stock_qty || 0),
+                image_url: typeof row.image_url === 'string' ? row.image_url : null,
+                is_active: row.is_active !== false
+            }));
+            setProducts(mapped);
+            setCatalogPickId((prev) => (prev || mapped[0]?.id || ''));
+        } catch (error: any) {
+            setProductsError(error?.message || 'Failed to load products');
+        } finally {
+            setProductsLoading(false);
+        }
+    }, [apiBaseUrl, sessionToken]);
+
     useEffect(() => {
         loadPreset();
         loadInvoices();
-    }, [loadInvoices, loadPreset]);
+        loadProducts();
+    }, [loadInvoices, loadPreset, loadProducts]);
 
     useEffect(() => {
         if (!sendInvoiceId && invoices.length > 0) {
@@ -257,6 +315,44 @@ export default function InvoicesView({
     const updateItem = useCallback((itemId: string, key: keyof DraftInvoiceItem, value: string) => {
         setItems((prev) => prev.map((item) => (item.id === itemId ? { ...item, [key]: value } : item)));
     }, []);
+
+    const applyProductToItem = useCallback((itemId: string, productId: string) => {
+        setItems((prev) => prev.map((item) => {
+            if (item.id !== itemId) return item;
+            if (!productId) {
+                return { ...item, product_id: '' };
+            }
+            const product = products.find((row) => row.id === productId);
+            if (!product) return { ...item, product_id: '' };
+            return {
+                ...item,
+                product_id: product.id,
+                item_name: product.name,
+                description: product.description || '',
+                unit_price: String(product.price || 0)
+            };
+        }));
+    }, [products]);
+
+    const handleAddProductItem = useCallback(() => {
+        const product = products.find((row) => row.id === catalogPickId);
+        if (!product) {
+            setFormError('Pick a product first.');
+            return;
+        }
+        setItems((prev) => [
+            ...prev,
+            {
+                id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+                product_id: product.id,
+                item_name: product.name,
+                description: product.description || '',
+                quantity: '1',
+                unit_price: String(product.price || 0)
+            }
+        ]);
+        setFormError(null);
+    }, [catalogPickId, products]);
 
     const removeItem = useCallback((itemId: string) => {
         setItems((prev) => {
@@ -298,6 +394,7 @@ export default function InvoicesView({
                 notes: notes.trim() || undefined,
                 payment_instructions: paymentInstructions.trim() || undefined,
                 items: validItems.map((item) => ({
+                    product_id: item.product_id || undefined,
                     item_name: item.item_name.trim(),
                     description: item.description.trim() || undefined,
                     quantity: item.quantity,
@@ -383,6 +480,66 @@ export default function InvoicesView({
         paymentInstructions,
         resetForm,
         saveClient,
+        sessionToken
+    ]);
+
+    const handleCreateProduct = useCallback(async () => {
+        if (!sessionToken) {
+            setProductsError('Please sign in first.');
+            return;
+        }
+        if (!newProductName.trim()) {
+            setProductsError('Product name is required.');
+            return;
+        }
+
+        const priceValue = parseMoney(newProductPrice);
+        if (!Number.isFinite(priceValue) || priceValue < 0) {
+            setProductsError('Product price must be >= 0.');
+            return;
+        }
+
+        setProductSubmitting(true);
+        setProductsError(null);
+        try {
+            const res = await fetch(`${apiBaseUrl}/api/store/products`, {
+                method: 'POST',
+                headers: {
+                    authorization: `Bearer ${sessionToken}`,
+                    'content-type': 'application/json'
+                },
+                body: JSON.stringify({
+                    name: newProductName.trim(),
+                    price: priceValue,
+                    currency: currency.trim() || 'USD',
+                    sku: newProductSku.trim() || undefined,
+                    description: newProductDescription.trim() || undefined
+                })
+            });
+            const payload = await res.json().catch(() => null);
+            if (!res.ok || !payload?.success) {
+                throw new Error(payload?.error || 'Failed to create product');
+            }
+
+            setNewProductName('');
+            setNewProductPrice('0');
+            setNewProductSku('');
+            setNewProductDescription('');
+            setFormNotice('Product added to webstore catalog.');
+            loadProducts();
+        } catch (error: any) {
+            setProductsError(error?.message || 'Failed to create product');
+        } finally {
+            setProductSubmitting(false);
+        }
+    }, [
+        apiBaseUrl,
+        currency,
+        loadProducts,
+        newProductDescription,
+        newProductName,
+        newProductPrice,
+        newProductSku,
         sessionToken
     ]);
 
@@ -473,11 +630,12 @@ export default function InvoicesView({
                                 onClick={() => {
                                     loadPreset();
                                     loadInvoices();
+                                    loadProducts();
                                 }}
-                                disabled={!canUseApi || presetLoading || listLoading}
+                                disabled={!canUseApi || presetLoading || listLoading || productsLoading}
                                 className="px-3 py-2 rounded-xl border border-[#eceff1] bg-white text-[#111b21] text-xs font-bold hover:bg-[#f8f9fa] transition-all disabled:opacity-50"
                             >
-                                <RefreshCw className={`w-4 h-4 ${presetLoading || listLoading ? 'animate-spin' : ''}`} />
+                                <RefreshCw className={`w-4 h-4 ${presetLoading || listLoading || productsLoading ? 'animate-spin' : ''}`} />
                             </button>
                         </div>
 
@@ -509,6 +667,11 @@ export default function InvoicesView({
                         {sendNotice && (
                             <div className="mt-4 px-3 py-2 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-700 text-xs font-semibold">
                                 {sendNotice}
+                            </div>
+                        )}
+                        {productsError && (
+                            <div className="mt-4 px-3 py-2 rounded-xl bg-rose-50 border border-rose-200 text-rose-600 text-xs font-semibold">
+                                {productsError}
                             </div>
                         )}
 
@@ -610,17 +773,104 @@ export default function InvoicesView({
                             </div>
                         </div>
 
-                        <div className="mt-6">
-                            <div className="flex items-center justify-between mb-2">
-                                <h3 className="text-sm font-black uppercase tracking-widest text-[#54656f]">Invoice Items</h3>
+                        <div className="mt-6 rounded-2xl border border-[#eceff1] bg-[#f8f9fa] p-4">
+                            <div className="flex items-center justify-between mb-3">
+                                <h3 className="text-sm font-black uppercase tracking-widest text-[#54656f]">Webstore Products</h3>
+                                {preset?.company_id && (
+                                    <div className="flex items-center gap-2">
+                                        <a
+                                            href={`${window.location.origin}/${preset.company_id}/store`}
+                                            target="_blank"
+                                            rel="noopener noreferrer"
+                                            className="inline-flex items-center gap-1 text-[#00a884] text-xs font-bold hover:underline"
+                                        >
+                                            Open Store
+                                            <ExternalLink className="w-3.5 h-3.5" />
+                                        </a>
+                                        <a
+                                            href={`${window.location.origin}/customixie?company=${encodeURIComponent(preset.company_id)}`}
+                                            target="_blank"
+                                            rel="noopener noreferrer"
+                                            className="inline-flex items-center gap-1 text-[#111b21] text-xs font-bold hover:underline"
+                                        >
+                                            Customixie Landing
+                                            <ExternalLink className="w-3.5 h-3.5" />
+                                        </a>
+                                    </div>
+                                )}
+                            </div>
+                            <div className="grid grid-cols-1 md:grid-cols-12 gap-2">
+                                <input
+                                    value={newProductName}
+                                    onChange={(e) => setNewProductName(e.target.value)}
+                                    placeholder="Product name"
+                                    className="md:col-span-3 rounded-xl border border-[#eceff1] bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#00a884]/20"
+                                />
+                                <input
+                                    value={newProductPrice}
+                                    onChange={(e) => setNewProductPrice(e.target.value)}
+                                    placeholder="Price"
+                                    className="md:col-span-2 rounded-xl border border-[#eceff1] bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#00a884]/20"
+                                />
+                                <input
+                                    value={newProductSku}
+                                    onChange={(e) => setNewProductSku(e.target.value)}
+                                    placeholder="SKU (optional)"
+                                    className="md:col-span-2 rounded-xl border border-[#eceff1] bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#00a884]/20"
+                                />
+                                <input
+                                    value={newProductDescription}
+                                    onChange={(e) => setNewProductDescription(e.target.value)}
+                                    placeholder="Description (optional)"
+                                    className="md:col-span-4 rounded-xl border border-[#eceff1] bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#00a884]/20"
+                                />
                                 <button
                                     type="button"
-                                    onClick={() => setItems((prev) => [...prev, createDraftItem()])}
-                                    className="px-3 py-1.5 rounded-lg border border-[#00a884]/30 text-[#00a884] text-xs font-bold hover:bg-[#00a884]/10 transition-all"
+                                    onClick={handleCreateProduct}
+                                    disabled={!canUseApi || productSubmitting}
+                                    className="md:col-span-1 rounded-xl bg-[#111b21] text-white text-xs font-bold hover:bg-[#202c33] transition-all disabled:opacity-50"
                                 >
-                                    <Plus className="w-3.5 h-3.5 inline mr-1" />
-                                    Add Item
+                                    {productSubmitting ? 'Saving…' : 'Save'}
                                 </button>
+                            </div>
+                            <div className="mt-2 text-xs text-[#54656f]">
+                                {productsLoading ? 'Loading products…' : `${products.length} active products available for invoice items.`}
+                            </div>
+                        </div>
+
+                        <div className="mt-6">
+                            <div className="flex items-center justify-between gap-3 mb-2 flex-wrap">
+                                <h3 className="text-sm font-black uppercase tracking-widest text-[#54656f]">Invoice Items</h3>
+                                <div className="flex items-center gap-2 flex-wrap">
+                                    <select
+                                        value={catalogPickId}
+                                        onChange={(e) => setCatalogPickId(e.target.value)}
+                                        className="rounded-lg border border-[#eceff1] bg-white px-2 py-1.5 text-xs font-semibold text-[#334155]"
+                                    >
+                                        <option value="">Pick product</option>
+                                        {products.map((product) => (
+                                            <option key={product.id} value={product.id}>
+                                                {product.name} ({formatMoney(product.price, product.currency)})
+                                            </option>
+                                        ))}
+                                    </select>
+                                    <button
+                                        type="button"
+                                        onClick={handleAddProductItem}
+                                        className="px-3 py-1.5 rounded-lg border border-[#00a884]/30 text-[#00a884] text-xs font-bold hover:bg-[#00a884]/10 transition-all"
+                                    >
+                                        <Plus className="w-3.5 h-3.5 inline mr-1" />
+                                        Add Product Item
+                                    </button>
+                                    <button
+                                        type="button"
+                                        onClick={() => setItems((prev) => [...prev, createDraftItem()])}
+                                        className="px-3 py-1.5 rounded-lg border border-[#00a884]/30 text-[#00a884] text-xs font-bold hover:bg-[#00a884]/10 transition-all"
+                                    >
+                                        <Plus className="w-3.5 h-3.5 inline mr-1" />
+                                        Add Manual Item
+                                    </button>
+                                </div>
                             </div>
                             <div className="space-y-2">
                                 {items.map((item) => {
@@ -630,17 +880,29 @@ export default function InvoicesView({
                                     return (
                                         <div key={item.id} className="rounded-2xl border border-[#eceff1] bg-[#fcfdfd] p-3">
                                             <div className="grid grid-cols-1 md:grid-cols-12 gap-2">
+                                                <select
+                                                    value={item.product_id}
+                                                    onChange={(e) => applyProductToItem(item.id, e.target.value)}
+                                                    className="md:col-span-3 rounded-xl border border-[#eceff1] bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#00a884]/20"
+                                                >
+                                                    <option value="">Manual item</option>
+                                                    {products.map((product) => (
+                                                        <option key={product.id} value={product.id}>
+                                                            {product.name}
+                                                        </option>
+                                                    ))}
+                                                </select>
                                                 <input
                                                     value={item.item_name}
                                                     onChange={(e) => updateItem(item.id, 'item_name', e.target.value)}
                                                     placeholder="Item name"
-                                                    className="md:col-span-4 rounded-xl border border-[#eceff1] bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#00a884]/20"
+                                                    className="md:col-span-3 rounded-xl border border-[#eceff1] bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#00a884]/20"
                                                 />
                                                 <input
                                                     value={item.description}
                                                     onChange={(e) => updateItem(item.id, 'description', e.target.value)}
                                                     placeholder="Description (optional)"
-                                                    className="md:col-span-4 rounded-xl border border-[#eceff1] bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#00a884]/20"
+                                                    className="md:col-span-3 rounded-xl border border-[#eceff1] bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#00a884]/20"
                                                 />
                                                 <input
                                                     value={item.quantity}
@@ -652,7 +914,7 @@ export default function InvoicesView({
                                                     value={item.unit_price}
                                                     onChange={(e) => updateItem(item.id, 'unit_price', e.target.value)}
                                                     placeholder="Unit"
-                                                    className="md:col-span-2 rounded-xl border border-[#eceff1] bg-white px-2 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#00a884]/20"
+                                                    className="md:col-span-1 rounded-xl border border-[#eceff1] bg-white px-2 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#00a884]/20"
                                                 />
                                                 <button
                                                     type="button"

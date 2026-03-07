@@ -4,6 +4,7 @@ import { buildInvoicePdf } from '../services/invoicePdf'
 type InvoiceStatus = 'draft' | 'generated' | 'sent' | 'viewed' | 'paid' | 'overdue' | 'cancelled'
 
 type NormalizedInvoiceItem = {
+    product_id: string | null
     item_name: string
     description: string | null
     quantity: number
@@ -92,8 +93,27 @@ function isUniqueViolation(error: any): boolean {
     return error?.code === '23505' || /duplicate|unique/i.test(message)
 }
 
+function isProductsTableMissingError(error: any): boolean {
+    const code = readTrimmed(error?.code).toUpperCase()
+    const message = String(error?.message || '').toLowerCase()
+    return (
+        code === 'PGRST205' ||
+        code === '42P01' ||
+        (message.includes("could not find the table") && message.includes("products")) ||
+        message.includes('relation "public.products" does not exist') ||
+        message.includes('relation "products" does not exist')
+    )
+}
+
+const PRODUCTS_TABLE_MISSING_MESSAGE =
+    'Products feature is not initialized. Run migration 20260307_webstore_products.sql to create public.products.'
+
 function isObject(value: any): value is Record<string, any> {
     return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+}
+
+function isUuid(value: string): boolean {
+    return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)
 }
 
 function escapeHtml(value: string): string {
@@ -137,11 +157,17 @@ function normalizeItems(rawItems: any): { items: NormalizedInvoiceItem[]; errors
     const errors: string[] = []
 
     rawItems.forEach((item: any, index: number) => {
+        const productIdRaw = readTrimmed(item?.product_id || item?.productId)
+        const productId = productIdRaw ? productIdRaw.toLowerCase() : null
         const name = readTrimmed(item?.item_name || item?.itemName || item?.name)
         const descriptionRaw = readTrimmed(item?.description)
         const quantity = parsePositiveQuantity(item?.quantity)
         const unitPrice = parseMoney(item?.unit_price ?? item?.unitPrice)
 
+        if (productId && !isUuid(productId)) {
+            errors.push(`Item #${index + 1}: product_id is invalid`)
+            return
+        }
         if (!name) {
             errors.push(`Item #${index + 1}: item name is required`)
             return
@@ -157,6 +183,7 @@ function normalizeItems(rawItems: any): { items: NormalizedInvoiceItem[]; errors
 
         const lineTotal = roundMoney(quantity * unitPrice)
         items.push({
+            product_id: productId,
             item_name: name.slice(0, 255),
             description: descriptionRaw ? descriptionRaw.slice(0, 2000) : null,
             quantity,
@@ -224,6 +251,37 @@ async function generateNextInvoiceNumber(ctx: any, companyId: string, prefixInpu
         if (Number.isFinite(parsed)) max = Math.max(max, parsed)
     })
     return `${prefix}-${String(max + 1).padStart(4, '0')}`
+}
+
+async function validateProductIdsForCompany(supabase: any, companyId: string, items: NormalizedInvoiceItem[]): Promise<string | null> {
+    const uniqueProductIds = Array.from(
+        new Set(items.map((item) => item.product_id).filter(Boolean))
+    ) as string[]
+
+    if (uniqueProductIds.length === 0) {
+        return null
+    }
+
+    const { data, error } = await supabase
+        .from('products')
+        .select('id')
+        .eq('company_id', companyId)
+        .in('id', uniqueProductIds)
+
+    if (error) {
+        if (isProductsTableMissingError(error)) {
+            return PRODUCTS_TABLE_MISSING_MESSAGE
+        }
+        throw new Error(error.message)
+    }
+
+    const found = new Set((data || []).map((row: any) => readTrimmed(row.id).toLowerCase()))
+    const missing = uniqueProductIds.filter((id) => !found.has(id))
+    if (missing.length > 0) {
+        return `Unknown product_id for this company: ${missing.join(', ')}`
+    }
+
+    return null
 }
 
 function buildPublicInvoicePayload(req: any, invoice: any) {
@@ -572,6 +630,11 @@ export function registerInvoiceRoutes(app: Express, ctx: any) {
             }
             const items = normalized.items
 
+            const productsError = await validateProductIdsForCompany(supabase, access.companyId, items)
+            if (productsError) {
+                return res.status(400).json({ success: false, error: productsError })
+            }
+
             const totals = computeTotals(items, req.body?.discount, req.body?.tax)
             const fallbackDate = new Date().toISOString().slice(0, 10)
             const invoiceDate = parseDateOnly(req.body?.invoice_date || req.body?.invoiceDate, fallbackDate)
@@ -728,6 +791,7 @@ export function registerInvoiceRoutes(app: Express, ctx: any) {
                     .insert(items.map((item, index) => ({
                         invoice_id: createdInvoice.id,
                         item_index: index,
+                        product_id: item.product_id,
                         item_name: item.item_name,
                         description: item.description,
                         quantity: item.quantity,
@@ -777,6 +841,11 @@ export function registerInvoiceRoutes(app: Express, ctx: any) {
                 return res.status(400).json({ success: false, error: normalized.errors.join('; ') })
             }
 
+            const productsError = await validateProductIdsForCompany(supabase, access.companyId, normalized.items)
+            if (productsError) {
+                return res.status(400).json({ success: false, error: productsError })
+            }
+
             const loaded = await loadInvoiceWithItems(ctx, access.companyId, invoiceId)
             if (!loaded) {
                 return res.status(404).json({ success: false, error: 'Invoice not found' })
@@ -802,6 +871,7 @@ export function registerInvoiceRoutes(app: Express, ctx: any) {
                     .insert(normalized.items.map((item, index) => ({
                         invoice_id: invoiceId,
                         item_index: index,
+                        product_id: item.product_id,
                         item_name: item.item_name,
                         description: item.description,
                         quantity: item.quantity,
@@ -878,6 +948,7 @@ export function registerInvoiceRoutes(app: Express, ctx: any) {
                 const quantity = parsePositiveQuantity(item.quantity) || 1
                 const unitPrice = parseMoney(item.unit_price) || 0
                 return {
+                    product_id: readTrimmed(item.product_id) || null,
                     item_name: readTrimmed(item.item_name || item.name) || 'Item',
                     description: readTrimmed(item.description) || null,
                     quantity,
