@@ -27,6 +27,7 @@ import { registerPublicInfoRoutes } from './dashboard-server/routes/publicInfoRo
 import { registerPublicAuthRoutes } from './dashboard-server/routes/publicAuthRoutes'
 import { registerWabaRoutes } from './dashboard-server/routes/wabaRoutes'
 import { registerCompanyRoutes } from './dashboard-server/routes/companyRoutes'
+import { registerInvoiceRoutes } from './dashboard-server/routes/invoiceRoutes'
 import { registerAiRoutes } from './dashboard-server/routes/aiRoutes'
 import { getCompanyAiSettings } from './dashboard-server/services/aiSettingsSupabase'
 import { loadOpenAiMemoryForUser, requestOpenAiCompletion, type OpenAiChatMessage } from './dashboard-server/services/openaiAssistant'
@@ -2840,6 +2841,12 @@ registerCompanyRoutes(app, {
     computeAgentColor,
     deriveAgentName,
     readTrimmed
+})
+
+registerInvoiceRoutes(app, {
+    requireSupabaseUserMiddleware,
+    resolveCompanyAccess,
+    supabase
 })
 
 registerAiRoutes(app, {

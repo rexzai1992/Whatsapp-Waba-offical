@@ -56,12 +56,18 @@ export class WabaClient {
 
             if (!res.ok) {
                 const errMsg = data?.error?.message || res.statusText
-                throw new Error(`WABA API error ${res.status}: ${errMsg}`)
+                const error: any = new Error(`WABA API error ${res.status}: ${errMsg}`)
+                error.status = res.status
+                error.response = data || null
+                throw error
             }
 
             if (data?.error) {
                 const errMsg = data?.error?.message || 'Unknown API error'
-                throw new Error(`WABA API error: ${errMsg}`)
+                const error: any = new Error(`WABA API error: ${errMsg}`)
+                error.status = 502
+                error.response = data
+                throw error
             }
 
             return data

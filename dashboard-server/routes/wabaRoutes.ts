@@ -72,6 +72,45 @@ function sanitizeConversationalPrompts(rawPrompts: any): string[] {
         .filter(Boolean)
 }
 
+function toHttpErrorPayload(error: any, fallback = 'Unexpected error'): {
+    status: number
+    payload: { success: false; error: string; details?: string[] }
+} {
+    const statusFromObject = Number(error?.status)
+    let status = Number.isFinite(statusFromObject) ? statusFromObject : 500
+    const message = trimText(error?.message) || fallback
+
+    if (!Number.isFinite(statusFromObject)) {
+        const match = /^WABA API error\s+(\d+):\s*/i.exec(message)
+        if (match?.[1]) {
+            const parsed = Number.parseInt(match[1], 10)
+            if (Number.isFinite(parsed)) status = parsed
+        }
+    }
+
+    if (!Number.isFinite(status) || status < 400 || status > 599) status = 500
+
+    const graphMessage = trimText(error?.response?.error?.message)
+    const graphType = trimText(error?.response?.error?.type)
+    const graphCode = error?.response?.error?.code
+    const graphSubcode = error?.response?.error?.error_subcode
+
+    const details: string[] = []
+    if (graphMessage && graphMessage !== message) details.push(graphMessage)
+    if (graphType) details.push(`type=${graphType}`)
+    if (graphCode !== undefined && graphCode !== null && String(graphCode).trim()) details.push(`code=${graphCode}`)
+    if (graphSubcode !== undefined && graphSubcode !== null && String(graphSubcode).trim()) details.push(`subcode=${graphSubcode}`)
+
+    return {
+        status,
+        payload: {
+            success: false,
+            error: message,
+            ...(details.length > 0 ? { details } : {})
+        }
+    }
+}
+
 export function registerWabaRoutes(app: Express, ctx: any) {
     const {
         assertProfileCompany,
@@ -1017,7 +1056,11 @@ app.post('/api/waba/templates/utility', async (req: any, res: any) => {
         const data = await client.createMessageTemplate(wabaId, payload)
         res.json({ success: true, data })
     } catch (error: any) {
-        res.status(500).json({ success: false, error: error.message })
+        const normalized = toHttpErrorPayload(error, 'Failed to create utility template')
+        if (normalized.status >= 500) {
+            console.error('[WABA] Utility template creation failed:', error)
+        }
+        res.status(normalized.status).json(normalized.payload)
     }
 })
 
@@ -1045,7 +1088,11 @@ app.post('/api/waba/templates/marketing', async (req: any, res: any) => {
         const data = await client.createMessageTemplate(wabaId, payload)
         res.json({ success: true, data })
     } catch (error: any) {
-        res.status(500).json({ success: false, error: error.message })
+        const normalized = toHttpErrorPayload(error, 'Failed to create marketing template')
+        if (normalized.status >= 500) {
+            console.error('[WABA] Marketing template creation failed:', error)
+        }
+        res.status(normalized.status).json(normalized.payload)
     }
 })
 
@@ -1158,7 +1205,11 @@ app.post('/api/waba/templates/authentication', async (req: any, res: any) => {
         const data = await client.createMessageTemplate(wabaId, payload)
         res.json({ success: true, data })
     } catch (error: any) {
-        res.status(500).json({ success: false, error: error.message })
+        const normalized = toHttpErrorPayload(error, 'Failed to create authentication template')
+        if (normalized.status >= 500) {
+            console.error('[WABA] Authentication template creation failed:', error)
+        }
+        res.status(normalized.status).json(normalized.payload)
     }
 })
 
