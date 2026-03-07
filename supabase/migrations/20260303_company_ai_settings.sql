@@ -1,6 +1,6 @@
 -- Store per-company AI chatbot settings in Supabase (instead of local JSON file).
 
-CREATE TABLE IF NOT EXISTS public.company_ai_settings (
+
   company_id text PRIMARY KEY REFERENCES public.company(id) ON DELETE CASCADE,
   enabled boolean NOT NULL DEFAULT false,
   model text NOT NULL DEFAULT 'gpt-4o-mini',
@@ -28,3 +28,4 @@ ALTER TABLE public.company_ai_settings ADD COLUMN IF NOT EXISTS memory_messages 
 ALTER TABLE public.company_ai_settings ADD COLUMN IF NOT EXISTS api_key text;
 ALTER TABLE public.company_ai_settings ADD COLUMN IF NOT EXISTS updated_at timestamptz DEFAULT now();
 ALTER TABLE public.company_ai_settings ADD COLUMN IF NOT EXISTS updated_by uuid;
+CREATE TABLE IF NOT EXISTS public.company_ai_settings (

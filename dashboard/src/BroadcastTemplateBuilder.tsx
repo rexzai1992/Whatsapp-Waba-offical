@@ -85,6 +85,29 @@ const extractNamedVars = (text: string): string[] => {
 
 const MARKETING_NAMED_PARAM_REGEX = /^[a-z_][a-z0-9_]*$/;
 
+const TEMPLATE_LANGUAGE_PRESETS: Array<{ value: string; label: string }> = [
+    { value: 'en_US', label: 'English (US)' },
+    { value: 'en_GB', label: 'English (UK)' },
+    { value: 'ms', label: 'Malay (Bahasa Melayu)' },
+    { value: 'id', label: 'Indonesian (Bahasa Indonesia)' },
+    { value: 'zh_CN', label: 'Chinese Simplified' },
+    { value: 'zh_HK', label: 'Chinese Traditional (Hong Kong)' },
+    { value: 'zh_TW', label: 'Chinese Traditional (Taiwan)' },
+    { value: 'ja', label: 'Japanese' },
+    { value: 'ko', label: 'Korean' },
+    { value: 'th', label: 'Thai' },
+    { value: 'vi', label: 'Vietnamese' },
+    { value: 'hi', label: 'Hindi' },
+    { value: 'ar', label: 'Arabic' },
+    { value: 'es', label: 'Spanish' },
+    { value: 'pt_BR', label: 'Portuguese (Brazil)' },
+    { value: 'fr', label: 'French' },
+    { value: 'de', label: 'German' },
+    { value: 'it', label: 'Italian' },
+    { value: 'nl', label: 'Dutch' },
+    { value: 'tr', label: 'Turkish' }
+];
+
 const formatTemplateCreateResult = (data: any): string => {
     const id = data?.id || data?.template_id || data?.message_template_id || '';
     const status = data?.status || data?.template_status || '';
@@ -1521,14 +1544,25 @@ export default function BroadcastTemplateBuilder({
                             <div>
                                 <label className="block text-sm font-bold text-[#1f2937] mb-2">Language</label>
                                 <input
+                                    list="template-language-presets"
                                     value={language}
                                     onChange={(e) => {
                                         setLanguage(e.target.value);
                                         setError(null);
                                     }}
-                                    placeholder="en_US"
+                                    placeholder="Pick or type Meta language code (e.g. en_US)"
                                     className="w-full bg-[#f3f4f6] border border-[#e5e7eb] rounded-xl px-4 py-3 text-sm font-semibold text-[#111b21] focus:outline-none focus:border-[#00a884]"
                                 />
+                                <datalist id="template-language-presets">
+                                    {TEMPLATE_LANGUAGE_PRESETS.map((option) => (
+                                        <option key={option.value} value={option.value}>
+                                            {option.label}
+                                        </option>
+                                    ))}
+                                </datalist>
+                                <p className="mt-1 text-[11px] text-[#6b7280]">
+                                    Presets included: English, Malay, Indonesian, Chinese, Japanese, Korean and more.
+                                </p>
                             </div>
                         </div>
 
