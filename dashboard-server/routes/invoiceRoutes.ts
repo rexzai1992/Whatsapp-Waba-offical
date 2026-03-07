@@ -51,7 +51,7 @@ function normalizeInvoicePrefix(input: any, fallback = 'INV'): string {
 }
 
 function normalizeInvoiceName(value: any): string {
-    const raw = readTrimmed(value)
+    const raw = readTrimmed(value).replace(/\.pdf$/i, '')
     if (!raw) return ''
     const slug = raw
         .replace(/\s+/g, '-')
@@ -78,7 +78,7 @@ function buildStoragePath(companyId: string, invoiceName: string): string {
 }
 
 function buildPublicPath(companyId: string, invoiceName: string): string {
-    return `/${companyId}/invoice/${encodeURIComponent(invoiceName)}`
+    return `/${companyId}/invoice/${encodeURIComponent(invoiceName)}.pdf`
 }
 
 function resolveBaseUrl(req: any): string {
@@ -377,6 +377,41 @@ function resolveInvoiceStatus(input: any): InvoiceStatus | null {
     const value = readTrimmed(input).toLowerCase() as InvoiceStatus
     if (!value) return null
     return VALID_STATUSES.has(value) ? value : null
+}
+
+async function loadPublicInvoiceByName(supabase: any, companyId: string, invoiceName: string) {
+    const { data, error } = await supabase
+        .from('invoices')
+        .select(`
+            id,
+            company_id,
+            invoice_name,
+            invoice_number,
+            invoice_title,
+            invoice_date,
+            due_date,
+            currency,
+            total,
+            status,
+            pdf_path,
+            company_snapshot,
+            client_snapshot
+        `)
+        .eq('company_id', companyId)
+        .eq('invoice_name', invoiceName)
+        .maybeSingle()
+
+    if (error) {
+        throw new Error('Failed to resolve invoice')
+    }
+
+    return data || null
+}
+
+function resolveInvoicePdfUrl(supabase: any, pdfPath: string): string | null {
+    const bucket = readTrimmed(process.env.SUPABASE_INVOICE_BUCKET || 'invoices') || 'invoices'
+    const { data } = supabase.storage.from(bucket).getPublicUrl(pdfPath)
+    return data?.publicUrl || null
 }
 
 export function registerInvoiceRoutes(app: Express, ctx: any) {
@@ -933,10 +968,8 @@ export function registerInvoiceRoutes(app: Express, ctx: any) {
                 return res.status(500).json({ success: false, error: uploadError.message })
             }
 
-            const { data: publicFileData } = supabase.storage.from(bucket).getPublicUrl(pdfPath)
-            const pdfFileUrl = publicFileData?.publicUrl || null
             const publicInvoice = buildPublicInvoicePayload(req, { company_id: access.companyId, invoice_name: invoiceName })
-            const wabaDocumentUrl = pdfFileUrl || publicInvoice.publicUrl
+            const wabaDocumentUrl = publicInvoice.publicUrl
 
             const lockedStatus = loaded.invoice.status === 'paid' || loaded.invoice.status === 'cancelled'
                 ? loaded.invoice.status
@@ -1175,6 +1208,30 @@ export function registerInvoiceRoutes(app: Express, ctx: any) {
         }
     })
 
+    app.get('/:companyId/invoice/:invoiceName.pdf', async (req: any, res: any) => {
+        try {
+            const companyId = sanitizePathSegment(req.params?.companyId)
+            const invoiceName = normalizeInvoiceName(req.params?.invoiceName)
+            if (!companyId || !invoiceName || RESERVED_PUBLIC_SEGMENTS.has(companyId)) {
+                return res.status(404).send('Invoice not found')
+            }
+
+            const invoice = await loadPublicInvoiceByName(supabase, companyId, invoiceName)
+            if (!invoice || !invoice.pdf_path) {
+                return res.status(404).send('Invoice not found')
+            }
+
+            const pdfUrl = resolveInvoicePdfUrl(supabase, invoice.pdf_path)
+            if (!pdfUrl) {
+                return res.status(404).send('Invoice file not found')
+            }
+
+            return res.redirect(302, pdfUrl)
+        } catch (error: any) {
+            return res.status(500).send(error.message || 'Failed to load invoice')
+        }
+    })
+
     app.get('/:companyId/invoice/:invoiceName', async (req: any, res: any) => {
         try {
             const companyId = sanitizePathSegment(req.params?.companyId)
@@ -1183,37 +1240,12 @@ export function registerInvoiceRoutes(app: Express, ctx: any) {
                 return res.status(404).send('Invoice not found')
             }
 
-            const { data: invoice, error } = await supabase
-                .from('invoices')
-                .select(`
-                    id,
-                    company_id,
-                    invoice_name,
-                    invoice_number,
-                    invoice_title,
-                    invoice_date,
-                    due_date,
-                    currency,
-                    total,
-                    status,
-                    pdf_path,
-                    company_snapshot,
-                    client_snapshot
-                `)
-                .eq('company_id', companyId)
-                .eq('invoice_name', invoiceName)
-                .maybeSingle()
-
-            if (error) {
-                return res.status(500).send('Failed to resolve invoice')
-            }
+            const invoice = await loadPublicInvoiceByName(supabase, companyId, invoiceName)
             if (!invoice || !invoice.pdf_path) {
                 return res.status(404).send('Invoice not found')
             }
 
-            const bucket = readTrimmed(process.env.SUPABASE_INVOICE_BUCKET || 'invoices') || 'invoices'
-            const { data: fileData } = supabase.storage.from(bucket).getPublicUrl(invoice.pdf_path)
-            const pdfUrl = fileData?.publicUrl
+            const pdfUrl = resolveInvoicePdfUrl(supabase, invoice.pdf_path)
             if (!pdfUrl) {
                 return res.status(404).send('Invoice file not found')
             }

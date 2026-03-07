@@ -111,6 +111,15 @@ function toHttpErrorPayload(error: any, fallback = 'Unexpected error'): {
     }
 }
 
+function isPdfUrl(value: string): boolean {
+    return /\.pdf(?:$|[?#])/i.test(value)
+}
+
+function toTemplateText(value: any): string {
+    if (value === null || value === undefined) return ''
+    return String(value)
+}
+
 export function registerWabaRoutes(app: Express, ctx: any) {
     const {
         assertProfileCompany,
@@ -1351,13 +1360,14 @@ app.post('/api/waba/templates/send', async (req: any, res: any) => {
             return res.status(503).json({ success: false, error: 'WABA not configured for this profile.' })
         }
 
-        const name = readTrimmed(req.body?.name)
-        const language = readTrimmed(req.body?.language) || 'en_US'
+        const name = readTrimmed(req.body?.name || req.body?.templateName || req.body?.template_name)
+        const language = readTrimmed(req.body?.language || req.body?.languageCode || req.body?.language_code) || 'en_US'
         const to = readTrimmed(req.body?.to || req.body?.phone || req.body?.phoneNumber)
         const phoneNumber = normalizePhoneNumber(to)
+        const invoiceId = readTrimmed(req.body?.invoice_id || req.body?.invoiceId)
 
         if (!name) {
-            return res.status(400).json({ success: false, error: 'name is required' })
+            return res.status(400).json({ success: false, error: 'name/templateName is required' })
         }
         if (!phoneNumber) {
             return res.status(400).json({ success: false, error: 'to/phone is required' })
@@ -1368,7 +1378,112 @@ app.post('/api/waba/templates/send', async (req: any, res: any) => {
             return res.status(500).json({ success: false, error: 'Failed to resolve user' })
         }
 
-        const components = buildTemplateSendComponents(req.body || {})
+        let invoiceRecord: any = null
+        let documentLink: string | null = null
+        let components = buildTemplateSendComponents(req.body || {})
+
+        if (invoiceId) {
+            const { data: invoice, error: invoiceError } = await supabase
+                .from('invoices')
+                .select(`
+                    id,
+                    company_id,
+                    invoice_name,
+                    invoice_number,
+                    due_date,
+                    total,
+                    pdf_path,
+                    public_url,
+                    company_snapshot,
+                    client_snapshot
+                `)
+                .eq('id', invoiceId)
+                .eq('company_id', access.companyId)
+                .maybeSingle()
+
+            if (invoiceError) {
+                return res.status(500).json({ success: false, error: invoiceError.message })
+            }
+            if (!invoice) {
+                return res.status(404).json({ success: false, error: 'Invoice not found' })
+            }
+            if (!readTrimmed(invoice.pdf_path)) {
+                return res.status(400).json({ success: false, error: 'invoice.pdf_path is missing. Generate invoice PDF first.' })
+            }
+
+            const publicUrl = readTrimmed(invoice.public_url)
+            if (!publicUrl) {
+                return res.status(400).json({ success: false, error: 'invoice.public_url is missing. Generate invoice PDF first.' })
+            }
+            if (!isPdfUrl(publicUrl)) {
+                return res.status(400).json({ success: false, error: 'invoice.public_url must end with .pdf' })
+            }
+
+            const bucket = readTrimmed(process.env.SUPABASE_INVOICE_BUCKET || 'invoices') || 'invoices'
+            const { error: fileError } = await supabase.storage.from(bucket).download(invoice.pdf_path)
+            if (fileError) {
+                return res.status(400).json({ success: false, error: 'Invoice PDF file does not exist in storage' })
+            }
+
+            const companySnapshot = invoice.company_snapshot && typeof invoice.company_snapshot === 'object' ? invoice.company_snapshot : {}
+            const clientSnapshot = invoice.client_snapshot && typeof invoice.client_snapshot === 'object' ? invoice.client_snapshot : {}
+
+            const fallbackBodyAttributes = [
+                toTemplateText(clientSnapshot.name || 'Customer'),
+                toTemplateText(companySnapshot.business_name || access.companyId),
+                toTemplateText(invoice.invoice_number || invoice.invoice_name || ''),
+                toTemplateText(invoice.total ?? ''),
+                toTemplateText(invoice.due_date || '')
+            ]
+
+            const requestedBodyAttributes = req.body?.bodyAttributes ?? req.body?.body_attributes
+            const bodyAttributes = Array.isArray(requestedBodyAttributes) && requestedBodyAttributes.length > 0
+                ? requestedBodyAttributes.map((value: any) => toTemplateText(value))
+                : fallbackBodyAttributes
+
+            const headerType = readTrimmed(req.body?.headerType || req.body?.header_type || 'document').toLowerCase() || 'document'
+            if (headerType !== 'document') {
+                return res.status(400).json({ success: false, error: 'headerType must be document for invoice template sending' })
+            }
+
+            documentLink = readTrimmed(req.body?.documentLink || req.body?.document_link || publicUrl) || publicUrl
+            if (!isPdfUrl(documentLink)) {
+                return res.status(400).json({ success: false, error: 'documentLink must end with .pdf' })
+            }
+            let documentFilename = readTrimmed(
+                req.body?.documentFilename
+                || req.body?.document_filename
+                || `${toTemplateText(invoice.invoice_name || invoice.invoice_number || 'invoice')}.pdf`
+            )
+            if (!documentFilename.toLowerCase().endsWith('.pdf')) {
+                documentFilename = `${documentFilename}.pdf`
+            }
+
+            components = [
+                {
+                    type: 'header',
+                    parameters: [
+                        {
+                            type: 'document',
+                            document: {
+                                link: documentLink,
+                                filename: documentFilename
+                            }
+                        }
+                    ]
+                },
+                {
+                    type: 'body',
+                    parameters: bodyAttributes.map((value) => ({
+                        type: 'text',
+                        text: value
+                    }))
+                }
+            ]
+
+            invoiceRecord = invoice
+        }
+
         const componentErrors = validateTemplateSendComponents(components)
         if (componentErrors.length > 0) {
             return res.status(400).json({ success: false, error: 'Invalid template send components', details: componentErrors })
@@ -1386,6 +1501,28 @@ app.post('/api/waba/templates/send', async (req: any, res: any) => {
             }
         })
 
+        let invoiceStatusUpdated = false
+        let invoiceStatusError: string | null = null
+        if (invoiceRecord) {
+            const nowIso = new Date().toISOString()
+            const { error: updateError } = await supabase
+                .from('invoices')
+                .update({
+                    status: 'sent',
+                    sent_at: nowIso,
+                    ...(documentLink ? { waba_document_url: documentLink } : {}),
+                    updated_at: nowIso
+                })
+                .eq('id', invoiceRecord.id)
+                .eq('company_id', access.companyId)
+
+            if (updateError) {
+                invoiceStatusError = updateError.message || 'Failed to update invoice status'
+            } else {
+                invoiceStatusUpdated = true
+            }
+        }
+
         res.json({
             success: true,
             data: {
@@ -1394,7 +1531,14 @@ app.post('/api/waba/templates/send', async (req: any, res: any) => {
                 to: phoneNumber,
                 name,
                 language,
-                components: components || null
+                components: components || null,
+                ...(invoiceRecord
+                    ? {
+                        invoiceId: invoiceRecord.id,
+                        invoiceStatusUpdated,
+                        ...(invoiceStatusError ? { invoiceStatusError } : {})
+                    }
+                    : {})
             }
         })
     } catch (error: any) {

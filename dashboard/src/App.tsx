@@ -3947,6 +3947,7 @@ export default function App() {
                 <InvoicesView
                     sessionToken={session?.access_token || null}
                     apiBaseUrl={SOCKET_URL}
+                    profileId={activeProfileId}
                 />
             ) : workspaceSection === 'chatbots' ? (
                 <ChatbotsView

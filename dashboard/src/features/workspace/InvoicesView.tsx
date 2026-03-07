@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { ExternalLink, FileText, Plus, RefreshCw, Trash2 } from 'lucide-react';
+import { ExternalLink, FileText, Plus, RefreshCw, Send, Trash2 } from 'lucide-react';
 
 type InvoiceStatus = 'draft' | 'generated' | 'sent' | 'viewed' | 'paid' | 'overdue' | 'cancelled';
 
@@ -40,6 +40,7 @@ type DraftInvoiceItem = {
 };
 
 type GenerationOutput = {
+    invoice_id: string;
     company_id: string;
     invoice_name: string;
     pdf_path: string | null;
@@ -51,6 +52,7 @@ type GenerationOutput = {
 type InvoicesViewProps = {
     sessionToken: string | null;
     apiBaseUrl: string;
+    profileId: string | null;
 };
 
 const createDraftItem = (): DraftInvoiceItem => ({
@@ -88,7 +90,8 @@ function safeString(value: unknown): string {
 
 export default function InvoicesView({
     sessionToken,
-    apiBaseUrl
+    apiBaseUrl,
+    profileId
 }: InvoicesViewProps) {
     const [presetLoading, setPresetLoading] = useState(false);
     const [presetError, setPresetError] = useState<string | null>(null);
@@ -102,6 +105,13 @@ export default function InvoicesView({
     const [formError, setFormError] = useState<string | null>(null);
     const [formNotice, setFormNotice] = useState<string | null>(null);
     const [lastOutput, setLastOutput] = useState<GenerationOutput | null>(null);
+    const [sendInvoiceId, setSendInvoiceId] = useState('');
+    const [sendPhone, setSendPhone] = useState('');
+    const [sendTemplateName, setSendTemplateName] = useState('send_invoice');
+    const [sendLanguage, setSendLanguage] = useState('en_US');
+    const [sendingTemplate, setSendingTemplate] = useState(false);
+    const [sendError, setSendError] = useState<string | null>(null);
+    const [sendNotice, setSendNotice] = useState<string | null>(null);
 
     const [invoiceName, setInvoiceName] = useState('');
     const [invoiceTitle, setInvoiceTitle] = useState('');
@@ -227,6 +237,12 @@ export default function InvoicesView({
         loadInvoices();
     }, [loadInvoices, loadPreset]);
 
+    useEffect(() => {
+        if (!sendInvoiceId && invoices.length > 0) {
+            setSendInvoiceId(invoices[0].id);
+        }
+    }, [invoices, sendInvoiceId]);
+
     const resetForm = useCallback(() => {
         setInvoiceName('');
         setInvoiceTitle('');
@@ -329,6 +345,7 @@ export default function InvoicesView({
             }
 
             const outputs: GenerationOutput = {
+                invoice_id: safeString(generatePayload.data.invoice?.id || invoiceId),
                 company_id: safeString(generatePayload.data.outputs.company_id),
                 invoice_name: safeString(generatePayload.data.outputs.invoice_name),
                 pdf_path: typeof generatePayload.data.outputs.pdf_path === 'string' ? generatePayload.data.outputs.pdf_path : null,
@@ -339,6 +356,7 @@ export default function InvoicesView({
                     : null
             };
             setLastOutput(outputs);
+            setSendInvoiceId(outputs.invoice_id);
             setFormNotice('Invoice generated and uploaded successfully.');
             resetForm();
             loadInvoices();
@@ -365,6 +383,73 @@ export default function InvoicesView({
         paymentInstructions,
         resetForm,
         saveClient,
+        sessionToken
+    ]);
+
+    const handleSendInvoiceTemplate = useCallback(async () => {
+        if (!sessionToken) {
+            setSendError('Please sign in first.');
+            return;
+        }
+        if (!profileId) {
+            setSendError('Select an active WABA profile first.');
+            return;
+        }
+        if (!sendInvoiceId) {
+            setSendError('Select an invoice to send.');
+            return;
+        }
+        if (!sendPhone.trim()) {
+            setSendError('Recipient phone is required.');
+            return;
+        }
+        if (!sendTemplateName.trim()) {
+            setSendError('Template name is required.');
+            return;
+        }
+
+        setSendingTemplate(true);
+        setSendError(null);
+        setSendNotice(null);
+
+        try {
+            const params = new URLSearchParams({ profileId });
+            const res = await fetch(`${apiBaseUrl}/api/waba/templates/send?${params.toString()}`, {
+                method: 'POST',
+                headers: {
+                    authorization: `Bearer ${sessionToken}`,
+                    'content-type': 'application/json'
+                },
+                body: JSON.stringify({
+                    invoice_id: sendInvoiceId,
+                    to: sendPhone.trim(),
+                    name: sendTemplateName.trim(),
+                    language: sendLanguage.trim() || 'en_US'
+                })
+            });
+            const payload = await res.json().catch(() => null);
+            if (!res.ok || !payload?.success || !payload?.data?.messageId) {
+                throw new Error(payload?.error || 'Failed to send invoice template');
+            }
+
+            const warning = typeof payload.data.invoiceStatusError === 'string' && payload.data.invoiceStatusError
+                ? ` Sent (messageId: ${payload.data.messageId}) but invoice status update failed: ${payload.data.invoiceStatusError}`
+                : ` Sent successfully (messageId: ${payload.data.messageId}).`;
+            setSendNotice(`Invoice template${warning}`);
+            loadInvoices();
+        } catch (error: any) {
+            setSendError(error?.message || 'Failed to send invoice template');
+        } finally {
+            setSendingTemplate(false);
+        }
+    }, [
+        apiBaseUrl,
+        loadInvoices,
+        profileId,
+        sendInvoiceId,
+        sendLanguage,
+        sendPhone,
+        sendTemplateName,
         sessionToken
     ]);
 
@@ -414,6 +499,16 @@ export default function InvoicesView({
                         {formNotice && (
                             <div className="mt-4 px-3 py-2 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-700 text-xs font-semibold">
                                 {formNotice}
+                            </div>
+                        )}
+                        {sendError && (
+                            <div className="mt-4 px-3 py-2 rounded-xl bg-rose-50 border border-rose-200 text-rose-600 text-xs font-semibold">
+                                {sendError}
+                            </div>
+                        )}
+                        {sendNotice && (
+                            <div className="mt-4 px-3 py-2 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-700 text-xs font-semibold">
+                                {sendNotice}
                             </div>
                         )}
 
@@ -666,6 +761,67 @@ export default function InvoicesView({
                                 </div>
                             </div>
                         )}
+
+                        <div className="mt-5 rounded-2xl border border-[#eceff1] bg-[#f8f9fa] p-4">
+                            <div className="text-[11px] font-black uppercase tracking-widest text-[#54656f] mb-3">
+                                Send Via WhatsApp
+                            </div>
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                <label className="space-y-1 block">
+                                    <span className="text-[11px] font-black uppercase tracking-widest text-[#54656f]">Invoice</span>
+                                    <select
+                                        value={sendInvoiceId}
+                                        onChange={(e) => setSendInvoiceId(e.target.value)}
+                                        className="w-full rounded-xl border border-[#eceff1] bg-white px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-[#00a884]/20"
+                                    >
+                                        <option value="">Select invoice</option>
+                                        {invoices.map((invoice) => (
+                                            <option key={invoice.id} value={invoice.id}>
+                                                {invoice.invoice_number} ({invoice.invoice_name})
+                                            </option>
+                                        ))}
+                                    </select>
+                                </label>
+                                <label className="space-y-1 block">
+                                    <span className="text-[11px] font-black uppercase tracking-widest text-[#54656f]">Recipient Phone</span>
+                                    <input
+                                        value={sendPhone}
+                                        onChange={(e) => setSendPhone(e.target.value)}
+                                        placeholder="+6012..."
+                                        className="w-full rounded-xl border border-[#eceff1] bg-white px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-[#00a884]/20"
+                                    />
+                                </label>
+                                <label className="space-y-1 block">
+                                    <span className="text-[11px] font-black uppercase tracking-widest text-[#54656f]">Template Name</span>
+                                    <input
+                                        value={sendTemplateName}
+                                        onChange={(e) => setSendTemplateName(e.target.value)}
+                                        placeholder="send_invoice"
+                                        className="w-full rounded-xl border border-[#eceff1] bg-white px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-[#00a884]/20"
+                                    />
+                                </label>
+                                <label className="space-y-1 block">
+                                    <span className="text-[11px] font-black uppercase tracking-widest text-[#54656f]">Language</span>
+                                    <input
+                                        value={sendLanguage}
+                                        onChange={(e) => setSendLanguage(e.target.value)}
+                                        placeholder="en_US"
+                                        className="w-full rounded-xl border border-[#eceff1] bg-white px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-[#00a884]/20"
+                                    />
+                                </label>
+                            </div>
+                            <div className="mt-3 flex justify-end">
+                                <button
+                                    type="button"
+                                    onClick={handleSendInvoiceTemplate}
+                                    disabled={!canUseApi || !profileId || sendingTemplate}
+                                    className="inline-flex items-center gap-1.5 px-4 py-2.5 rounded-xl bg-[#00a884] text-white text-xs font-bold uppercase tracking-widest hover:bg-[#008f6f] transition-all disabled:opacity-50"
+                                >
+                                    <Send className="w-3.5 h-3.5" />
+                                    {sendingTemplate ? 'Sending…' : 'Send Invoice Template'}
+                                </button>
+                            </div>
+                        </div>
                     </section>
 
                     <section className="bg-white border border-[#eceff1] rounded-3xl shadow-[0_10px_30px_rgba(0,0,0,0.05)] p-6">
@@ -697,13 +853,13 @@ export default function InvoicesView({
                                             <th className="py-2 pr-3">Date</th>
                                             <th className="py-2 pr-3">Status</th>
                                             <th className="py-2 pr-3 text-right">Total</th>
-                                            <th className="py-2">Open</th>
+                                            <th className="py-2">Actions</th>
                                         </tr>
                                     </thead>
                                     <tbody className="divide-y divide-[#f0f2f5]">
                                         {invoices.map((invoice) => {
                                             const href = invoice.public_url
-                                                || `${window.location.origin}/${invoice.company_id}/invoice/${encodeURIComponent(invoice.invoice_name)}`;
+                                                || `${window.location.origin}/${invoice.company_id}/invoice/${encodeURIComponent(invoice.invoice_name)}.pdf`;
                                             return (
                                                 <tr key={invoice.id}>
                                                     <td className="py-2 pr-3 font-bold">{invoice.invoice_number}</td>
@@ -716,15 +872,25 @@ export default function InvoicesView({
                                                     </td>
                                                     <td className="py-2 pr-3 text-right font-bold">{formatMoney(invoice.total, invoice.currency)}</td>
                                                     <td className="py-2">
-                                                        <a
-                                                            href={href}
-                                                            target="_blank"
-                                                            rel="noopener noreferrer"
-                                                            className="inline-flex items-center gap-1 text-[#00a884] font-bold hover:underline"
-                                                        >
-                                                            Open
-                                                            <ExternalLink className="w-3.5 h-3.5" />
-                                                        </a>
+                                                        <div className="flex items-center gap-3">
+                                                            <a
+                                                                href={href}
+                                                                target="_blank"
+                                                                rel="noopener noreferrer"
+                                                                className="inline-flex items-center gap-1 text-[#00a884] font-bold hover:underline"
+                                                            >
+                                                                Open
+                                                                <ExternalLink className="w-3.5 h-3.5" />
+                                                            </a>
+                                                            <button
+                                                                type="button"
+                                                                onClick={() => setSendInvoiceId(invoice.id)}
+                                                                className="inline-flex items-center gap-1 text-[#111b21] font-bold hover:underline"
+                                                            >
+                                                                Send
+                                                                <Send className="w-3.5 h-3.5" />
+                                                            </button>
+                                                        </div>
                                                     </td>
                                                 </tr>
                                             );

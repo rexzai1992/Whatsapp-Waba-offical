@@ -2233,6 +2233,47 @@ function buildTemplateSendComponents(input: any): any[] | undefined {
     const headerParameters = normalizeTemplateSendParameters(input?.headerParameters || input?.header_parameters)
     const bodyParameters = normalizeTemplateSendParameters(input?.bodyParameters || input?.body_parameters || input?.parameters)
 
+    if (headerParameters.length === 0) {
+        const headerType = readTrimmed(input?.headerType || input?.header_type).toLowerCase()
+        const headerText = readTrimmed(input?.headerText || input?.header_text)
+        const headerLink = readTrimmed(
+            input?.documentLink
+            || input?.document_link
+            || input?.mediaLink
+            || input?.media_link
+            || input?.headerLink
+            || input?.header_link
+        )
+        let headerFilename = readTrimmed(input?.documentFilename || input?.document_filename || input?.headerFilename || input?.header_filename)
+
+        if (headerType === 'text' && headerText) {
+            headerParameters.push({ type: 'text', text: headerText })
+        } else if ((headerType === 'image' || headerType === 'video' || headerType === 'document') && headerLink) {
+            if (headerType === 'document' && headerFilename && !headerFilename.toLowerCase().endsWith('.pdf')) {
+                headerFilename = `${headerFilename}.pdf`
+            }
+            headerParameters.push({
+                type: headerType,
+                [headerType]: {
+                    link: headerLink,
+                    ...(headerType === 'document' && headerFilename ? { filename: headerFilename } : {})
+                }
+            })
+        }
+    }
+
+    if (bodyParameters.length === 0) {
+        const bodyAttributes = input?.bodyAttributes ?? input?.body_attributes
+        if (Array.isArray(bodyAttributes)) {
+            bodyAttributes.forEach((value: any) => {
+                bodyParameters.push({
+                    type: 'text',
+                    text: value === null || value === undefined ? '' : String(value)
+                })
+            })
+        }
+    }
+
     const built: any[] = []
     if (headerParameters.length > 0) built.push({ type: 'header', parameters: headerParameters })
     if (bodyParameters.length > 0) built.push({ type: 'body', parameters: bodyParameters })
