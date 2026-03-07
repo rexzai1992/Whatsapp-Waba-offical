@@ -48,6 +48,7 @@ import BroadcastView from './features/workspace/BroadcastView';
 import AutomationsView from './features/workspace/AutomationsView';
 import ContactsView from './features/workspace/ContactsView';
 import ChatbotsView from './features/workspace/ChatbotsView';
+import InvoicesView from './features/workspace/InvoicesView';
 import SettingsView from './features/workspace/SettingsView';
 import ChatflowView from './features/workspace/ChatflowView';
 import AddProfileModal from './features/workspace/modals/AddProfileModal';
@@ -337,7 +338,7 @@ export default function App() {
 
     const [activeView, setActiveView] = useState<'dashboard' | 'chatflow' | 'settings' | 'admin'>('dashboard');
     const [workspaceSection, setWorkspaceSection] = useState<
-        'team-inbox' | 'broadcast' | 'chatbots' | 'contacts' | 'ads' | 'automations' | 'more'
+        'team-inbox' | 'broadcast' | 'invoices' | 'chatbots' | 'contacts' | 'ads' | 'automations' | 'more'
     >('team-inbox');
     const [broadcastSection, setBroadcastSection] = useState<
         'template-library' | 'my-templates' | 'broadcast-history' | 'scheduled-broadcasts'
@@ -2443,13 +2444,14 @@ export default function App() {
     }
 
     const workspaceTabs: Array<{
-        id: 'team-inbox' | 'broadcast' | 'chatbots' | 'contacts' | 'ads' | 'automations' | 'more';
+        id: 'team-inbox' | 'broadcast' | 'invoices' | 'chatbots' | 'contacts' | 'ads' | 'automations' | 'more';
         label: string;
         icon: React.ComponentType<{ className?: string }>;
         beta?: boolean;
     }> = [
             { id: 'team-inbox', label: 'Team Inbox', icon: MessageSquare },
             { id: 'broadcast', label: 'Broadcast', icon: Send },
+            { id: 'invoices', label: 'Invoices', icon: FileText },
             { id: 'chatbots', label: 'Chatbots', icon: Bot },
             { id: 'contacts', label: 'Contacts', icon: Users },
             { id: 'ads', label: 'Ads', icon: CircleDashed, beta: true },
@@ -3940,6 +3942,11 @@ export default function App() {
                         setShowWorkflowStarter(true);
                         setStartWorkflowId(workflowId);
                     }}
+                />
+            ) : workspaceSection === 'invoices' ? (
+                <InvoicesView
+                    sessionToken={session?.access_token || null}
+                    apiBaseUrl={SOCKET_URL}
                 />
             ) : workspaceSection === 'chatbots' ? (
                 <ChatbotsView
