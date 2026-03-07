@@ -84,6 +84,31 @@ function isProductsTableMissingError(error: any): boolean {
 const PRODUCTS_TABLE_MISSING_MESSAGE =
     'Products feature is not initialized. Run migration 20260307_webstore_products.sql to create public.products.'
 
+function isWebstoreSettingsMissingError(error: any): boolean {
+    const code = readTrimmed(error?.code).toUpperCase()
+    const message = String(error?.message || '').toLowerCase()
+    return code === '42703' && message.includes('webstore_')
+}
+
+const WEBSTORE_SETTINGS_MISSING_MESSAGE =
+    'Webstore settings columns are missing. Run migration 20260307_company_webstore_settings.sql.'
+
+function normalizeHexColor(input: any, fallback = '#00a884'): string {
+    const raw = readTrimmed(input).toLowerCase()
+    if (/^#[0-9a-f]{3}$/.test(raw) || /^#[0-9a-f]{6}$/.test(raw)) return raw
+    return fallback
+}
+
+function parseBoolean(value: any, fallback = true): boolean {
+    if (value === null || value === undefined || value === '') return fallback
+    if (typeof value === 'boolean') return value
+    if (typeof value === 'number') return value !== 0
+    const normalized = readTrimmed(value).toLowerCase()
+    if (['0', 'false', 'no', 'off'].includes(normalized)) return false
+    if (['1', 'true', 'yes', 'on'].includes(normalized)) return true
+    return fallback
+}
+
 function toMoneyText(value: any, currency: string): string {
     const amount = Number(value || 0)
     if (Number.isFinite(amount)) {
@@ -108,6 +133,9 @@ function escapeHtml(value: string): string {
 function renderStorePage(args: { company: any; products: any[]; companyId: string }) {
     const { company, products, companyId } = args
     const companyName = readTrimmed(company?.name || companyId) || companyId
+    const storeTitle = readTrimmed(company?.webstore_title) || `${companyName} Store`
+    const storeSubtitle = readTrimmed(company?.webstore_subtitle) || 'Browse products and pricing. Built for invoice and WhatsApp workflows.'
+    const brandColor = normalizeHexColor(company?.webstore_brand_color, '#00a884')
     const defaultCurrency = normalizeCurrency(company?.default_currency || 'USD')
     const productCards = products.length === 0
         ? '<div class="empty">No products published yet.</div>'
@@ -136,14 +164,14 @@ function renderStorePage(args: { company: any; products: any[]; companyId: strin
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>${escapeHtml(companyName)} Store</title>
   <style>
-    :root { --bg:#f4f7f8; --card:#fff; --line:#d9e2e6; --text:#111b21; --muted:#54656f; --brand:#00a884; --ink:#0b141a; }
+    :root { --bg:#f4f7f8; --card:#fff; --line:#d9e2e6; --text:#111b21; --muted:#54656f; --brand:${brandColor}; --ink:#0b141a; }
     * { box-sizing: border-box; }
     body { margin:0; background:radial-gradient(circle at 0 0, #d9f8ef 0%, #f4f7f8 45%); color:var(--ink); font-family: "Segoe UI", "Inter", sans-serif; }
     .wrap { max-width: 1100px; margin: 0 auto; padding: 28px 18px 48px; }
     .hero { display:flex; gap:16px; align-items:center; justify-content:space-between; flex-wrap:wrap; margin-bottom:18px; }
     .title { font-size: 34px; font-weight: 900; margin:0 0 6px; letter-spacing: -0.02em; }
     .sub { margin:0; color:var(--muted); font-size:14px; }
-    .chip { border:1px solid #b9e6dc; background:#e8f8f3; color:#0a7a63; border-radius:999px; padding:7px 12px; font-weight:700; font-size:12px; }
+    .chip { border:1px solid color-mix(in srgb, var(--brand) 30%, #fff 70%); background:color-mix(in srgb, var(--brand) 15%, #fff 85%); color:color-mix(in srgb, var(--brand) 75%, #111 25%); border-radius:999px; padding:7px 12px; font-weight:700; font-size:12px; }
     .grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap:14px; }
     .card { background:var(--card); border:1px solid var(--line); border-radius:16px; overflow:hidden; box-shadow:0 12px 30px rgba(10,20,26,0.06); }
     .img { width:100%; height:170px; object-fit:cover; display:block; background:#eef2f4; }
@@ -160,8 +188,8 @@ function renderStorePage(args: { company: any; products: any[]; companyId: strin
   <main class="wrap">
     <section class="hero">
       <div>
-        <h1 class="title">${escapeHtml(companyName)} Store</h1>
-        <p class="sub">Browse products and pricing. Built for invoice and WhatsApp workflows.</p>
+        <h1 class="title">${escapeHtml(storeTitle)}</h1>
+        <p class="sub">${escapeHtml(storeSubtitle)}</p>
       </div>
       <div class="chip">${products.length} product${products.length === 1 ? '' : 's'}</div>
     </section>
@@ -229,8 +257,132 @@ function renderCustomixieLanding(companyIdHint: string) {
 </html>`
 }
 
+async function fetchPublicCompanyStoreProfile(supabase: any, companyId: string): Promise<{ data: any; error: any }> {
+    const fullSelect = 'id, name, logo_url, address, email, phone, default_currency, webstore_enabled, webstore_title, webstore_subtitle, webstore_brand_color'
+    const baseSelect = 'id, name, logo_url, address, email, phone, default_currency'
+    const primary = await supabase
+        .from('company')
+        .select(fullSelect)
+        .eq('id', companyId)
+        .maybeSingle()
+
+    if (!primary.error || !isWebstoreSettingsMissingError(primary.error)) {
+        return { data: primary.data, error: primary.error }
+    }
+
+    const fallback = await supabase
+        .from('company')
+        .select(baseSelect)
+        .eq('id', companyId)
+        .maybeSingle()
+    if (fallback.error || !fallback.data) {
+        return { data: fallback.data, error: fallback.error }
+    }
+
+    return {
+        data: {
+            ...fallback.data,
+            webstore_enabled: true,
+            webstore_title: null,
+            webstore_subtitle: null,
+            webstore_brand_color: '#00a884'
+        },
+        error: null
+    }
+}
+
 export function registerStoreRoutes(app: Express, ctx: any) {
     const { requireSupabaseUserMiddleware, resolveCompanyAccess, supabase } = ctx
+
+    app.get('/api/company/webstore-settings', requireSupabaseUserMiddleware, async (req: any, res: any) => {
+        try {
+            const access = await resolveCompanyAccess(req, res, 'agent')
+            if (!access) return
+
+            const { data, error } = await supabase
+                .from('company')
+                .select('id, name, webstore_enabled, webstore_title, webstore_subtitle, webstore_brand_color')
+                .eq('id', access.companyId)
+                .maybeSingle()
+
+            if (error) {
+                if (isWebstoreSettingsMissingError(error)) {
+                    return res.status(503).json({
+                        success: false,
+                        code: 'WEBSTORE_SETTINGS_MISSING',
+                        error: WEBSTORE_SETTINGS_MISSING_MESSAGE
+                    })
+                }
+                return res.status(500).json({ success: false, error: error.message })
+            }
+            if (!data) {
+                return res.status(404).json({ success: false, error: 'Company profile not found' })
+            }
+
+            return res.json({
+                success: true,
+                data: {
+                    company_id: data.id,
+                    company_name: data.name || access.companyId,
+                    enabled: parseBoolean(data.webstore_enabled, true),
+                    title: readTrimmed(data.webstore_title) || null,
+                    subtitle: readTrimmed(data.webstore_subtitle) || null,
+                    brand_color: normalizeHexColor(data.webstore_brand_color, '#00a884')
+                }
+            })
+        } catch (error: any) {
+            return res.status(500).json({ success: false, error: error.message })
+        }
+    })
+
+    app.post('/api/company/webstore-settings', requireSupabaseUserMiddleware, async (req: any, res: any) => {
+        try {
+            const access = await resolveCompanyAccess(req, res, 'admin')
+            if (!access) return
+
+            const payload = {
+                webstore_enabled: parseBoolean(req.body?.enabled ?? req.body?.webstore_enabled, true),
+                webstore_title: readTrimmed(req.body?.title || req.body?.webstore_title) || null,
+                webstore_subtitle: readTrimmed(req.body?.subtitle || req.body?.webstore_subtitle) || null,
+                webstore_brand_color: normalizeHexColor(req.body?.brand_color || req.body?.webstore_brand_color, '#00a884')
+            }
+
+            const { data, error } = await supabase
+                .from('company')
+                .update(payload)
+                .eq('id', access.companyId)
+                .select('id, name, webstore_enabled, webstore_title, webstore_subtitle, webstore_brand_color')
+                .maybeSingle()
+
+            if (error) {
+                if (isWebstoreSettingsMissingError(error)) {
+                    return res.status(503).json({
+                        success: false,
+                        code: 'WEBSTORE_SETTINGS_MISSING',
+                        error: WEBSTORE_SETTINGS_MISSING_MESSAGE
+                    })
+                }
+                return res.status(500).json({ success: false, error: error.message })
+            }
+            if (!data) {
+                return res.status(404).json({ success: false, error: 'Company profile not found' })
+            }
+
+            return res.json({
+                success: true,
+                data: {
+                    company_id: data.id,
+                    company_name: data.name || access.companyId,
+                    enabled: parseBoolean(data.webstore_enabled, true),
+                    title: readTrimmed(data.webstore_title) || null,
+                    subtitle: readTrimmed(data.webstore_subtitle) || null,
+                    brand_color: normalizeHexColor(data.webstore_brand_color, '#00a884')
+                }
+            })
+        } catch (error: any) {
+            return res.status(500).json({ success: false, error: error.message })
+        }
+    })
 
     app.get('/api/store/products', requireSupabaseUserMiddleware, async (req: any, res: any) => {
         try {
@@ -495,15 +647,14 @@ export function registerStoreRoutes(app: Express, ctx: any) {
                 return res.status(404).json({ success: false, error: 'Store not found' })
             }
 
-            const { data: company, error: companyError } = await supabase
-                .from('company')
-                .select('id, name, logo_url, address, email, phone, default_currency')
-                .eq('id', companyId)
-                .maybeSingle()
+            const { data: company, error: companyError } = await fetchPublicCompanyStoreProfile(supabase, companyId)
             if (companyError) {
                 return res.status(500).json({ success: false, error: 'Failed to resolve company' })
             }
             if (!company) {
+                return res.status(404).json({ success: false, error: 'Store not found' })
+            }
+            if (company.webstore_enabled === false) {
                 return res.status(404).json({ success: false, error: 'Store not found' })
             }
 
@@ -529,6 +680,12 @@ export function registerStoreRoutes(app: Express, ctx: any) {
                 success: true,
                 data: {
                     company,
+                    settings: {
+                        enabled: parseBoolean(company.webstore_enabled, true),
+                        title: readTrimmed(company.webstore_title) || null,
+                        subtitle: readTrimmed(company.webstore_subtitle) || null,
+                        brand_color: normalizeHexColor(company.webstore_brand_color, '#00a884')
+                    },
                     products: products || []
                 }
             })
@@ -544,15 +701,14 @@ export function registerStoreRoutes(app: Express, ctx: any) {
                 return res.status(404).send('Store not found')
             }
 
-            const { data: company, error: companyError } = await supabase
-                .from('company')
-                .select('id, name, logo_url, address, email, phone, default_currency')
-                .eq('id', companyId)
-                .maybeSingle()
+            const { data: company, error: companyError } = await fetchPublicCompanyStoreProfile(supabase, companyId)
             if (companyError) {
                 return res.status(500).send('Failed to resolve store')
             }
             if (!company) {
+                return res.status(404).send('Store not found')
+            }
+            if (company.webstore_enabled === false) {
                 return res.status(404).send('Store not found')
             }
 

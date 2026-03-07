@@ -6,10 +6,24 @@ type InvoiceStatus = 'draft' | 'generated' | 'sent' | 'viewed' | 'paid' | 'overd
 type InvoicePreset = {
     company_id: string;
     company_name: string;
+    email: string | null;
+    logo: string | null;
+    registration_number: string | null;
+    address: string | null;
+    phone: string | null;
     default_currency: string;
     default_invoice_prefix: string;
     default_notes: string | null;
     default_payment_instructions: string | null;
+    template_name: string;
+};
+
+type WebstoreSettings = {
+    company_id: string;
+    enabled: boolean;
+    title: string | null;
+    subtitle: string | null;
+    brand_color: string;
 };
 
 type InvoiceListItem = {
@@ -103,6 +117,12 @@ function safeString(value: unknown): string {
     return typeof value === 'string' ? value : '';
 }
 
+function normalizeHexColor(value: string, fallback = '#00a884'): string {
+    const raw = value.trim().toLowerCase();
+    if (/^#([0-9a-f]{3}|[0-9a-f]{6})$/.test(raw)) return raw;
+    return fallback;
+}
+
 export default function InvoicesView({
     sessionToken,
     apiBaseUrl,
@@ -111,6 +131,11 @@ export default function InvoicesView({
     const [presetLoading, setPresetLoading] = useState(false);
     const [presetError, setPresetError] = useState<string | null>(null);
     const [preset, setPreset] = useState<InvoicePreset | null>(null);
+    const [settingsError, setSettingsError] = useState<string | null>(null);
+    const [settingsNotice, setSettingsNotice] = useState<string | null>(null);
+    const [invoiceSettingsSaving, setInvoiceSettingsSaving] = useState(false);
+    const [webstoreSettingsLoading, setWebstoreSettingsLoading] = useState(false);
+    const [webstoreSettingsSaving, setWebstoreSettingsSaving] = useState(false);
 
     const [listLoading, setListLoading] = useState(false);
     const [listError, setListError] = useState<string | null>(null);
@@ -158,6 +183,22 @@ export default function InvoicesView({
     const [newProductDescription, setNewProductDescription] = useState('');
     const [productSubmitting, setProductSubmitting] = useState(false);
 
+    const [invoiceSettingLogo, setInvoiceSettingLogo] = useState('');
+    const [invoiceSettingRegistrationNumber, setInvoiceSettingRegistrationNumber] = useState('');
+    const [invoiceSettingAddress, setInvoiceSettingAddress] = useState('');
+    const [invoiceSettingEmail, setInvoiceSettingEmail] = useState('');
+    const [invoiceSettingPhone, setInvoiceSettingPhone] = useState('');
+    const [invoiceSettingDefaultCurrency, setInvoiceSettingDefaultCurrency] = useState('USD');
+    const [invoiceSettingDefaultPrefix, setInvoiceSettingDefaultPrefix] = useState('INV');
+    const [invoiceSettingDefaultNotes, setInvoiceSettingDefaultNotes] = useState('');
+    const [invoiceSettingDefaultPaymentInstructions, setInvoiceSettingDefaultPaymentInstructions] = useState('');
+
+    const [webstoreSettings, setWebstoreSettings] = useState<WebstoreSettings | null>(null);
+    const [webstoreEnabled, setWebstoreEnabled] = useState(true);
+    const [webstoreTitle, setWebstoreTitle] = useState('');
+    const [webstoreSubtitle, setWebstoreSubtitle] = useState('');
+    const [webstoreBrandColor, setWebstoreBrandColor] = useState('#00a884');
+
     const canUseApi = Boolean(sessionToken);
 
     const computedTotals = useMemo(() => {
@@ -200,21 +241,67 @@ export default function InvoicesView({
             const nextPreset: InvoicePreset = {
                 company_id: safeString(payload.data.company_id),
                 company_name: safeString(payload.data.company_name),
+                email: typeof payload.data.email === 'string' ? payload.data.email : null,
+                logo: typeof payload.data.logo === 'string' ? payload.data.logo : null,
+                registration_number: typeof payload.data.registration_number === 'string' ? payload.data.registration_number : null,
+                address: typeof payload.data.address === 'string' ? payload.data.address : null,
+                phone: typeof payload.data.phone === 'string' ? payload.data.phone : null,
                 default_currency: safeString(payload.data.default_currency || 'USD'),
                 default_invoice_prefix: safeString(payload.data.default_invoice_prefix || 'INV'),
                 default_notes: typeof payload.data.default_notes === 'string' ? payload.data.default_notes : null,
                 default_payment_instructions: typeof payload.data.default_payment_instructions === 'string'
                     ? payload.data.default_payment_instructions
-                    : null
+                    : null,
+                template_name: safeString(payload.data.template_name || 'default')
             };
             setPreset(nextPreset);
             setCurrency(nextPreset.default_currency || 'USD');
             setNotes(nextPreset.default_notes || '');
             setPaymentInstructions(nextPreset.default_payment_instructions || '');
+            setInvoiceSettingLogo(nextPreset.logo || '');
+            setInvoiceSettingRegistrationNumber(nextPreset.registration_number || '');
+            setInvoiceSettingAddress(nextPreset.address || '');
+            setInvoiceSettingEmail(nextPreset.email || '');
+            setInvoiceSettingPhone(nextPreset.phone || '');
+            setInvoiceSettingDefaultCurrency(nextPreset.default_currency || 'USD');
+            setInvoiceSettingDefaultPrefix(nextPreset.default_invoice_prefix || 'INV');
+            setInvoiceSettingDefaultNotes(nextPreset.default_notes || '');
+            setInvoiceSettingDefaultPaymentInstructions(nextPreset.default_payment_instructions || '');
         } catch (error: any) {
             setPresetError(error?.message || 'Failed to load invoice preset');
         } finally {
             setPresetLoading(false);
+        }
+    }, [apiBaseUrl, sessionToken]);
+
+    const loadWebstoreSettings = useCallback(async () => {
+        if (!sessionToken) return;
+        setWebstoreSettingsLoading(true);
+        setSettingsError(null);
+        try {
+            const res = await fetch(`${apiBaseUrl}/api/company/webstore-settings`, {
+                headers: { authorization: `Bearer ${sessionToken}` }
+            });
+            const payload = await res.json().catch(() => null);
+            if (!res.ok || !payload?.success || !payload?.data) {
+                throw new Error(payload?.error || 'Failed to load webstore settings');
+            }
+            const mapped: WebstoreSettings = {
+                company_id: safeString(payload.data.company_id),
+                enabled: payload.data.enabled !== false,
+                title: typeof payload.data.title === 'string' ? payload.data.title : null,
+                subtitle: typeof payload.data.subtitle === 'string' ? payload.data.subtitle : null,
+                brand_color: normalizeHexColor(safeString(payload.data.brand_color || '#00a884') || '#00a884')
+            };
+            setWebstoreSettings(mapped);
+            setWebstoreEnabled(mapped.enabled);
+            setWebstoreTitle(mapped.title || '');
+            setWebstoreSubtitle(mapped.subtitle || '');
+            setWebstoreBrandColor(mapped.brand_color || '#00a884');
+        } catch (error: any) {
+            setSettingsError(error?.message || 'Failed to load webstore settings');
+        } finally {
+            setWebstoreSettingsLoading(false);
         }
     }, [apiBaseUrl, sessionToken]);
 
@@ -293,13 +380,134 @@ export default function InvoicesView({
         loadPreset();
         loadInvoices();
         loadProducts();
-    }, [loadInvoices, loadPreset, loadProducts]);
+        loadWebstoreSettings();
+    }, [loadInvoices, loadPreset, loadProducts, loadWebstoreSettings]);
 
     useEffect(() => {
         if (!sendInvoiceId && invoices.length > 0) {
             setSendInvoiceId(invoices[0].id);
         }
     }, [invoices, sendInvoiceId]);
+
+    const handleSaveInvoiceSettings = useCallback(async () => {
+        if (!sessionToken) {
+            setSettingsError('Please sign in first.');
+            return;
+        }
+        setInvoiceSettingsSaving(true);
+        setSettingsError(null);
+        setSettingsNotice(null);
+        try {
+            const res = await fetch(`${apiBaseUrl}/api/company/invoice-preset`, {
+                method: 'POST',
+                headers: {
+                    authorization: `Bearer ${sessionToken}`,
+                    'content-type': 'application/json'
+                },
+                body: JSON.stringify({
+                    logo: invoiceSettingLogo.trim() || null,
+                    registration_number: invoiceSettingRegistrationNumber.trim() || null,
+                    address: invoiceSettingAddress.trim() || null,
+                    email: invoiceSettingEmail.trim() || null,
+                    phone: invoiceSettingPhone.trim() || null,
+                    default_currency: invoiceSettingDefaultCurrency.trim() || 'USD',
+                    default_invoice_prefix: invoiceSettingDefaultPrefix.trim() || 'INV',
+                    default_notes: invoiceSettingDefaultNotes.trim() || null,
+                    default_payment_instructions: invoiceSettingDefaultPaymentInstructions.trim() || null,
+                    template_name: preset?.template_name || 'default'
+                })
+            });
+            const payload = await res.json().catch(() => null);
+            if (!res.ok || !payload?.success || !payload?.data) {
+                throw new Error(payload?.error || 'Failed to save invoice settings');
+            }
+
+            const nextPreset: InvoicePreset = {
+                company_id: safeString(payload.data.company_id),
+                company_name: safeString(payload.data.company_name),
+                email: typeof payload.data.email === 'string' ? payload.data.email : null,
+                logo: typeof payload.data.logo === 'string' ? payload.data.logo : null,
+                registration_number: typeof payload.data.registration_number === 'string' ? payload.data.registration_number : null,
+                address: typeof payload.data.address === 'string' ? payload.data.address : null,
+                phone: typeof payload.data.phone === 'string' ? payload.data.phone : null,
+                default_currency: safeString(payload.data.default_currency || 'USD'),
+                default_invoice_prefix: safeString(payload.data.default_invoice_prefix || 'INV'),
+                default_notes: typeof payload.data.default_notes === 'string' ? payload.data.default_notes : null,
+                default_payment_instructions: typeof payload.data.default_payment_instructions === 'string'
+                    ? payload.data.default_payment_instructions
+                    : null,
+                template_name: safeString(payload.data.template_name || 'default')
+            };
+            setPreset(nextPreset);
+            setCurrency(nextPreset.default_currency || 'USD');
+            setNotes(nextPreset.default_notes || '');
+            setPaymentInstructions(nextPreset.default_payment_instructions || '');
+            setSettingsNotice('Invoice settings saved.');
+        } catch (error: any) {
+            setSettingsError(error?.message || 'Failed to save invoice settings');
+        } finally {
+            setInvoiceSettingsSaving(false);
+        }
+    }, [
+        apiBaseUrl,
+        invoiceSettingAddress,
+        invoiceSettingDefaultCurrency,
+        invoiceSettingDefaultNotes,
+        invoiceSettingDefaultPaymentInstructions,
+        invoiceSettingDefaultPrefix,
+        invoiceSettingEmail,
+        invoiceSettingLogo,
+        invoiceSettingPhone,
+        invoiceSettingRegistrationNumber,
+        preset?.template_name,
+        sessionToken
+    ]);
+
+    const handleSaveWebstoreSettings = useCallback(async () => {
+        if (!sessionToken) {
+            setSettingsError('Please sign in first.');
+            return;
+        }
+        setWebstoreSettingsSaving(true);
+        setSettingsError(null);
+        setSettingsNotice(null);
+        try {
+            const res = await fetch(`${apiBaseUrl}/api/company/webstore-settings`, {
+                method: 'POST',
+                headers: {
+                    authorization: `Bearer ${sessionToken}`,
+                    'content-type': 'application/json'
+                },
+                body: JSON.stringify({
+                    enabled: webstoreEnabled,
+                    title: webstoreTitle.trim() || null,
+                    subtitle: webstoreSubtitle.trim() || null,
+                    brand_color: normalizeHexColor(webstoreBrandColor, '#00a884')
+                })
+            });
+            const payload = await res.json().catch(() => null);
+            if (!res.ok || !payload?.success || !payload?.data) {
+                throw new Error(payload?.error || 'Failed to save webstore settings');
+            }
+            const mapped: WebstoreSettings = {
+                company_id: safeString(payload.data.company_id),
+                enabled: payload.data.enabled !== false,
+                title: typeof payload.data.title === 'string' ? payload.data.title : null,
+                subtitle: typeof payload.data.subtitle === 'string' ? payload.data.subtitle : null,
+                brand_color: normalizeHexColor(safeString(payload.data.brand_color || '#00a884') || '#00a884')
+            };
+            setWebstoreSettings(mapped);
+            setWebstoreEnabled(mapped.enabled);
+            setWebstoreTitle(mapped.title || '');
+            setWebstoreSubtitle(mapped.subtitle || '');
+            setWebstoreBrandColor(mapped.brand_color || '#00a884');
+            setSettingsNotice('Webstore settings saved.');
+        } catch (error: any) {
+            setSettingsError(error?.message || 'Failed to save webstore settings');
+        } finally {
+            setWebstoreSettingsSaving(false);
+        }
+    }, [apiBaseUrl, sessionToken, webstoreBrandColor, webstoreEnabled, webstoreSubtitle, webstoreTitle]);
 
     const resetForm = useCallback(() => {
         setInvoiceName('');
@@ -631,11 +839,12 @@ export default function InvoicesView({
                                     loadPreset();
                                     loadInvoices();
                                     loadProducts();
+                                    loadWebstoreSettings();
                                 }}
-                                disabled={!canUseApi || presetLoading || listLoading || productsLoading}
+                                disabled={!canUseApi || presetLoading || listLoading || productsLoading || webstoreSettingsLoading}
                                 className="px-3 py-2 rounded-xl border border-[#eceff1] bg-white text-[#111b21] text-xs font-bold hover:bg-[#f8f9fa] transition-all disabled:opacity-50"
                             >
-                                <RefreshCw className={`w-4 h-4 ${presetLoading || listLoading || productsLoading ? 'animate-spin' : ''}`} />
+                                <RefreshCw className={`w-4 h-4 ${presetLoading || listLoading || productsLoading || webstoreSettingsLoading ? 'animate-spin' : ''}`} />
                             </button>
                         </div>
 
@@ -674,6 +883,168 @@ export default function InvoicesView({
                                 {productsError}
                             </div>
                         )}
+                        {settingsError && (
+                            <div className="mt-4 px-3 py-2 rounded-xl bg-rose-50 border border-rose-200 text-rose-600 text-xs font-semibold">
+                                {settingsError}
+                            </div>
+                        )}
+                        {settingsNotice && (
+                            <div className="mt-4 px-3 py-2 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-700 text-xs font-semibold">
+                                {settingsNotice}
+                            </div>
+                        )}
+
+                        <div className="mt-5 grid grid-cols-1 lg:grid-cols-2 gap-5">
+                            <div className="rounded-2xl border border-[#eceff1] bg-[#f8f9fa] p-4">
+                                <div className="flex items-center justify-between gap-3 mb-3">
+                                    <h3 className="text-sm font-black uppercase tracking-widest text-[#54656f]">Invoice Settings</h3>
+                                    <button
+                                        type="button"
+                                        onClick={handleSaveInvoiceSettings}
+                                        disabled={!canUseApi || invoiceSettingsSaving}
+                                        className="px-3 py-1.5 rounded-lg bg-[#111b21] text-white text-[11px] font-bold uppercase tracking-widest hover:bg-[#202c33] transition-all disabled:opacity-50"
+                                    >
+                                        {invoiceSettingsSaving ? 'Saving…' : 'Save'}
+                                    </button>
+                                </div>
+                                <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                                    <input
+                                        value={invoiceSettingDefaultCurrency}
+                                        onChange={(e) => setInvoiceSettingDefaultCurrency(e.target.value.toUpperCase())}
+                                        placeholder="Default currency (USD)"
+                                        className="rounded-xl border border-[#eceff1] bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#00a884]/20"
+                                    />
+                                    <input
+                                        value={invoiceSettingDefaultPrefix}
+                                        onChange={(e) => setInvoiceSettingDefaultPrefix(e.target.value.toUpperCase())}
+                                        placeholder="Invoice prefix (INV)"
+                                        className="rounded-xl border border-[#eceff1] bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#00a884]/20"
+                                    />
+                                    <input
+                                        value={invoiceSettingEmail}
+                                        onChange={(e) => setInvoiceSettingEmail(e.target.value)}
+                                        placeholder="Company email"
+                                        className="rounded-xl border border-[#eceff1] bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#00a884]/20"
+                                    />
+                                    <input
+                                        value={invoiceSettingPhone}
+                                        onChange={(e) => setInvoiceSettingPhone(e.target.value)}
+                                        placeholder="Company phone"
+                                        className="rounded-xl border border-[#eceff1] bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#00a884]/20"
+                                    />
+                                    <input
+                                        value={invoiceSettingRegistrationNumber}
+                                        onChange={(e) => setInvoiceSettingRegistrationNumber(e.target.value)}
+                                        placeholder="Registration number"
+                                        className="rounded-xl border border-[#eceff1] bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#00a884]/20"
+                                    />
+                                    <input
+                                        value={invoiceSettingLogo}
+                                        onChange={(e) => setInvoiceSettingLogo(e.target.value)}
+                                        placeholder="Logo URL"
+                                        className="rounded-xl border border-[#eceff1] bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#00a884]/20"
+                                    />
+                                </div>
+                                <textarea
+                                    value={invoiceSettingAddress}
+                                    onChange={(e) => setInvoiceSettingAddress(e.target.value)}
+                                    rows={2}
+                                    placeholder="Company address"
+                                    className="mt-2 w-full rounded-xl border border-[#eceff1] bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#00a884]/20"
+                                />
+                                <textarea
+                                    value={invoiceSettingDefaultNotes}
+                                    onChange={(e) => setInvoiceSettingDefaultNotes(e.target.value)}
+                                    rows={2}
+                                    placeholder="Default invoice notes"
+                                    className="mt-2 w-full rounded-xl border border-[#eceff1] bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#00a884]/20"
+                                />
+                                <textarea
+                                    value={invoiceSettingDefaultPaymentInstructions}
+                                    onChange={(e) => setInvoiceSettingDefaultPaymentInstructions(e.target.value)}
+                                    rows={2}
+                                    placeholder="Default payment instructions"
+                                    className="mt-2 w-full rounded-xl border border-[#eceff1] bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#00a884]/20"
+                                />
+                            </div>
+
+                            <div className="rounded-2xl border border-[#eceff1] bg-[#f8f9fa] p-4">
+                                <div className="flex items-center justify-between gap-3 mb-3">
+                                    <h3 className="text-sm font-black uppercase tracking-widest text-[#54656f]">Webstore Settings</h3>
+                                    <button
+                                        type="button"
+                                        onClick={handleSaveWebstoreSettings}
+                                        disabled={!canUseApi || webstoreSettingsSaving}
+                                        className="px-3 py-1.5 rounded-lg bg-[#00a884] text-white text-[11px] font-bold uppercase tracking-widest hover:bg-[#008f6f] transition-all disabled:opacity-50"
+                                    >
+                                        {webstoreSettingsSaving ? 'Saving…' : 'Save'}
+                                    </button>
+                                </div>
+                                <label className="inline-flex items-center gap-2 text-sm font-semibold text-[#334155] mb-2">
+                                    <input
+                                        type="checkbox"
+                                        checked={webstoreEnabled}
+                                        onChange={(e) => setWebstoreEnabled(e.target.checked)}
+                                        className="w-4 h-4 accent-[#00a884]"
+                                    />
+                                    Enable public webstore
+                                </label>
+                                <input
+                                    value={webstoreTitle}
+                                    onChange={(e) => setWebstoreTitle(e.target.value)}
+                                    placeholder={preset ? `${preset.company_name} Store` : 'Store title'}
+                                    className="w-full rounded-xl border border-[#eceff1] bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#00a884]/20"
+                                />
+                                <textarea
+                                    value={webstoreSubtitle}
+                                    onChange={(e) => setWebstoreSubtitle(e.target.value)}
+                                    rows={2}
+                                    placeholder="Store subtitle shown on the public page"
+                                    className="mt-2 w-full rounded-xl border border-[#eceff1] bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#00a884]/20"
+                                />
+                                <div className="mt-2 grid grid-cols-[88px_1fr] gap-2 items-center">
+                                    <input
+                                        type="color"
+                                        value={normalizeHexColor(webstoreBrandColor, '#00a884')}
+                                        onChange={(e) => setWebstoreBrandColor(e.target.value)}
+                                        className="h-10 w-full rounded-lg border border-[#eceff1] bg-white px-1"
+                                    />
+                                    <input
+                                        value={webstoreBrandColor}
+                                        onChange={(e) => setWebstoreBrandColor(e.target.value)}
+                                        placeholder="#00a884"
+                                        className="rounded-xl border border-[#eceff1] bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#00a884]/20"
+                                    />
+                                </div>
+                                {preset?.company_id && (
+                                    <div className="mt-2 flex items-center gap-3 text-xs font-bold">
+                                        <a
+                                            href={`${window.location.origin}/${preset.company_id}/store`}
+                                            target="_blank"
+                                            rel="noopener noreferrer"
+                                            className="inline-flex items-center gap-1 text-[#00a884] hover:underline"
+                                        >
+                                            Open Store
+                                            <ExternalLink className="w-3.5 h-3.5" />
+                                        </a>
+                                        <a
+                                            href={`${window.location.origin}/customixie?company=${encodeURIComponent(preset.company_id)}`}
+                                            target="_blank"
+                                            rel="noopener noreferrer"
+                                            className="inline-flex items-center gap-1 text-[#111b21] hover:underline"
+                                        >
+                                            Open Customixie
+                                            <ExternalLink className="w-3.5 h-3.5" />
+                                        </a>
+                                    </div>
+                                )}
+                                {webstoreSettings && (
+                                    <div className="mt-2 text-[11px] text-[#54656f]">
+                                        Current profile: {webstoreSettings.company_id}
+                                    </div>
+                                )}
+                            </div>
+                        </div>
 
                         <div className="mt-5 grid grid-cols-1 lg:grid-cols-2 gap-5">
                             <div className="space-y-3">
