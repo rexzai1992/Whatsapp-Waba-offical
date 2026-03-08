@@ -368,7 +368,7 @@ export default function App() {
     const [workflowEditorMode, setWorkflowEditorMode] = useState<'visual' | 'json'>('visual');
     const menuRef = useRef<HTMLDivElement>(null);
     const profileMenuRef = useRef<HTMLDivElement>(null);
-    const messageInputRef = useRef<HTMLInputElement>(null);
+    const messageInputRef = useRef<HTMLTextAreaElement>(null);
     const activeProfileIdRef = useRef<string | null>(null);
     const lastRecoverAtRef = useRef(0);
     const lastInboundRef = useRef<number | null>(null);
@@ -3225,34 +3225,33 @@ export default function App() {
                                     </p>
                                 </div>
                             )}
-                                <input
+                                <textarea
                                     ref={messageInputRef}
-                                    type="text"
-                                    placeholder={canSendText ? 'Type a message' : 'Type a message (24h closed - use template)'}
+                                    placeholder={canSendText ? 'Type a message (Enter = newline, Ctrl/Cmd+Enter = send)' : 'Type a message (24h closed - use template)'}
                                     value={messageText}
                                     disabled={!canSendText}
                                     onChange={(e) => setMessageTextWithDraft(e.target.value)}
                                     onKeyDown={(e) => {
-                                    if (e.key === 'Enter') {
-                                        if (!canSendText) {
+                                        if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
                                             e.preventDefault();
-                                            setShowTemplateComposer(true);
-                                            return;
+                                            if (!canSendText) {
+                                                setShowTemplateComposer(true);
+                                                return;
+                                            }
+                                            if (quickReplyQuery !== null && quickReplySuggestions.length > 0) {
+                                                handleQuickReplyPick(quickReplySuggestions[0]);
+                                                return;
+                                            }
+                                            handleSendMessage();
                                         }
-                                        if (quickReplyQuery !== null && quickReplySuggestions.length > 0) {
+                                        if (canSendText && e.key === 'Tab' && quickReplyQuery !== null && quickReplySuggestions.length > 0) {
                                             e.preventDefault();
                                             handleQuickReplyPick(quickReplySuggestions[0]);
-                                            return;
                                         }
-                                        handleSendMessage();
-                                    }
-                                    if (canSendText && e.key === 'Tab' && quickReplyQuery !== null && quickReplySuggestions.length > 0) {
-                                        e.preventDefault();
-                                        handleQuickReplyPick(quickReplySuggestions[0]);
-                                    }
-                                }}
-                                className={`w-full border border-[#eceff1] rounded-xl px-4 py-3 text-[15px] focus:outline-none focus:ring-1 focus:ring-[#00a884]/20 placeholder:text-[#54656f]/50 ${canSendText ? 'bg-white text-[#111b21]' : 'bg-[#f8f9fa] text-[#9ca3af] cursor-not-allowed'}`}
-                            />
+                                    }}
+                                    rows={2}
+                                    className={`w-full border border-[#eceff1] rounded-xl px-4 py-3 text-[15px] leading-6 resize-y min-h-[52px] max-h-[180px] focus:outline-none focus:ring-1 focus:ring-[#00a884]/20 placeholder:text-[#54656f]/50 ${canSendText ? 'bg-white text-[#111b21]' : 'bg-[#f8f9fa] text-[#9ca3af] cursor-not-allowed'}`}
+                                />
                             {hasComposerMedia && (
                                 <div className="mt-1 text-[11px] font-bold text-[#00a884]">
                                     Attachment ready: {composerMediaType}

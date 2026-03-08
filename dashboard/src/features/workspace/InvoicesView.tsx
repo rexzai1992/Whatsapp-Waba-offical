@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { ExternalLink, FileText, Plus, RefreshCw, Send, Trash2 } from 'lucide-react';
+import { ExternalLink, FileText, PencilLine, Plus, RefreshCw, Send, Sparkles, Trash2 } from 'lucide-react';
 
 type InvoiceStatus = 'draft' | 'generated' | 'sent' | 'viewed' | 'paid' | 'overdue' | 'cancelled';
 
@@ -24,6 +24,9 @@ type WebstoreSettings = {
     title: string | null;
     subtitle: string | null;
     brand_color: string;
+    theme: 'editorial' | 'midnight' | 'sunrise';
+    show_logo: boolean;
+    hero_badge: string | null;
 };
 
 type InvoiceListItem = {
@@ -123,6 +126,12 @@ function normalizeHexColor(value: string, fallback = '#00a884'): string {
     return fallback;
 }
 
+function normalizeTheme(value: string): 'editorial' | 'midnight' | 'sunrise' {
+    const theme = value.trim().toLowerCase();
+    if (theme === 'midnight' || theme === 'sunrise' || theme === 'editorial') return theme;
+    return 'editorial';
+}
+
 export default function InvoicesView({
     sessionToken,
     apiBaseUrl,
@@ -131,6 +140,7 @@ export default function InvoicesView({
     const [presetLoading, setPresetLoading] = useState(false);
     const [presetError, setPresetError] = useState<string | null>(null);
     const [preset, setPreset] = useState<InvoicePreset | null>(null);
+    const [currentRole, setCurrentRole] = useState<string | null>(null);
     const [settingsError, setSettingsError] = useState<string | null>(null);
     const [settingsNotice, setSettingsNotice] = useState<string | null>(null);
     const [invoiceSettingsSaving, setInvoiceSettingsSaving] = useState(false);
@@ -178,10 +188,14 @@ export default function InvoicesView({
     const [products, setProducts] = useState<StoreProduct[]>([]);
     const [catalogPickId, setCatalogPickId] = useState('');
     const [newProductName, setNewProductName] = useState('');
+    const [newProductSlug, setNewProductSlug] = useState('');
     const [newProductPrice, setNewProductPrice] = useState('0');
+    const [newProductStockQty, setNewProductStockQty] = useState('0');
     const [newProductSku, setNewProductSku] = useState('');
+    const [newProductImageUrl, setNewProductImageUrl] = useState('');
     const [newProductDescription, setNewProductDescription] = useState('');
     const [productSubmitting, setProductSubmitting] = useState(false);
+    const [editingProductId, setEditingProductId] = useState<string | null>(null);
 
     const [invoiceSettingLogo, setInvoiceSettingLogo] = useState('');
     const [invoiceSettingRegistrationNumber, setInvoiceSettingRegistrationNumber] = useState('');
@@ -198,8 +212,13 @@ export default function InvoicesView({
     const [webstoreTitle, setWebstoreTitle] = useState('');
     const [webstoreSubtitle, setWebstoreSubtitle] = useState('');
     const [webstoreBrandColor, setWebstoreBrandColor] = useState('#00a884');
+    const [webstoreTheme, setWebstoreTheme] = useState<'editorial' | 'midnight' | 'sunrise'>('editorial');
+    const [webstoreShowLogo, setWebstoreShowLogo] = useState(true);
+    const [webstoreHeroBadge, setWebstoreHeroBadge] = useState('');
 
     const canUseApi = Boolean(sessionToken);
+    const canSaveSettings = currentRole === 'admin' || currentRole === 'owner';
+    const activeProducts = useMemo(() => products.filter((product) => product.is_active), [products]);
 
     const computedTotals = useMemo(() => {
         const normalized = items.map((item) => {
@@ -291,17 +310,40 @@ export default function InvoicesView({
                 enabled: payload.data.enabled !== false,
                 title: typeof payload.data.title === 'string' ? payload.data.title : null,
                 subtitle: typeof payload.data.subtitle === 'string' ? payload.data.subtitle : null,
-                brand_color: normalizeHexColor(safeString(payload.data.brand_color || '#00a884') || '#00a884')
+                brand_color: normalizeHexColor(safeString(payload.data.brand_color || '#00a884') || '#00a884'),
+                theme: normalizeTheme(safeString(payload.data.theme || 'editorial')),
+                show_logo: payload.data.show_logo !== false,
+                hero_badge: typeof payload.data.hero_badge === 'string' ? payload.data.hero_badge : null
             };
             setWebstoreSettings(mapped);
             setWebstoreEnabled(mapped.enabled);
             setWebstoreTitle(mapped.title || '');
             setWebstoreSubtitle(mapped.subtitle || '');
             setWebstoreBrandColor(mapped.brand_color || '#00a884');
+            setWebstoreTheme(mapped.theme);
+            setWebstoreShowLogo(mapped.show_logo);
+            setWebstoreHeroBadge(mapped.hero_badge || '');
         } catch (error: any) {
             setSettingsError(error?.message || 'Failed to load webstore settings');
         } finally {
             setWebstoreSettingsLoading(false);
+        }
+    }, [apiBaseUrl, sessionToken]);
+
+    const loadCurrentRole = useCallback(async () => {
+        if (!sessionToken) return;
+        try {
+            const res = await fetch(`${apiBaseUrl}/api/company/team-users`, {
+                headers: { authorization: `Bearer ${sessionToken}` }
+            });
+            const payload = await res.json().catch(() => null);
+            if (!res.ok || !payload?.success) {
+                return;
+            }
+            const role = safeString(payload?.data?.currentUserRole);
+            setCurrentRole(role || null);
+        } catch {
+            // Role lookup is best-effort. Save endpoints still enforce admin on the server.
         }
     }, [apiBaseUrl, sessionToken]);
 
@@ -348,7 +390,7 @@ export default function InvoicesView({
         setProductsLoading(true);
         setProductsError(null);
         try {
-            const res = await fetch(`${apiBaseUrl}/api/store/products?limit=200`, {
+            const res = await fetch(`${apiBaseUrl}/api/store/products?limit=200&include_inactive=true`, {
                 headers: { authorization: `Bearer ${sessionToken}` }
             });
             const payload = await res.json().catch(() => null);
@@ -368,7 +410,8 @@ export default function InvoicesView({
                 is_active: row.is_active !== false
             }));
             setProducts(mapped);
-            setCatalogPickId((prev) => (prev || mapped[0]?.id || ''));
+            const firstActive = mapped.find((product) => product.is_active)?.id || '';
+            setCatalogPickId((prev) => (prev || firstActive));
         } catch (error: any) {
             setProductsError(error?.message || 'Failed to load products');
         } finally {
@@ -381,7 +424,8 @@ export default function InvoicesView({
         loadInvoices();
         loadProducts();
         loadWebstoreSettings();
-    }, [loadInvoices, loadPreset, loadProducts, loadWebstoreSettings]);
+        loadCurrentRole();
+    }, [loadCurrentRole, loadInvoices, loadPreset, loadProducts, loadWebstoreSettings]);
 
     useEffect(() => {
         if (!sendInvoiceId && invoices.length > 0) {
@@ -392,6 +436,10 @@ export default function InvoicesView({
     const handleSaveInvoiceSettings = useCallback(async () => {
         if (!sessionToken) {
             setSettingsError('Please sign in first.');
+            return;
+        }
+        if (!canSaveSettings) {
+            setSettingsError('admin role required');
             return;
         }
         setInvoiceSettingsSaving(true);
@@ -450,6 +498,7 @@ export default function InvoicesView({
         }
     }, [
         apiBaseUrl,
+        canSaveSettings,
         invoiceSettingAddress,
         invoiceSettingDefaultCurrency,
         invoiceSettingDefaultNotes,
@@ -468,6 +517,10 @@ export default function InvoicesView({
             setSettingsError('Please sign in first.');
             return;
         }
+        if (!canSaveSettings) {
+            setSettingsError('admin role required');
+            return;
+        }
         setWebstoreSettingsSaving(true);
         setSettingsError(null);
         setSettingsNotice(null);
@@ -482,7 +535,10 @@ export default function InvoicesView({
                     enabled: webstoreEnabled,
                     title: webstoreTitle.trim() || null,
                     subtitle: webstoreSubtitle.trim() || null,
-                    brand_color: normalizeHexColor(webstoreBrandColor, '#00a884')
+                    brand_color: normalizeHexColor(webstoreBrandColor, '#00a884'),
+                    theme: webstoreTheme,
+                    show_logo: webstoreShowLogo,
+                    hero_badge: webstoreHeroBadge.trim() || null
                 })
             });
             const payload = await res.json().catch(() => null);
@@ -494,20 +550,37 @@ export default function InvoicesView({
                 enabled: payload.data.enabled !== false,
                 title: typeof payload.data.title === 'string' ? payload.data.title : null,
                 subtitle: typeof payload.data.subtitle === 'string' ? payload.data.subtitle : null,
-                brand_color: normalizeHexColor(safeString(payload.data.brand_color || '#00a884') || '#00a884')
+                brand_color: normalizeHexColor(safeString(payload.data.brand_color || '#00a884') || '#00a884'),
+                theme: normalizeTheme(safeString(payload.data.theme || 'editorial')),
+                show_logo: payload.data.show_logo !== false,
+                hero_badge: typeof payload.data.hero_badge === 'string' ? payload.data.hero_badge : null
             };
             setWebstoreSettings(mapped);
             setWebstoreEnabled(mapped.enabled);
             setWebstoreTitle(mapped.title || '');
             setWebstoreSubtitle(mapped.subtitle || '');
             setWebstoreBrandColor(mapped.brand_color || '#00a884');
+            setWebstoreTheme(mapped.theme);
+            setWebstoreShowLogo(mapped.show_logo);
+            setWebstoreHeroBadge(mapped.hero_badge || '');
             setSettingsNotice('Webstore settings saved.');
         } catch (error: any) {
             setSettingsError(error?.message || 'Failed to save webstore settings');
         } finally {
             setWebstoreSettingsSaving(false);
         }
-    }, [apiBaseUrl, sessionToken, webstoreBrandColor, webstoreEnabled, webstoreSubtitle, webstoreTitle]);
+    }, [
+        apiBaseUrl,
+        canSaveSettings,
+        sessionToken,
+        webstoreBrandColor,
+        webstoreEnabled,
+        webstoreHeroBadge,
+        webstoreShowLogo,
+        webstoreSubtitle,
+        webstoreTheme,
+        webstoreTitle
+    ]);
 
     const resetForm = useCallback(() => {
         setInvoiceName('');
@@ -530,7 +603,7 @@ export default function InvoicesView({
             if (!productId) {
                 return { ...item, product_id: '' };
             }
-            const product = products.find((row) => row.id === productId);
+            const product = activeProducts.find((row) => row.id === productId);
             if (!product) return { ...item, product_id: '' };
             return {
                 ...item,
@@ -540,10 +613,10 @@ export default function InvoicesView({
                 unit_price: String(product.price || 0)
             };
         }));
-    }, [products]);
+    }, [activeProducts]);
 
     const handleAddProductItem = useCallback(() => {
-        const product = products.find((row) => row.id === catalogPickId);
+        const product = activeProducts.find((row) => row.id === catalogPickId);
         if (!product) {
             setFormError('Pick a product first.');
             return;
@@ -560,7 +633,7 @@ export default function InvoicesView({
             }
         ]);
         setFormError(null);
-    }, [catalogPickId, products]);
+    }, [activeProducts, catalogPickId]);
 
     const removeItem = useCallback((itemId: string) => {
         setItems((prev) => {
@@ -691,7 +764,29 @@ export default function InvoicesView({
         sessionToken
     ]);
 
-    const handleCreateProduct = useCallback(async () => {
+    const resetProductForm = useCallback(() => {
+        setEditingProductId(null);
+        setNewProductName('');
+        setNewProductSlug('');
+        setNewProductPrice('0');
+        setNewProductStockQty('0');
+        setNewProductSku('');
+        setNewProductImageUrl('');
+        setNewProductDescription('');
+    }, []);
+
+    const handleEditProduct = useCallback((product: StoreProduct) => {
+        setEditingProductId(product.id);
+        setNewProductName(product.name);
+        setNewProductSlug(product.slug);
+        setNewProductPrice(String(product.price || 0));
+        setNewProductStockQty(String(product.stock_qty || 0));
+        setNewProductSku(product.sku || '');
+        setNewProductImageUrl(product.image_url || '');
+        setNewProductDescription(product.description || '');
+    }, []);
+
+    const handleSaveProduct = useCallback(async () => {
         if (!sessionToken) {
             setProductsError('Please sign in first.');
             return;
@@ -706,50 +801,153 @@ export default function InvoicesView({
             setProductsError('Product price must be >= 0.');
             return;
         }
+        const stockValue = Math.max(0, Math.floor(Number(newProductStockQty || '0')));
+        if (!Number.isFinite(stockValue) || stockValue < 0) {
+            setProductsError('Stock must be a number >= 0.');
+            return;
+        }
 
         setProductSubmitting(true);
         setProductsError(null);
         try {
-            const res = await fetch(`${apiBaseUrl}/api/store/products`, {
-                method: 'POST',
+            const endpoint = editingProductId
+                ? `${apiBaseUrl}/api/store/products/${encodeURIComponent(editingProductId)}`
+                : `${apiBaseUrl}/api/store/products`;
+            const res = await fetch(endpoint, {
+                method: editingProductId ? 'PUT' : 'POST',
                 headers: {
                     authorization: `Bearer ${sessionToken}`,
                     'content-type': 'application/json'
                 },
                 body: JSON.stringify({
                     name: newProductName.trim(),
+                    slug: newProductSlug.trim() || undefined,
                     price: priceValue,
-                    currency: currency.trim() || 'USD',
+                    currency: (currency.trim() || 'USD').toUpperCase(),
+                    stock_qty: stockValue,
                     sku: newProductSku.trim() || undefined,
-                    description: newProductDescription.trim() || undefined
+                    image_url: newProductImageUrl.trim() || undefined,
+                    description: newProductDescription.trim() || undefined,
+                    is_active: true
                 })
             });
             const payload = await res.json().catch(() => null);
             if (!res.ok || !payload?.success) {
-                throw new Error(payload?.error || 'Failed to create product');
+                throw new Error(payload?.error || 'Failed to save product');
             }
 
-            setNewProductName('');
-            setNewProductPrice('0');
-            setNewProductSku('');
-            setNewProductDescription('');
-            setFormNotice('Product added to webstore catalog.');
+            resetProductForm();
+            setFormNotice(editingProductId ? 'Product updated.' : 'Product added to webstore catalog.');
             loadProducts();
         } catch (error: any) {
-            setProductsError(error?.message || 'Failed to create product');
+            setProductsError(error?.message || 'Failed to save product');
         } finally {
             setProductSubmitting(false);
         }
     }, [
         apiBaseUrl,
         currency,
+        editingProductId,
         loadProducts,
         newProductDescription,
+        newProductImageUrl,
         newProductName,
         newProductPrice,
+        newProductSlug,
+        newProductStockQty,
         newProductSku,
+        resetProductForm,
         sessionToken
     ]);
+
+    const handleArchiveProduct = useCallback(async (productId: string) => {
+        if (!sessionToken) {
+            setProductsError('Please sign in first.');
+            return;
+        }
+        setProductSubmitting(true);
+        setProductsError(null);
+        try {
+            const res = await fetch(`${apiBaseUrl}/api/store/products/${encodeURIComponent(productId)}`, {
+                method: 'DELETE',
+                headers: { authorization: `Bearer ${sessionToken}` }
+            });
+            const payload = await res.json().catch(() => null);
+            if (!res.ok || !payload?.success) {
+                throw new Error(payload?.error || 'Failed to archive product');
+            }
+            setFormNotice('Product archived.');
+            if (editingProductId === productId) {
+                resetProductForm();
+            }
+            loadProducts();
+        } catch (error: any) {
+            setProductsError(error?.message || 'Failed to archive product');
+        } finally {
+            setProductSubmitting(false);
+        }
+    }, [apiBaseUrl, editingProductId, loadProducts, resetProductForm, sessionToken]);
+
+    const handleToggleProductActive = useCallback(async (product: StoreProduct, nextActive: boolean) => {
+        if (!sessionToken) {
+            setProductsError('Please sign in first.');
+            return;
+        }
+        setProductSubmitting(true);
+        setProductsError(null);
+        try {
+            const res = await fetch(`${apiBaseUrl}/api/store/products/${encodeURIComponent(product.id)}`, {
+                method: 'PUT',
+                headers: {
+                    authorization: `Bearer ${sessionToken}`,
+                    'content-type': 'application/json'
+                },
+                body: JSON.stringify({ is_active: nextActive })
+            });
+            const payload = await res.json().catch(() => null);
+            if (!res.ok || !payload?.success) {
+                throw new Error(payload?.error || 'Failed to update product status');
+            }
+            setFormNotice(nextActive ? 'Product published.' : 'Product hidden.');
+            loadProducts();
+        } catch (error: any) {
+            setProductsError(error?.message || 'Failed to update product status');
+        } finally {
+            setProductSubmitting(false);
+        }
+    }, [apiBaseUrl, loadProducts, sessionToken]);
+
+    const handleSeedDemoProducts = useCallback(async () => {
+        if (!sessionToken) {
+            setProductsError('Please sign in first.');
+            return;
+        }
+        if (!canSaveSettings) {
+            setProductsError('admin role required');
+            return;
+        }
+        setProductSubmitting(true);
+        setProductsError(null);
+        try {
+            const res = await fetch(`${apiBaseUrl}/api/store/products/demo-seed`, {
+                method: 'POST',
+                headers: {
+                    authorization: `Bearer ${sessionToken}`,
+                    'content-type': 'application/json'
+                }
+            });
+            const payload = await res.json().catch(() => null);
+            if (!res.ok || !payload?.success) {
+                throw new Error(payload?.error || 'Failed to add demo products');
+            }
+            setFormNotice('5 demo products added to webstore.');
+            loadProducts();
+        } catch (error: any) {
+            setProductsError(error?.message || 'Failed to add demo products');
+        } finally {
+            setProductSubmitting(false);
+        }
+    }, [apiBaseUrl, canSaveSettings, loadProducts, sessionToken]);
 
     const handleSendInvoiceTemplate = useCallback(async () => {
         if (!sessionToken) {
@@ -840,6 +1038,7 @@ export default function InvoicesView({
                                     loadInvoices();
                                     loadProducts();
                                     loadWebstoreSettings();
+                                    loadCurrentRole();
                                 }}
                                 disabled={!canUseApi || presetLoading || listLoading || productsLoading || webstoreSettingsLoading}
                                 className="px-3 py-2 rounded-xl border border-[#eceff1] bg-white text-[#111b21] text-xs font-bold hover:bg-[#f8f9fa] transition-all disabled:opacity-50"
@@ -893,6 +1092,11 @@ export default function InvoicesView({
                                 {settingsNotice}
                             </div>
                         )}
+                        {!canSaveSettings && (
+                            <div className="mt-4 px-3 py-2 rounded-xl bg-amber-50 border border-amber-200 text-amber-700 text-xs font-semibold">
+                                Admin role required to save invoice/webstore settings.
+                            </div>
+                        )}
 
                         <div className="mt-5 grid grid-cols-1 lg:grid-cols-2 gap-5">
                             <div className="rounded-2xl border border-[#eceff1] bg-[#f8f9fa] p-4">
@@ -901,7 +1105,7 @@ export default function InvoicesView({
                                     <button
                                         type="button"
                                         onClick={handleSaveInvoiceSettings}
-                                        disabled={!canUseApi || invoiceSettingsSaving}
+                                        disabled={!canUseApi || !canSaveSettings || invoiceSettingsSaving}
                                         className="px-3 py-1.5 rounded-lg bg-[#111b21] text-white text-[11px] font-bold uppercase tracking-widest hover:bg-[#202c33] transition-all disabled:opacity-50"
                                     >
                                         {invoiceSettingsSaving ? 'Saving…' : 'Save'}
@@ -974,7 +1178,7 @@ export default function InvoicesView({
                                     <button
                                         type="button"
                                         onClick={handleSaveWebstoreSettings}
-                                        disabled={!canUseApi || webstoreSettingsSaving}
+                                        disabled={!canUseApi || !canSaveSettings || webstoreSettingsSaving}
                                         className="px-3 py-1.5 rounded-lg bg-[#00a884] text-white text-[11px] font-bold uppercase tracking-widest hover:bg-[#008f6f] transition-all disabled:opacity-50"
                                     >
                                         {webstoreSettingsSaving ? 'Saving…' : 'Save'}
@@ -1002,6 +1206,32 @@ export default function InvoicesView({
                                     placeholder="Store subtitle shown on the public page"
                                     className="mt-2 w-full rounded-xl border border-[#eceff1] bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#00a884]/20"
                                 />
+                                <div className="mt-2 grid grid-cols-1 md:grid-cols-2 gap-2">
+                                    <select
+                                        value={webstoreTheme}
+                                        onChange={(e) => setWebstoreTheme(normalizeTheme(e.target.value))}
+                                        className="rounded-xl border border-[#eceff1] bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#00a884]/20"
+                                    >
+                                        <option value="editorial">Theme: Editorial</option>
+                                        <option value="midnight">Theme: Midnight</option>
+                                        <option value="sunrise">Theme: Sunrise</option>
+                                    </select>
+                                    <input
+                                        value={webstoreHeroBadge}
+                                        onChange={(e) => setWebstoreHeroBadge(e.target.value)}
+                                        placeholder="Hero badge (e.g. Limited Drop)"
+                                        className="rounded-xl border border-[#eceff1] bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#00a884]/20"
+                                    />
+                                </div>
+                                <label className="mt-2 inline-flex items-center gap-2 text-xs font-bold text-[#334155]">
+                                    <input
+                                        type="checkbox"
+                                        checked={webstoreShowLogo}
+                                        onChange={(e) => setWebstoreShowLogo(e.target.checked)}
+                                        className="w-4 h-4 accent-[#00a884]"
+                                    />
+                                    Show company logo on store hero
+                                </label>
                                 <div className="mt-2 grid grid-cols-[88px_1fr] gap-2 items-center">
                                     <input
                                         type="color"
@@ -1145,8 +1375,8 @@ export default function InvoicesView({
                         </div>
 
                         <div className="mt-6 rounded-2xl border border-[#eceff1] bg-[#f8f9fa] p-4">
-                            <div className="flex items-center justify-between mb-3">
-                                <h3 className="text-sm font-black uppercase tracking-widest text-[#54656f]">Webstore Products</h3>
+                            <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
+                                <h3 className="text-sm font-black uppercase tracking-widest text-[#54656f]">Product Settings</h3>
                                 {preset?.company_id && (
                                     <div className="flex items-center gap-2">
                                         <a
@@ -1178,34 +1408,121 @@ export default function InvoicesView({
                                     className="md:col-span-3 rounded-xl border border-[#eceff1] bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#00a884]/20"
                                 />
                                 <input
+                                    value={newProductSlug}
+                                    onChange={(e) => setNewProductSlug(e.target.value)}
+                                    placeholder="Slug (optional)"
+                                    className="md:col-span-2 rounded-xl border border-[#eceff1] bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#00a884]/20"
+                                />
+                                <input
                                     value={newProductPrice}
                                     onChange={(e) => setNewProductPrice(e.target.value)}
                                     placeholder="Price"
                                     className="md:col-span-2 rounded-xl border border-[#eceff1] bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#00a884]/20"
                                 />
                                 <input
+                                    value={newProductStockQty}
+                                    onChange={(e) => setNewProductStockQty(e.target.value)}
+                                    placeholder="Stock qty"
+                                    className="md:col-span-2 rounded-xl border border-[#eceff1] bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#00a884]/20"
+                                />
+                                <input
                                     value={newProductSku}
                                     onChange={(e) => setNewProductSku(e.target.value)}
-                                    placeholder="SKU (optional)"
-                                    className="md:col-span-2 rounded-xl border border-[#eceff1] bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#00a884]/20"
+                                    placeholder="SKU"
+                                    className="md:col-span-3 rounded-xl border border-[#eceff1] bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#00a884]/20"
+                                />
+                                <input
+                                    value={newProductImageUrl}
+                                    onChange={(e) => setNewProductImageUrl(e.target.value)}
+                                    placeholder="Image URL (optional)"
+                                    className="md:col-span-4 rounded-xl border border-[#eceff1] bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#00a884]/20"
                                 />
                                 <input
                                     value={newProductDescription}
                                     onChange={(e) => setNewProductDescription(e.target.value)}
-                                    placeholder="Description (optional)"
-                                    className="md:col-span-4 rounded-xl border border-[#eceff1] bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#00a884]/20"
+                                    placeholder="Description"
+                                    className="md:col-span-6 rounded-xl border border-[#eceff1] bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#00a884]/20"
                                 />
                                 <button
                                     type="button"
-                                    onClick={handleCreateProduct}
+                                    onClick={handleSaveProduct}
                                     disabled={!canUseApi || productSubmitting}
-                                    className="md:col-span-1 rounded-xl bg-[#111b21] text-white text-xs font-bold hover:bg-[#202c33] transition-all disabled:opacity-50"
+                                    className="md:col-span-2 rounded-xl bg-[#111b21] text-white text-xs font-bold hover:bg-[#202c33] transition-all disabled:opacity-50"
                                 >
-                                    {productSubmitting ? 'Saving…' : 'Save'}
+                                    {productSubmitting ? 'Saving…' : editingProductId ? 'Update Product' : 'Save Product'}
                                 </button>
+                                <button
+                                    type="button"
+                                    onClick={handleSeedDemoProducts}
+                                    disabled={!canUseApi || productSubmitting || !canSaveSettings}
+                                    className="md:col-span-2 rounded-xl bg-[#00a884] text-white text-xs font-bold hover:bg-[#008f6f] transition-all disabled:opacity-50 inline-flex items-center justify-center gap-1"
+                                >
+                                    <Sparkles className="w-3.5 h-3.5" />
+                                    Add 5 Demo
+                                </button>
+                                {editingProductId && (
+                                    <button
+                                        type="button"
+                                        onClick={resetProductForm}
+                                        className="md:col-span-2 rounded-xl border border-[#cbd5e1] text-[#334155] text-xs font-bold hover:bg-white transition-all"
+                                    >
+                                        Cancel Edit
+                                    </button>
+                                )}
                             </div>
                             <div className="mt-2 text-xs text-[#54656f]">
-                                {productsLoading ? 'Loading products…' : `${products.length} active products available for invoice items.`}
+                                {productsLoading
+                                    ? 'Loading products…'
+                                    : `${activeProducts.length} active / ${products.length} total products.`}
+                            </div>
+                            <div className="mt-3 grid grid-cols-1 md:grid-cols-2 gap-2">
+                                {products.map((product) => (
+                                    <div key={product.id} className="rounded-xl border border-[#e2e8f0] bg-white p-3">
+                                        <div className="flex items-start justify-between gap-3">
+                                            <div>
+                                                <div className="text-sm font-black text-[#111b21]">{product.name}</div>
+                                                <div className="text-[11px] text-[#64748b]">
+                                                    {product.slug} {product.sku ? `• ${product.sku}` : ''}
+                                                </div>
+                                                <div className="text-xs font-bold text-[#0f172a] mt-1">
+                                                    {formatMoney(product.price, product.currency)} • Stock {product.stock_qty}
+                                                </div>
+                                                {product.description && (
+                                                    <div className="text-xs text-[#54656f] mt-1">{product.description}</div>
+                                                )}
+                                            </div>
+                                            <span className={`px-2 py-1 rounded-full text-[10px] font-black uppercase ${product.is_active ? 'bg-emerald-50 text-emerald-700 border border-emerald-200' : 'bg-slate-100 text-slate-500 border border-slate-200'}`}>
+                                                {product.is_active ? 'Active' : 'Hidden'}
+                                            </span>
+                                        </div>
+                                        <div className="mt-2 flex items-center gap-2 flex-wrap">
+                                            <button
+                                                type="button"
+                                                onClick={() => handleEditProduct(product)}
+                                                className="inline-flex items-center gap-1 rounded-lg border border-[#cbd5e1] px-2.5 py-1 text-[11px] font-bold text-[#334155] hover:bg-[#f8fafc]"
+                                            >
+                                                <PencilLine className="w-3 h-3" />
+                                                Edit
+                                            </button>
+                                            <button
+                                                type="button"
+                                                onClick={() => handleToggleProductActive(product, !product.is_active)}
+                                                disabled={productSubmitting}
+                                                className="rounded-lg border border-[#cbd5e1] px-2.5 py-1 text-[11px] font-bold text-[#334155] hover:bg-[#f8fafc] disabled:opacity-50"
+                                            >
+                                                {product.is_active ? 'Hide' : 'Publish'}
+                                            </button>
+                                            <button
+                                                type="button"
+                                                onClick={() => handleArchiveProduct(product.id)}
+                                                disabled={productSubmitting}
+                                                className="rounded-lg border border-rose-200 px-2.5 py-1 text-[11px] font-bold text-rose-600 hover:bg-rose-50 disabled:opacity-50"
+                                            >
+                                                Archive
+                                            </button>
+                                        </div>
+                                    </div>
+                                ))}
                             </div>
                         </div>
 
@@ -1219,7 +1536,7 @@ export default function InvoicesView({
                                         className="rounded-lg border border-[#eceff1] bg-white px-2 py-1.5 text-xs font-semibold text-[#334155]"
                                     >
                                         <option value="">Pick product</option>
-                                        {products.map((product) => (
+                                        {activeProducts.map((product) => (
                                             <option key={product.id} value={product.id}>
                                                 {product.name} ({formatMoney(product.price, product.currency)})
                                             </option>

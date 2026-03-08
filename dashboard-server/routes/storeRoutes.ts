@@ -91,7 +91,7 @@ function isWebstoreSettingsMissingError(error: any): boolean {
 }
 
 const WEBSTORE_SETTINGS_MISSING_MESSAGE =
-    'Webstore settings columns are missing. Run migration 20260307_company_webstore_settings.sql.'
+    'Webstore settings columns are missing. Run migrations 20260307_company_webstore_settings.sql and 20260308_webstore_design_settings.sql.'
 
 function normalizeHexColor(input: any, fallback = '#00a884'): string {
     const raw = readTrimmed(input).toLowerCase()
@@ -107,6 +107,112 @@ function parseBoolean(value: any, fallback = true): boolean {
     if (['0', 'false', 'no', 'off'].includes(normalized)) return false
     if (['1', 'true', 'yes', 'on'].includes(normalized)) return true
     return fallback
+}
+
+function normalizeTheme(input: any, fallback = 'editorial'): 'editorial' | 'midnight' | 'sunrise' {
+    const raw = readTrimmed(input).toLowerCase()
+    if (raw === 'midnight' || raw === 'sunrise' || raw === 'editorial') return raw
+    return fallback as 'editorial' | 'midnight' | 'sunrise'
+}
+
+function themePalette(theme: 'editorial' | 'midnight' | 'sunrise') {
+    if (theme === 'midnight') {
+        return {
+            bg: 'linear-gradient(160deg, #090b1a 0%, #101428 42%, #1a2040 100%)',
+            surface: '#10172a',
+            text: '#f8fafc',
+            muted: '#cbd5e1',
+            line: '#223056'
+        }
+    }
+    if (theme === 'sunrise') {
+        return {
+            bg: 'linear-gradient(135deg, #fff7ed 0%, #fef3c7 50%, #fef9c3 100%)',
+            surface: '#ffffff',
+            text: '#1f2937',
+            muted: '#6b7280',
+            line: '#fcd34d'
+        }
+    }
+    return {
+        bg: 'radial-gradient(circle at 0 0, #d9f8ef 0%, #f4f7f8 45%)',
+        surface: '#ffffff',
+        text: '#0f172a',
+        muted: '#475569',
+        line: '#d9e2e6'
+    }
+}
+
+function buildDemoProducts(companyId: string, currency: string) {
+    const now = new Date().toISOString()
+    const code = normalizeCurrency(currency, 'USD')
+    return [
+        {
+            company_id: companyId,
+            name: 'Aero Bottle 750ml',
+            slug: 'aero-bottle-750',
+            sku: 'DEMO-BTL-750',
+            description: 'Insulated steel bottle for daily carry.',
+            price: 29.9,
+            currency: code,
+            stock_qty: 48,
+            image_url: 'https://images.unsplash.com/photo-1602143407151-7111542de6e8?auto=format&fit=crop&w=900&q=80',
+            is_active: true,
+            updated_at: now
+        },
+        {
+            company_id: companyId,
+            name: 'Canvas Daily Tote',
+            slug: 'canvas-daily-tote',
+            sku: 'DEMO-TOTE-01',
+            description: 'Minimal canvas tote with reinforced handle.',
+            price: 24.5,
+            currency: code,
+            stock_qty: 72,
+            image_url: 'https://images.unsplash.com/photo-1594633312681-425c7b97ccd1?auto=format&fit=crop&w=900&q=80',
+            is_active: true,
+            updated_at: now
+        },
+        {
+            company_id: companyId,
+            name: 'Desk Dock Charger',
+            slug: 'desk-dock-charger',
+            sku: 'DEMO-DOCK-02',
+            description: 'Fast wireless charging dock for office desk.',
+            price: 49.0,
+            currency: code,
+            stock_qty: 36,
+            image_url: 'https://images.unsplash.com/photo-1587829741301-dc798b83add3?auto=format&fit=crop&w=900&q=80',
+            is_active: true,
+            updated_at: now
+        },
+        {
+            company_id: companyId,
+            name: 'Flex Hoodie',
+            slug: 'flex-hoodie',
+            sku: 'DEMO-HOODIE-03',
+            description: 'Soft heavyweight hoodie with clean branding.',
+            price: 59.0,
+            currency: code,
+            stock_qty: 54,
+            image_url: 'https://images.unsplash.com/photo-1521572163474-6864f9cf17ab?auto=format&fit=crop&w=900&q=80',
+            is_active: true,
+            updated_at: now
+        },
+        {
+            company_id: companyId,
+            name: 'Field Notebook Set',
+            slug: 'field-notebook-set',
+            sku: 'DEMO-NOTE-04',
+            description: 'Set of 3 dotted notebooks for product planning.',
+            price: 18.0,
+            currency: code,
+            stock_qty: 120,
+            image_url: 'https://images.unsplash.com/photo-1531346680769-a1d79b57de5c?auto=format&fit=crop&w=900&q=80',
+            is_active: true,
+            updated_at: now
+        }
+    ]
 }
 
 function toMoneyText(value: any, currency: string): string {
@@ -136,9 +242,18 @@ function renderStorePage(args: { company: any; products: any[]; companyId: strin
     const storeTitle = readTrimmed(company?.webstore_title) || `${companyName} Store`
     const storeSubtitle = readTrimmed(company?.webstore_subtitle) || 'Browse products and pricing. Built for invoice and WhatsApp workflows.'
     const brandColor = normalizeHexColor(company?.webstore_brand_color, '#00a884')
+    const theme = normalizeTheme(company?.webstore_theme, 'editorial')
+    const showLogo = parseBoolean(company?.webstore_show_logo, true)
+    const heroBadge = readTrimmed(company?.webstore_hero_badge) || 'Webstore'
+    const palette = themePalette(theme)
     const defaultCurrency = normalizeCurrency(company?.default_currency || 'USD')
+    const logoUrl = readTrimmed(company?.logo_url)
+    const contactLine = [readTrimmed(company?.email), readTrimmed(company?.phone), readTrimmed(company?.address)]
+        .filter(Boolean)
+        .map((part) => escapeHtml(part))
+        .join(' • ')
     const productCards = products.length === 0
-        ? '<div class="empty">No products published yet.</div>'
+        ? '<div class="empty">No products published yet. Add products from Product Settings.</div>'
         : products.map((product) => {
             const currency = normalizeCurrency(product.currency || defaultCurrency, defaultCurrency)
             const name = escapeHtml(product.name || 'Product')
@@ -146,13 +261,21 @@ function renderStorePage(args: { company: any; products: any[]; companyId: strin
             const sku = readTrimmed(product.sku)
             const image = readTrimmed(product.image_url)
             const price = escapeHtml(toMoneyText(product.price, currency))
+            const stockQty = Number(product.stock_qty || 0)
+            const stockLabel = stockQty > 0 ? `${stockQty} in stock` : 'Out of stock'
             return `<article class="card">
-    ${image ? `<img src="${escapeHtml(image)}" alt="${name}" class="img" loading="lazy" />` : '<div class="img placeholder">No image</div>'}
+    ${image ? `<img src="${escapeHtml(image)}" alt="${name}" class="img" loading="lazy" />` : '<div class="img placeholder">No image available</div>'}
     <div class="body">
+      <div class="meta">
+        ${sku ? `<p class="sku">SKU ${escapeHtml(sku)}</p>` : '<p class="sku">Featured Product</p>'}
+        <span class="stock">${escapeHtml(stockLabel)}</span>
+      </div>
       <h3>${name}</h3>
-      ${sku ? `<p class="sku">SKU: ${escapeHtml(sku)}</p>` : ''}
       ${description ? `<p class="desc">${description}</p>` : ''}
-      <div class="price">${price}</div>
+      <div class="row">
+        <div class="price">${price}</div>
+        <button class="cta" type="button">Enquire</button>
+      </div>
     </div>
   </article>`
         }).join('')
@@ -162,34 +285,104 @@ function renderStorePage(args: { company: any; products: any[]; companyId: strin
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>${escapeHtml(companyName)} Store</title>
+  <title>${escapeHtml(storeTitle)}</title>
   <style>
-    :root { --bg:#f4f7f8; --card:#fff; --line:#d9e2e6; --text:#111b21; --muted:#54656f; --brand:${brandColor}; --ink:#0b141a; }
+    :root {
+      --bg:${palette.bg};
+      --card:${palette.surface};
+      --line:${palette.line};
+      --text:${palette.text};
+      --muted:${palette.muted};
+      --brand:${brandColor};
+    }
     * { box-sizing: border-box; }
-    body { margin:0; background:radial-gradient(circle at 0 0, #d9f8ef 0%, #f4f7f8 45%); color:var(--ink); font-family: "Segoe UI", "Inter", sans-serif; }
-    .wrap { max-width: 1100px; margin: 0 auto; padding: 28px 18px 48px; }
-    .hero { display:flex; gap:16px; align-items:center; justify-content:space-between; flex-wrap:wrap; margin-bottom:18px; }
-    .title { font-size: 34px; font-weight: 900; margin:0 0 6px; letter-spacing: -0.02em; }
-    .sub { margin:0; color:var(--muted); font-size:14px; }
-    .chip { border:1px solid color-mix(in srgb, var(--brand) 30%, #fff 70%); background:color-mix(in srgb, var(--brand) 15%, #fff 85%); color:color-mix(in srgb, var(--brand) 75%, #111 25%); border-radius:999px; padding:7px 12px; font-weight:700; font-size:12px; }
-    .grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap:14px; }
-    .card { background:var(--card); border:1px solid var(--line); border-radius:16px; overflow:hidden; box-shadow:0 12px 30px rgba(10,20,26,0.06); }
-    .img { width:100%; height:170px; object-fit:cover; display:block; background:#eef2f4; }
-    .img.placeholder { display:flex; align-items:center; justify-content:center; color:#7a8b93; font-size:12px; font-weight:700; }
-    .body { padding:12px; }
-    h3 { margin:0 0 6px; font-size:17px; line-height:1.3; }
-    .sku { margin:0 0 8px; color:#6b7c84; font-size:11px; font-weight:700; letter-spacing:.02em; text-transform:uppercase; }
-    .desc { margin:0 0 10px; color:#334155; font-size:13px; line-height:1.45; min-height:38px; }
-    .price { font-size:18px; font-weight:900; color:var(--text); }
-    .empty { border:1px dashed #bad3dc; border-radius:14px; padding:26px; color:#48616c; text-align:center; background:#f8fbfc; font-weight:700; }
+    body { margin:0; background:var(--bg); color:var(--text); font-family:"Avenir Next","Segoe UI",sans-serif; }
+    .wrap { max-width: 1180px; margin: 0 auto; padding: 24px 18px 52px; }
+    .hero {
+      border:1px solid color-mix(in srgb, var(--brand) 25%, var(--line) 75%);
+      background:linear-gradient(110deg, color-mix(in srgb, var(--brand) 12%, var(--card) 88%) 0%, var(--card) 60%);
+      border-radius:24px;
+      padding:22px;
+      box-shadow:0 20px 45px rgba(2,6,23,0.14);
+      display:grid;
+      grid-template-columns:1fr auto;
+      gap:18px;
+      align-items:center;
+      margin-bottom:18px;
+    }
+    .hero-left { display:flex; gap:14px; align-items:flex-start; }
+    .logo { width:56px; height:56px; border-radius:16px; object-fit:cover; border:1px solid var(--line); background:#fff; }
+    .eyebrow { margin:0 0 6px; text-transform:uppercase; letter-spacing:.12em; font-size:11px; font-weight:900; color:var(--muted); }
+    .title { font-size:34px; line-height:1.05; margin:0; letter-spacing:-.03em; }
+    .sub { margin:8px 0 0; color:var(--muted); font-size:14px; max-width:720px; line-height:1.5; }
+    .contact { margin:10px 0 0; color:var(--muted); font-size:12px; }
+    .chip {
+      border:1px solid color-mix(in srgb, var(--brand) 35%, var(--line) 65%);
+      background:color-mix(in srgb, var(--brand) 18%, #fff 82%);
+      color:color-mix(in srgb, var(--brand) 68%, #111 32%);
+      border-radius:999px;
+      padding:8px 12px;
+      font-weight:800;
+      font-size:12px;
+      align-self:flex-start;
+    }
+    .grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap:14px; }
+    .card {
+      background:var(--card);
+      border:1px solid var(--line);
+      border-radius:18px;
+      overflow:hidden;
+      box-shadow:0 14px 35px rgba(2,6,23,0.12);
+      display:flex;
+      flex-direction:column;
+    }
+    .img { width:100%; height:190px; object-fit:cover; display:block; background:#eef2f4; }
+    .img.placeholder { display:flex; align-items:center; justify-content:center; color:#64748b; font-size:12px; font-weight:700; }
+    .body { padding:13px; display:flex; flex-direction:column; gap:8px; min-height:192px; }
+    .meta { display:flex; justify-content:space-between; gap:8px; align-items:center; }
+    .sku { margin:0; color:var(--muted); font-size:10px; font-weight:800; letter-spacing:.06em; text-transform:uppercase; }
+    .stock {
+      display:inline-flex; align-items:center; justify-content:center;
+      border:1px solid color-mix(in srgb, var(--brand) 28%, var(--line) 72%);
+      border-radius:999px; padding:4px 8px; font-size:10px; font-weight:800; color:var(--muted);
+    }
+    h3 { margin:0; font-size:18px; line-height:1.25; letter-spacing:-.01em; }
+    .desc { margin:0; color:var(--muted); font-size:13px; line-height:1.5; min-height:42px; }
+    .row { margin-top:auto; display:flex; justify-content:space-between; align-items:center; gap:10px; }
+    .price { font-size:20px; font-weight:900; color:var(--text); }
+    .cta {
+      border:1px solid color-mix(in srgb, var(--brand) 45%, var(--line) 55%);
+      background:color-mix(in srgb, var(--brand) 90%, #000 10%);
+      color:#fff; font-size:11px; font-weight:800; letter-spacing:.05em; text-transform:uppercase;
+      border-radius:10px; padding:8px 10px; cursor:pointer;
+    }
+    .empty {
+      border:1px dashed var(--line);
+      border-radius:16px;
+      padding:32px;
+      color:var(--muted);
+      text-align:center;
+      background:var(--card);
+      font-weight:700;
+    }
+    @media (max-width: 900px) {
+      .hero { grid-template-columns:1fr; }
+      .chip { justify-self:flex-start; }
+      .title { font-size:28px; }
+    }
   </style>
 </head>
 <body>
   <main class="wrap">
     <section class="hero">
-      <div>
-        <h1 class="title">${escapeHtml(storeTitle)}</h1>
-        <p class="sub">${escapeHtml(storeSubtitle)}</p>
+      <div class="hero-left">
+        ${showLogo && logoUrl ? `<img src="${escapeHtml(logoUrl)}" alt="${escapeHtml(companyName)} logo" class="logo" loading="lazy" />` : ''}
+        <div>
+          <p class="eyebrow">${escapeHtml(heroBadge)}</p>
+          <h1 class="title">${escapeHtml(storeTitle)}</h1>
+          <p class="sub">${escapeHtml(storeSubtitle)}</p>
+          ${contactLine ? `<p class="contact">${contactLine}</p>` : ''}
+        </div>
       </div>
       <div class="chip">${products.length} product${products.length === 1 ? '' : 's'}</div>
     </section>
@@ -258,7 +451,7 @@ function renderCustomixieLanding(companyIdHint: string) {
 }
 
 async function fetchPublicCompanyStoreProfile(supabase: any, companyId: string): Promise<{ data: any; error: any }> {
-    const fullSelect = 'id, name, logo_url, address, email, phone, default_currency, webstore_enabled, webstore_title, webstore_subtitle, webstore_brand_color'
+    const fullSelect = 'id, name, logo_url, address, email, phone, default_currency, webstore_enabled, webstore_title, webstore_subtitle, webstore_brand_color, webstore_theme, webstore_show_logo, webstore_hero_badge'
     const baseSelect = 'id, name, logo_url, address, email, phone, default_currency'
     const primary = await supabase
         .from('company')
@@ -285,7 +478,10 @@ async function fetchPublicCompanyStoreProfile(supabase: any, companyId: string):
             webstore_enabled: true,
             webstore_title: null,
             webstore_subtitle: null,
-            webstore_brand_color: '#00a884'
+            webstore_brand_color: '#00a884',
+            webstore_theme: 'editorial',
+            webstore_show_logo: true,
+            webstore_hero_badge: null
         },
         error: null
     }
@@ -301,7 +497,7 @@ export function registerStoreRoutes(app: Express, ctx: any) {
 
             const { data, error } = await supabase
                 .from('company')
-                .select('id, name, webstore_enabled, webstore_title, webstore_subtitle, webstore_brand_color')
+                .select('id, name, webstore_enabled, webstore_title, webstore_subtitle, webstore_brand_color, webstore_theme, webstore_show_logo, webstore_hero_badge')
                 .eq('id', access.companyId)
                 .maybeSingle()
 
@@ -327,7 +523,10 @@ export function registerStoreRoutes(app: Express, ctx: any) {
                     enabled: parseBoolean(data.webstore_enabled, true),
                     title: readTrimmed(data.webstore_title) || null,
                     subtitle: readTrimmed(data.webstore_subtitle) || null,
-                    brand_color: normalizeHexColor(data.webstore_brand_color, '#00a884')
+                    brand_color: normalizeHexColor(data.webstore_brand_color, '#00a884'),
+                    theme: normalizeTheme(data.webstore_theme, 'editorial'),
+                    show_logo: parseBoolean(data.webstore_show_logo, true),
+                    hero_badge: readTrimmed(data.webstore_hero_badge) || null
                 }
             })
         } catch (error: any) {
@@ -344,14 +543,17 @@ export function registerStoreRoutes(app: Express, ctx: any) {
                 webstore_enabled: parseBoolean(req.body?.enabled ?? req.body?.webstore_enabled, true),
                 webstore_title: readTrimmed(req.body?.title || req.body?.webstore_title) || null,
                 webstore_subtitle: readTrimmed(req.body?.subtitle || req.body?.webstore_subtitle) || null,
-                webstore_brand_color: normalizeHexColor(req.body?.brand_color || req.body?.webstore_brand_color, '#00a884')
+                webstore_brand_color: normalizeHexColor(req.body?.brand_color || req.body?.webstore_brand_color, '#00a884'),
+                webstore_theme: normalizeTheme(req.body?.theme || req.body?.webstore_theme, 'editorial'),
+                webstore_show_logo: parseBoolean(req.body?.show_logo ?? req.body?.webstore_show_logo, true),
+                webstore_hero_badge: readTrimmed(req.body?.hero_badge || req.body?.webstore_hero_badge) || null
             }
 
             const { data, error } = await supabase
                 .from('company')
                 .update(payload)
                 .eq('id', access.companyId)
-                .select('id, name, webstore_enabled, webstore_title, webstore_subtitle, webstore_brand_color')
+                .select('id, name, webstore_enabled, webstore_title, webstore_subtitle, webstore_brand_color, webstore_theme, webstore_show_logo, webstore_hero_badge')
                 .maybeSingle()
 
             if (error) {
@@ -376,7 +578,10 @@ export function registerStoreRoutes(app: Express, ctx: any) {
                     enabled: parseBoolean(data.webstore_enabled, true),
                     title: readTrimmed(data.webstore_title) || null,
                     subtitle: readTrimmed(data.webstore_subtitle) || null,
-                    brand_color: normalizeHexColor(data.webstore_brand_color, '#00a884')
+                    brand_color: normalizeHexColor(data.webstore_brand_color, '#00a884'),
+                    theme: normalizeTheme(data.webstore_theme, 'editorial'),
+                    show_logo: parseBoolean(data.webstore_show_logo, true),
+                    hero_badge: readTrimmed(data.webstore_hero_badge) || null
                 }
             })
         } catch (error: any) {
@@ -487,6 +692,47 @@ export function registerStoreRoutes(app: Express, ctx: any) {
             }
 
             return res.json({ success: true, data })
+        } catch (error: any) {
+            return res.status(500).json({ success: false, error: error.message })
+        }
+    })
+
+    app.post('/api/store/products/demo-seed', requireSupabaseUserMiddleware, async (req: any, res: any) => {
+        try {
+            const access = await resolveCompanyAccess(req, res, 'admin')
+            if (!access) return
+
+            const { data: company, error: companyError } = await supabase
+                .from('company')
+                .select('id, default_currency')
+                .eq('id', access.companyId)
+                .maybeSingle()
+            if (companyError) {
+                return res.status(500).json({ success: false, error: companyError.message })
+            }
+
+            const demoProducts = buildDemoProducts(access.companyId, company?.default_currency || 'USD')
+            const { data, error } = await supabase
+                .from('products')
+                .upsert(demoProducts, { onConflict: 'company_id,slug' })
+                .select('id, name, slug, sku, description, price, currency, stock_qty, image_url, is_active')
+
+            if (error) {
+                if (isProductsTableMissingError(error)) {
+                    return res.status(503).json({
+                        success: false,
+                        code: 'PRODUCTS_TABLE_MISSING',
+                        error: PRODUCTS_TABLE_MISSING_MESSAGE
+                    })
+                }
+                return res.status(500).json({ success: false, error: error.message })
+            }
+
+            return res.json({
+                success: true,
+                data: data || [],
+                message: 'Demo products upserted'
+            })
         } catch (error: any) {
             return res.status(500).json({ success: false, error: error.message })
         }
@@ -684,7 +930,10 @@ export function registerStoreRoutes(app: Express, ctx: any) {
                         enabled: parseBoolean(company.webstore_enabled, true),
                         title: readTrimmed(company.webstore_title) || null,
                         subtitle: readTrimmed(company.webstore_subtitle) || null,
-                        brand_color: normalizeHexColor(company.webstore_brand_color, '#00a884')
+                        brand_color: normalizeHexColor(company.webstore_brand_color, '#00a884'),
+                        theme: normalizeTheme(company.webstore_theme, 'editorial'),
+                        show_logo: parseBoolean(company.webstore_show_logo, true),
+                        hero_badge: readTrimmed(company.webstore_hero_badge) || null
                     },
                     products: products || []
                 }
