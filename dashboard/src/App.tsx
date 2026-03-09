@@ -3360,7 +3360,7 @@ export default function App() {
                         <div className="flex-1 mx-2 relative">
                             {!canSendText && (
                                 <div className="absolute -top-8 left-0 px-3 py-1.5 rounded-lg bg-[#fff3e0] text-[#a16207] text-[11px] font-bold border border-[#fde68a]">
-                                    24h window closed. Send a template.
+                                    24h window closed for free text. Template message can still be sent anytime.
                                 </div>
                             )}
                             {canSendText && quickReplyQuery !== null && (
@@ -3473,14 +3473,18 @@ export default function App() {
                                 <button
                                     type="button"
                                     onClick={() => setShowTemplateComposer(prev => !prev)}
-                                    className={`p-2 rounded-xl transition-all ${showTemplateComposer || !canSendText ? 'bg-[#00a884]/10 text-[#00a884]' : 'hover:bg-white'}`}
+                                    className={`inline-flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-bold transition-all ${showTemplateComposer ? 'bg-[#00a884]/10 text-[#00a884]' : 'bg-white border border-[#eceff1] text-[#334155] hover:bg-[#f8fafc]'}`}
                                     title="Send template message"
                                 >
                                     <FileText className="w-5 h-5" />
+                                    <span>Template</span>
                                 </button>
                                 {showTemplateComposer && (
                                     <div className="absolute bottom-[52px] right-0 w-[460px] max-w-[90vw] bg-white border border-[#eceff1] rounded-2xl shadow-xl z-30 p-3 space-y-2">
                                         <div className="text-[11px] font-bold uppercase tracking-widest text-[#54656f]">Send Template Message</div>
+                                        <div className="text-[11px] text-[#64748b]">
+                                            Approved template messages are available even when the 24h window is open.
+                                        </div>
                                         {templateComposerError && (
                                             <div className="px-2 py-1.5 rounded-lg bg-rose-50 border border-rose-200 text-[11px] text-rose-700 font-semibold">
                                                 {templateComposerError}
@@ -3641,15 +3645,7 @@ export default function App() {
                                 ) : (
                                     <div className="p-2 hover:bg-white rounded-xl transition-all cursor-pointer"><Mic className="w-6 h-6" /></div>
                                 )
-                            ) : (
-                                <button
-                                    type="button"
-                                    onClick={() => setShowTemplateComposer(true)}
-                                    className="px-3 py-2 rounded-xl bg-[#00a884] text-white text-xs font-bold hover:bg-[#008f6f]"
-                                >
-                                    Template
-                                </button>
-                            )}
+                            ) : null}
                         </div>
                     </footer>
 
