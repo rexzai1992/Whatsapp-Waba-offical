@@ -175,6 +175,16 @@ type TemplateComposerOption = {
     components: any[];
 };
 
+type ContactTemplateAttribute = {
+    templateName: string;
+    language: string;
+    scope: 'body' | 'header';
+    index: number;
+    key: string;
+    value: string;
+    savedAt: string;
+};
+
 type LogEntry = {
     id: string;
     ts: number;
@@ -233,6 +243,7 @@ type ContactMeta = {
     ctaReferralAt?: string | null;
     ctaFreeWindowStartedAt?: string | null;
     ctaFreeWindowExpiresAt?: string | null;
+    templateAttributes?: ContactTemplateAttribute[];
 };
 
 type MessageVirtualRow =
@@ -281,6 +292,57 @@ const extractTemplateVariableCount = (text: unknown): number => {
     return maxIndex;
 };
 
+const inferTemplateVariableLabel = (text: unknown, index: number, scope: 'body' | 'header' = 'body'): string => {
+    if (typeof text === 'string' && text.trim()) {
+        const pattern = new RegExp(`([^{}\\n]{0,34})\\{\\{\\s*${index}\\s*\\}\\}([^{}\\n]{0,18})`, 'i');
+        const match = pattern.exec(text);
+        const cleanContext = (value: string): string =>
+            value
+                .replace(/[\n\r]+/g, ' ')
+                .replace(/[_\-]/g, ' ')
+                .replace(/[.,;:!?()[\]{}]+/g, ' ')
+                .replace(/\s+/g, ' ')
+                .trim();
+        const before = cleanContext(match?.[1] || '').split(' ').slice(-3).join(' ');
+        const after = cleanContext(match?.[2] || '').split(' ').slice(0, 3).join(' ');
+        const candidate = before || after;
+        if (candidate) {
+            return candidate.charAt(0).toUpperCase() + candidate.slice(1);
+        }
+    }
+    return `${scope === 'header' ? 'Header' : 'Body'} {{${index}}}`;
+};
+
+const normalizeContactTemplateAttributes = (value: unknown): ContactTemplateAttribute[] => {
+    if (!Array.isArray(value)) return [];
+    return value
+        .map((entry: any) => {
+            const templateName = typeof entry?.templateName === 'string' ? entry.templateName.trim() : '';
+            const key = typeof entry?.key === 'string' ? entry.key.trim() : '';
+            const itemValue = typeof entry?.value === 'string' ? entry.value.trim() : '';
+            if (!templateName || !key || !itemValue) return null;
+            const language = typeof entry?.language === 'string' && entry.language.trim() ? entry.language.trim() : 'en_US';
+            const parsedIndex = Number.parseInt(String(entry?.index ?? ''), 10);
+            const index = Number.isFinite(parsedIndex) && parsedIndex > 0 ? Math.min(parsedIndex, 99) : 1;
+            const scope: 'body' | 'header' = typeof entry?.scope === 'string' && entry.scope.toLowerCase() === 'header'
+                ? 'header'
+                : 'body';
+            const parsedSavedAt = typeof entry?.savedAt === 'string' ? new Date(entry.savedAt).getTime() : Number.NaN;
+            const savedAt = Number.isNaN(parsedSavedAt) ? '' : new Date(parsedSavedAt).toISOString();
+            return {
+                templateName: templateName.slice(0, 128),
+                language: language.slice(0, 24),
+                scope,
+                index,
+                key: key.slice(0, 120),
+                value: itemValue.slice(0, 400),
+                savedAt
+            };
+        })
+        .filter((entry): entry is ContactTemplateAttribute => Boolean(entry))
+        .slice(0, 80);
+};
+
 const findTemplateComponent = (components: any[] | undefined, type: string): any | null => {
     if (!Array.isArray(components)) return null;
     const normalized = type.trim().toUpperCase();
@@ -319,6 +381,7 @@ export default function App() {
     const [templateComposerError, setTemplateComposerError] = useState<string | null>(null);
     const [selectedTemplateOptionId, setSelectedTemplateOptionId] = useState('');
     const [templateBodyAttributes, setTemplateBodyAttributes] = useState<string[]>([]);
+    const [templateBodyAttributeNames, setTemplateBodyAttributeNames] = useState<string[]>([]);
     const [templateHeaderAttributes, setTemplateHeaderAttributes] = useState<string[]>([]);
     const [templateHeaderMediaUrl, setTemplateHeaderMediaUrl] = useState('');
     const [templateHeaderDocumentFilename, setTemplateHeaderDocumentFilename] = useState('');
@@ -1554,6 +1617,10 @@ export default function App() {
                         const nextCtaReferralAt = c.ctaReferralAt === undefined ? (prev as any).ctaReferralAt || null : c.ctaReferralAt;
                         const nextCtaFreeWindowStartedAt = c.ctaFreeWindowStartedAt === undefined ? (prev as any).ctaFreeWindowStartedAt || null : c.ctaFreeWindowStartedAt;
                         const nextCtaFreeWindowExpiresAt = c.ctaFreeWindowExpiresAt === undefined ? (prev as any).ctaFreeWindowExpiresAt || null : c.ctaFreeWindowExpiresAt;
+                        const incomingTemplateAttributes = c.templateAttributes === undefined ? c.template_attributes : c.templateAttributes;
+                        const nextTemplateAttributes = incomingTemplateAttributes === undefined
+                            ? normalizeContactTemplateAttributes((prev as any).templateAttributes)
+                            : normalizeContactTemplateAttributes(incomingTemplateAttributes);
                         next[c.id] = {
                             name: resolvedName || prev.name,
                             lastInboundAt: nextLastInboundAt,
@@ -1563,7 +1630,8 @@ export default function App() {
                             assigneeColor: nextAssigneeColor,
                             ctaReferralAt: nextCtaReferralAt,
                             ctaFreeWindowStartedAt: nextCtaFreeWindowStartedAt,
-                            ctaFreeWindowExpiresAt: nextCtaFreeWindowExpiresAt
+                            ctaFreeWindowExpiresAt: nextCtaFreeWindowExpiresAt,
+                            templateAttributes: nextTemplateAttributes
                         };
                     });
                     return next;
@@ -2144,6 +2212,21 @@ export default function App() {
         })
         : null;
     const selectedContact = selectedChatId ? contacts[selectedChatId] : null;
+    const selectedContactTemplateAttributes = useMemo(() => {
+        const list = Array.isArray(selectedContact?.templateAttributes)
+            ? [...selectedContact.templateAttributes]
+            : [];
+        return list
+            .sort((a, b) => {
+                const aMs = new Date(a.savedAt || '').getTime();
+                const bMs = new Date(b.savedAt || '').getTime();
+                if (Number.isNaN(aMs) && Number.isNaN(bMs)) return 0;
+                if (Number.isNaN(aMs)) return 1;
+                if (Number.isNaN(bMs)) return -1;
+                return bMs - aMs;
+            })
+            .slice(0, 20);
+    }, [selectedContact?.templateAttributes]);
     const selectedHumanTakeover = Boolean(selectedContact?.humanTakeover);
     const selectedAssigneeName = selectedContact?.assigneeName || null;
     const selectedAssigneeColor = selectedContact?.assigneeColor || '#6b7280';
@@ -2212,12 +2295,34 @@ export default function App() {
         () => selectedTemplateHeaderFormat === 'TEXT' ? extractTemplateVariableCount(selectedTemplateHeader?.text) : 0,
         [selectedTemplateHeader, selectedTemplateHeaderFormat]
     );
+    const savedTemplateBodyAttributesByIndex = useMemo(() => {
+        const map = new Map<number, ContactTemplateAttribute>();
+        const templateName = selectedTemplateOption?.name?.trim().toLowerCase();
+        if (!templateName || !Array.isArray(selectedContact?.templateAttributes)) return map;
+        selectedContact.templateAttributes.forEach((entry) => {
+            if (!entry || entry.scope !== 'body') return;
+            if (entry.templateName.trim().toLowerCase() !== templateName) return;
+            if (!map.has(entry.index)) {
+                map.set(entry.index, entry);
+            }
+        });
+        return map;
+    }, [selectedContact?.templateAttributes, selectedTemplateOption?.name]);
 
     useEffect(() => {
         setTemplateBodyAttributes((prev) =>
             Array.from({ length: requiredTemplateBodyAttributeCount }, (_, index) => prev[index] || '')
         );
     }, [requiredTemplateBodyAttributeCount]);
+
+    useEffect(() => {
+        setTemplateBodyAttributeNames((prev) =>
+            Array.from(
+                { length: requiredTemplateBodyAttributeCount },
+                (_, index) => prev[index] || inferTemplateVariableLabel(selectedTemplateBody?.text, index + 1, 'body')
+            )
+        );
+    }, [requiredTemplateBodyAttributeCount, selectedTemplateBody]);
 
     useEffect(() => {
         setTemplateHeaderAttributes((prev) =>
@@ -2235,7 +2340,26 @@ export default function App() {
             if (prev.trim()) return prev;
             return `${selectedTemplateOption.name}.pdf`;
         });
-    }, [selectedTemplateOption]);
+        setTemplateBodyAttributes(
+            Array.from(
+                { length: requiredTemplateBodyAttributeCount },
+                (_, index) => savedTemplateBodyAttributesByIndex.get(index + 1)?.value || ''
+            )
+        );
+        setTemplateBodyAttributeNames(
+            Array.from(
+                { length: requiredTemplateBodyAttributeCount },
+                (_, index) =>
+                    savedTemplateBodyAttributesByIndex.get(index + 1)?.key
+                    || inferTemplateVariableLabel(selectedTemplateBody?.text, index + 1, 'body')
+            )
+        );
+    }, [
+        selectedTemplateOption,
+        requiredTemplateBodyAttributeCount,
+        savedTemplateBodyAttributesByIndex,
+        selectedTemplateBody
+    ]);
 
     const handleQuickReplyPick = (item: QuickReply) => {
         const text = typeof item.text === 'string' ? item.text.trim() : '';
@@ -2444,6 +2568,7 @@ export default function App() {
         }
 
         let components: any[] | undefined;
+        let namedBodyAttributes: Array<{ scope: 'body'; index: number; key: string; value: string }> = [];
         if (templateComponents.trim()) {
             try {
                 const parsed = JSON.parse(templateComponents);
@@ -2512,6 +2637,11 @@ export default function App() {
                     alert(`Body attribute {{${missingBodyParamIndex + 1}}} is required.`);
                     return;
                 }
+                const missingBodyAttributeNameIndex = templateBodyAttributeNames.findIndex((value) => !value.trim());
+                if (missingBodyAttributeNameIndex >= 0) {
+                    alert(`Body attribute label for {{${missingBodyAttributeNameIndex + 1}}} is required.`);
+                    return;
+                }
                 built.push({
                     type: 'body',
                     parameters: templateBodyAttributes.map((value) => ({
@@ -2519,6 +2649,12 @@ export default function App() {
                         text: value.trim()
                     }))
                 });
+                namedBodyAttributes = templateBodyAttributes.map((value, index) => ({
+                    scope: 'body' as const,
+                    index: index + 1,
+                    key: (templateBodyAttributeNames[index] || inferTemplateVariableLabel(selectedTemplateBody?.text, index + 1, 'body')).trim(),
+                    value: value.trim()
+                }));
             }
             components = built.length > 0 ? built : undefined;
         }
@@ -2528,7 +2664,8 @@ export default function App() {
             jid: selectedChatId,
             name: templateName.trim(),
             language: templateLanguage.trim() || 'en_US',
-            components
+            components,
+            bodyAttributes: namedBodyAttributes
         });
         setShowTemplateComposer(false);
     };
@@ -3583,22 +3720,40 @@ export default function App() {
                                                         <div className="text-[10px] font-bold text-[#0f172a]">
                                                             Body attributes ({requiredTemplateBodyAttributeCount})
                                                         </div>
+                                                        <div className="text-[10px] text-[#64748b]">
+                                                            Name each attribute so it is saved on the customer profile.
+                                                        </div>
                                                         {Array.from({ length: requiredTemplateBodyAttributeCount }).map((_, index) => (
-                                                            <input
-                                                                key={`body-attr-${index}`}
-                                                                type="text"
-                                                                value={templateBodyAttributes[index] || ''}
-                                                                onChange={(e) => setTemplateBodyAttributes((prev) => {
-                                                                    const next = Array.from(
-                                                                        { length: requiredTemplateBodyAttributeCount },
-                                                                        (_, idx) => prev[idx] || ''
-                                                                    );
-                                                                    next[index] = e.target.value;
-                                                                    return next;
-                                                                })}
-                                                                placeholder={`Body {{${index + 1}}}`}
-                                                                className="w-full bg-white border border-[#e2e8f0] rounded-lg px-2.5 py-1.5 text-[11px] text-[#111b21] focus:outline-none focus:ring-1 focus:ring-[#00a884]/20"
-                                                            />
+                                                            <div key={`body-attr-${index}`} className="grid grid-cols-2 gap-1.5">
+                                                                <input
+                                                                    type="text"
+                                                                    value={templateBodyAttributeNames[index] || ''}
+                                                                    onChange={(e) => setTemplateBodyAttributeNames((prev) => {
+                                                                        const next = Array.from(
+                                                                            { length: requiredTemplateBodyAttributeCount },
+                                                                            (_, idx) => prev[idx] || inferTemplateVariableLabel(selectedTemplateBody?.text, idx + 1, 'body')
+                                                                        );
+                                                                        next[index] = e.target.value;
+                                                                        return next;
+                                                                    })}
+                                                                    placeholder={`Name for {{${index + 1}}}`}
+                                                                    className="w-full bg-white border border-[#e2e8f0] rounded-lg px-2.5 py-1.5 text-[11px] text-[#111b21] focus:outline-none focus:ring-1 focus:ring-[#00a884]/20"
+                                                                />
+                                                                <input
+                                                                    type="text"
+                                                                    value={templateBodyAttributes[index] || ''}
+                                                                    onChange={(e) => setTemplateBodyAttributes((prev) => {
+                                                                        const next = Array.from(
+                                                                            { length: requiredTemplateBodyAttributeCount },
+                                                                            (_, idx) => prev[idx] || ''
+                                                                        );
+                                                                        next[index] = e.target.value;
+                                                                        return next;
+                                                                    })}
+                                                                    placeholder={`Value for {{${index + 1}}}`}
+                                                                    className="w-full bg-white border border-[#e2e8f0] rounded-lg px-2.5 py-1.5 text-[11px] text-[#111b21] focus:outline-none focus:ring-1 focus:ring-[#00a884]/20"
+                                                                />
+                                                            </div>
                                                         ))}
                                                     </div>
                                                 )}
@@ -3786,6 +3941,29 @@ export default function App() {
                                                         <div className="text-[11px] font-semibold text-[#111b21] break-words mt-1">A: {entry.answer}</div>
                                                         {entry.at ? (
                                                             <div className="text-[10px] text-[#94a3b8] mt-1">{new Date(entry.at).toLocaleString()}</div>
+                                                        ) : null}
+                                                    </div>
+                                                ))}
+                                            </div>
+                                        )}
+                                    </div>
+                                    <div className="flex flex-col gap-2.5 pt-3 border-t border-[#eceff1]">
+                                        <span className="text-[10px] text-[#7c3aed] font-bold uppercase tracking-wider">Saved Template Attributes</span>
+                                        {selectedContactTemplateAttributes.length === 0 ? (
+                                            <span className="text-[11px] text-[#8696a0]">No template attributes saved yet</span>
+                                        ) : (
+                                            <div className="flex flex-col gap-1.5">
+                                                {selectedContactTemplateAttributes.map((entry, idx) => (
+                                                    <div key={`template-attr-${entry.templateName}-${entry.scope}-${entry.index}-${idx}`} className="bg-white border border-[#eceff1] rounded-xl px-3 py-2">
+                                                        <div className="text-[10px] font-black uppercase tracking-wider text-[#7c3aed]">
+                                                            {entry.key}
+                                                        </div>
+                                                        <div className="text-[12px] font-semibold text-[#111b21] break-words">{entry.value}</div>
+                                                        <div className="text-[10px] text-[#64748b] mt-1">
+                                                            {entry.templateName} • {entry.scope} {`{{${entry.index}}}`} • {entry.language}
+                                                        </div>
+                                                        {entry.savedAt ? (
+                                                            <div className="text-[10px] text-[#94a3b8] mt-1">{new Date(entry.savedAt).toLocaleString()}</div>
                                                         ) : null}
                                                     </div>
                                                 ))}

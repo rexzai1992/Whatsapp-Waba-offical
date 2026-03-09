@@ -157,6 +157,7 @@ export function registerWabaRoutes(app: Express, ctx: any) {
         resolveOauthReturnUrl,
         resolveProfileAccess,
         sendWhatsAppMessage,
+        setUserTemplateAttributes,
         subscribeWabaApp,
         supabase,
         unsubscribeWabaApp,
@@ -1381,6 +1382,7 @@ app.post('/api/waba/templates/send', async (req: any, res: any) => {
         let invoiceRecord: any = null
         let documentLink: string | null = null
         let components = buildTemplateSendComponents(req.body || {})
+        let bodyAttributesForSave: Array<{ scope: 'body'; index: number; key: string; value: string }> = []
 
         if (invoiceId) {
             const { data: invoice, error: invoiceError } = await supabase
@@ -1435,11 +1437,28 @@ app.post('/api/waba/templates/send', async (req: any, res: any) => {
                 toTemplateText(invoice.total ?? ''),
                 toTemplateText(invoice.due_date || '')
             ]
+            const fallbackBodyAttributeNames = [
+                'Customer Name',
+                'Company Name',
+                'Invoice Number',
+                'Total Amount',
+                'Due Date'
+            ]
 
             const requestedBodyAttributes = req.body?.bodyAttributes ?? req.body?.body_attributes
             const bodyAttributes = Array.isArray(requestedBodyAttributes) && requestedBodyAttributes.length > 0
                 ? requestedBodyAttributes.map((value: any) => toTemplateText(value))
                 : fallbackBodyAttributes
+            const requestedBodyAttributeNames = req.body?.bodyAttributeNames ?? req.body?.body_attribute_names
+            const bodyAttributeNames = Array.isArray(requestedBodyAttributeNames)
+                ? requestedBodyAttributeNames.map((value: any) => toTemplateText(value))
+                : []
+            bodyAttributesForSave = bodyAttributes.map((value, index) => ({
+                scope: 'body' as const,
+                index: index + 1,
+                key: bodyAttributeNames[index] || fallbackBodyAttributeNames[index] || `Body {{${index + 1}}}`,
+                value
+            }))
 
             const headerType = readTrimmed(req.body?.headerType || req.body?.header_type || 'document').toLowerCase() || 'document'
             if (headerType !== 'document') {
@@ -1484,6 +1503,30 @@ app.post('/api/waba/templates/send', async (req: any, res: any) => {
             invoiceRecord = invoice
         }
 
+        if (!invoiceId && Array.isArray(components) && components.length > 0) {
+            const bodyComponent = components.find((component: any) => {
+                const type = typeof component?.type === 'string' ? component.type.trim().toLowerCase() : ''
+                return type === 'body'
+            })
+            const bodyParameters = Array.isArray(bodyComponent?.parameters) ? bodyComponent.parameters : []
+            const requestedBodyAttributeNames = req.body?.bodyAttributeNames ?? req.body?.body_attribute_names
+            const bodyAttributeNames = Array.isArray(requestedBodyAttributeNames)
+                ? requestedBodyAttributeNames.map((value: any) => toTemplateText(value))
+                : []
+            bodyAttributesForSave = bodyParameters
+                .map((param: any, index: number) => {
+                    const value = toTemplateText(param?.text)
+                    if (!value) return null
+                    return {
+                        scope: 'body' as const,
+                        index: index + 1,
+                        key: bodyAttributeNames[index] || `Body {{${index + 1}}}`,
+                        value
+                    }
+                })
+                .filter(Boolean) as Array<{ scope: 'body'; index: number; key: string; value: string }>
+        }
+
         const componentErrors = validateTemplateSendComponents(components)
         if (componentErrors.length > 0) {
             return res.status(400).json({ success: false, error: 'Invalid template send components', details: componentErrors })
@@ -1500,6 +1543,9 @@ app.post('/api/waba/templates/send', async (req: any, res: any) => {
                 components
             }
         })
+        if (typeof setUserTemplateAttributes === 'function' && bodyAttributesForSave.length > 0) {
+            await setUserTemplateAttributes(user.id, name, language, bodyAttributesForSave)
+        }
 
         let invoiceStatusUpdated = false
         let invoiceStatusError: string | null = null

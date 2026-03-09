@@ -24,6 +24,26 @@ export type User = {
     cta_referral_source?: string | null
     cta_free_window_started_at?: string | null
     cta_free_window_expires_at?: string | null
+    template_attributes?: UserTemplateAttribute[] | null
+}
+
+export type TemplateAttributeScope = 'body' | 'header'
+
+export type UserTemplateAttribute = {
+    templateName: string
+    language: string
+    scope: TemplateAttributeScope
+    index: number
+    key: string
+    value: string
+    savedAt: string
+}
+
+export type TemplateAttributeInput = {
+    scope?: string | null
+    index?: number | null
+    key?: string | null
+    value?: string | null
 }
 
 export type MessageRecord = {
@@ -39,10 +59,60 @@ export const HUMAN_TAKEOVER_TAG = 'human_takeover'
 
 const CTA_REPLY_WINDOW_MS = 24 * 60 * 60 * 1000
 const CTA_FREE_WINDOW_MS = 72 * 60 * 60 * 1000
+const TEMPLATE_ATTRIBUTE_MAX_ITEMS = 80
+const TEMPLATE_ATTRIBUTE_TEMPLATE_MAX_LENGTH = 128
+const TEMPLATE_ATTRIBUTE_LANGUAGE_MAX_LENGTH = 24
+const TEMPLATE_ATTRIBUTE_KEY_MAX_LENGTH = 120
+const TEMPLATE_ATTRIBUTE_VALUE_MAX_LENGTH = 400
 
 export function normalizePhoneNumber(input: string | null | undefined): string {
     if (!input) return ''
     return input.replace(/@s\.whatsapp\.net$/, '').replace(/\D/g, '')
+}
+
+function sanitizeTemplateAttributeText(value: any, maxLength: number): string {
+    const raw = typeof value === 'string' ? value.trim() : value === null || value === undefined ? '' : String(value).trim()
+    if (!raw) return ''
+    return raw.slice(0, maxLength)
+}
+
+function normalizeTemplateAttributeScope(value: any): TemplateAttributeScope {
+    const scope = typeof value === 'string' ? value.trim().toLowerCase() : ''
+    return scope === 'header' ? 'header' : 'body'
+}
+
+function sanitizeStoredTemplateAttributes(raw: any): UserTemplateAttribute[] {
+    if (!Array.isArray(raw)) return []
+    const sanitized: UserTemplateAttribute[] = []
+    raw.forEach((item: any) => {
+        const templateName = sanitizeTemplateAttributeText(item?.templateName, TEMPLATE_ATTRIBUTE_TEMPLATE_MAX_LENGTH)
+        const key = sanitizeTemplateAttributeText(item?.key, TEMPLATE_ATTRIBUTE_KEY_MAX_LENGTH)
+        const value = sanitizeTemplateAttributeText(item?.value, TEMPLATE_ATTRIBUTE_VALUE_MAX_LENGTH)
+        if (!templateName || !key || !value) return
+        const language = sanitizeTemplateAttributeText(item?.language, TEMPLATE_ATTRIBUTE_LANGUAGE_MAX_LENGTH) || 'en_US'
+        const parsedIndex = Number.parseInt(String(item?.index ?? ''), 10)
+        const index = Number.isFinite(parsedIndex) && parsedIndex > 0 ? Math.min(parsedIndex, 99) : 1
+        sanitized.push({
+            templateName,
+            language,
+            scope: normalizeTemplateAttributeScope(item?.scope),
+            index,
+            key,
+            value,
+            savedAt: toIsoOrNow(item?.savedAt || null)
+        })
+    })
+
+    sanitized.sort((a, b) => {
+        const aMs = new Date(a.savedAt).getTime()
+        const bMs = new Date(b.savedAt).getTime()
+        if (Number.isNaN(aMs) && Number.isNaN(bMs)) return 0
+        if (Number.isNaN(aMs)) return 1
+        if (Number.isNaN(bMs)) return -1
+        return bMs - aMs
+    })
+
+    return sanitized.slice(0, TEMPLATE_ATTRIBUTE_MAX_ITEMS)
 }
 
 export async function getDefaultCompanyId(): Promise<string | null> {
@@ -401,7 +471,8 @@ export async function setUserHumanTakeover(userId: string, enabled: boolean): Pr
         normalized.push(HUMAN_TAKEOVER_TAG)
     } else if (!enabled && hasTag) {
         for (let i = normalized.length - 1; i >= 0; i -= 1) {
-            if (normalized[i].toLowerCase() === HUMAN_TAKEOVER_TAG) {
+            const current = normalized[i] || ''
+            if (current.toLowerCase() === HUMAN_TAKEOVER_TAG) {
                 normalized.splice(i, 1)
             }
         }
@@ -496,6 +567,81 @@ export async function setUserAssignee(
 
     if (error) {
         console.warn('[DB] Failed to set user assignee:', error.message)
+        return null
+    }
+
+    if (data) return data as User
+    return getUserById(userId)
+}
+
+export async function setUserTemplateAttributes(
+    userId: string,
+    templateNameInput: string,
+    languageInput: string,
+    attributesInput: TemplateAttributeInput[]
+): Promise<User | null> {
+    if (!userId) return null
+
+    const templateName = sanitizeTemplateAttributeText(templateNameInput, TEMPLATE_ATTRIBUTE_TEMPLATE_MAX_LENGTH)
+    if (!templateName) return getUserById(userId)
+    const language = sanitizeTemplateAttributeText(languageInput, TEMPLATE_ATTRIBUTE_LANGUAGE_MAX_LENGTH) || 'en_US'
+    const nowIso = new Date().toISOString()
+
+    const incomingBySlot = new Map<string, UserTemplateAttribute>()
+    if (Array.isArray(attributesInput)) {
+        attributesInput.forEach((item: TemplateAttributeInput, index: number) => {
+            const value = sanitizeTemplateAttributeText(item?.value, TEMPLATE_ATTRIBUTE_VALUE_MAX_LENGTH)
+            if (!value) return
+            const parsedIndex = Number.parseInt(String(item?.index ?? index + 1), 10)
+            const slotIndex = Number.isFinite(parsedIndex) && parsedIndex > 0 ? Math.min(parsedIndex, 99) : index + 1
+            const scope = normalizeTemplateAttributeScope(item?.scope)
+            const fallbackKey = `${scope === 'header' ? 'Header' : 'Body'} {{${slotIndex}}}`
+            const key = sanitizeTemplateAttributeText(item?.key, TEMPLATE_ATTRIBUTE_KEY_MAX_LENGTH) || fallbackKey
+            const slot = `${scope}:${slotIndex}`
+            incomingBySlot.set(slot, {
+                templateName,
+                language,
+                scope,
+                index: slotIndex,
+                key,
+                value,
+                savedAt: nowIso
+            })
+        })
+    }
+
+    if (incomingBySlot.size === 0) return getUserById(userId)
+
+    const current = await getUserById(userId)
+    const existing = sanitizeStoredTemplateAttributes(current?.template_attributes)
+    const normalizedTemplateName = templateName.toLowerCase()
+    const incomingSlots = new Set(incomingBySlot.keys())
+
+    const carry = existing.filter((item) => {
+        if (item.templateName.toLowerCase() !== normalizedTemplateName) return true
+        return !incomingSlots.has(`${item.scope}:${item.index}`)
+    })
+
+    const merged = [...incomingBySlot.values(), ...carry]
+        .sort((a, b) => {
+            const aMs = new Date(a.savedAt).getTime()
+            const bMs = new Date(b.savedAt).getTime()
+            if (Number.isNaN(aMs) && Number.isNaN(bMs)) return 0
+            if (Number.isNaN(aMs)) return 1
+            if (Number.isNaN(bMs)) return -1
+            return bMs - aMs
+        })
+        .slice(0, TEMPLATE_ATTRIBUTE_MAX_ITEMS)
+
+    const { data, error } = await supabase
+        .from('users')
+        .update({ template_attributes: merged })
+        .eq('id', userId)
+        .select('*')
+        .maybeSingle()
+
+    if (error) {
+        console.warn('[DB] Failed to set user template attributes:', error.message)
         return null
     }
 

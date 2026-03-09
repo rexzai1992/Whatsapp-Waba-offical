@@ -69,6 +69,14 @@ export type WorkflowAction =
           retry_limit?: number
       }
     | {
+          type: 'confirm_attributes'
+          fields?: string[]
+          question?: string
+          fallback_text?: string
+          retry_limit?: number
+          edit_prompt?: string
+      }
+    | {
           type: 'condition'
           source: string
           operator?:
@@ -119,6 +127,13 @@ export type WorkflowState = {
         question?: string
         fallback_text?: string
         retry_limit?: number
+    }
+    awaiting_confirmation?: {
+        fields: Array<{ key: string; label: string }>
+        question?: string
+        fallback_text?: string
+        retry_limit?: number
+        edit_prompt?: string
     }
     fallback_count?: number
 }

@@ -1,6 +1,7 @@
 const BUILDER_ACTION_NODE_TYPES = new Set([
     'MESSAGE',
     'ASK',
+    'ATTR_CONFIRM',
     'QUESTION',
     'LIST',
     'CONDITION',
@@ -19,6 +20,7 @@ const SUPPORTED_ACTION_TYPES = new Set([
     'send_cta_url',
     'send_template',
     'ask_question',
+    'confirm_attributes',
     'condition',
     'send_image',
     'send_document',
@@ -141,6 +143,38 @@ const buildActionsFromBuilder = (builder: any) => {
             }
             if (!action.save_as) {
                 warnings.push(`Ask Question node ${nodeId} must define a variable key.`);
+            }
+            actions.push(action);
+            indexByNode[nodeId] = actionIndex;
+            return;
+        }
+
+        if (node.type === 'ATTR_CONFIRM') {
+            const actionIndex = actions.length;
+            const fieldsCsv = typeof node.fieldsCsv === 'string'
+                ? node.fieldsCsv
+                : Array.isArray(node.fields)
+                    ? node.fields.join(',')
+                    : '';
+            const fields = fieldsCsv
+                .split(',')
+                .map((value: string) => value.trim().toLowerCase().replace(/[^a-z0-9_]+/g, '_').replace(/^_+|_+$/g, ''))
+                .filter(Boolean);
+            const retryLimitRaw = Number(node.retryLimit);
+            const retryLimit = Number.isFinite(retryLimitRaw) ? Math.max(1, Math.min(10, Math.floor(retryLimitRaw))) : 3;
+            const action: any = {
+                type: 'confirm_attributes',
+                retry_limit: retryLimit
+            };
+            if (fields.length > 0) action.fields = Array.from(new Set(fields));
+            if (typeof node.confirmText === 'string' && node.confirmText.trim()) {
+                action.question = node.confirmText;
+            }
+            if (typeof node.fallbackText === 'string' && node.fallbackText.trim()) {
+                action.fallback_text = node.fallbackText;
+            }
+            if (typeof node.editPrompt === 'string' && node.editPrompt.trim()) {
+                action.edit_prompt = node.editPrompt;
             }
             actions.push(action);
             indexByNode[nodeId] = actionIndex;
@@ -469,6 +503,7 @@ const buildActionsFromBuilder = (builder: any) => {
         const supportsNextStep =
             node.type === 'MESSAGE' ||
             node.type === 'ASK' ||
+            node.type === 'ATTR_CONFIRM' ||
             node.type === 'IMAGE' ||
             node.type === 'TEMPLATE' ||
             node.type === 'TAG' ||
@@ -523,6 +558,13 @@ const buildBuilderFromActions = (actions: any[], workflowId: string) => {
             base.saveAs = action.save_as || '';
             base.fallbackText = action.fallback_text || '';
             base.retryLimit = typeof action.retry_limit === 'number' ? action.retry_limit : 3;
+        } else if (action.type === 'confirm_attributes') {
+            base.type = 'ATTR_CONFIRM';
+            base.confirmText = action.question || '';
+            base.fieldsCsv = Array.isArray(action.fields) ? action.fields.join(', ') : '';
+            base.fallbackText = action.fallback_text || '';
+            base.retryLimit = typeof action.retry_limit === 'number' ? action.retry_limit : 3;
+            base.editPrompt = action.edit_prompt || '';
         } else if (action.type === 'condition') {
             base.type = 'CONDITION';
             base.source = action.source || '';

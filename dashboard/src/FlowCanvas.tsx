@@ -28,6 +28,7 @@ import {
     Play,
     Square,
     Activity,
+    CheckCircle2,
     Plus,
     Trash2,
     Save,
@@ -153,6 +154,56 @@ const nodeTypes = {
             </div>
         );
     },
+    ATTR_CONFIRM: (props: any) => (
+        <div className="bg-white border border-[#eceff1] p-5 rounded-2xl shadow-[0_8px_30px_rgba(0,0,0,0.06)] w-80 text-[#111b21] group hover:border-emerald-500/30 transition-all">
+            <Handle type="target" position={Position.Top} className="w-3 h-3 bg-[#aebac1] border-2 border-white" />
+            <div className="flex items-center gap-3 mb-3">
+                <div className="w-8 h-8 rounded-full bg-emerald-50 flex items-center justify-center text-emerald-600">
+                    <CheckCircle2 className="w-4 h-4" />
+                </div>
+                <span className="font-black text-[10px] uppercase tracking-widest text-emerald-600">Confirm Attributes</span>
+                <button onClick={() => props.data.onDelete(props.id)} className="ml-auto opacity-0 group-hover:opacity-100 text-rose-500 hover:bg-rose-50 p-1.5 rounded-lg transition-all">
+                    <Trash2 className="w-3.5 h-3.5" />
+                </button>
+            </div>
+            <textarea
+                className="w-full bg-[#f8f9fa] border border-[#eceff1] rounded-xl p-3 text-xs h-20 resize-none focus:outline-none focus:border-emerald-400 font-medium"
+                value={props.data.confirmText || ''}
+                onChange={(e) => props.data.onChange(props.id, { confirmText: e.target.value })}
+                placeholder="Confirmation intro (e.g. Please confirm your details below)"
+            />
+            <div className="mt-3 grid grid-cols-1 gap-2">
+                <input
+                    className="w-full bg-[#f8f9fa] border border-[#eceff1] rounded-xl px-3 py-2 text-[11px] font-mono focus:outline-none focus:border-emerald-400"
+                    value={props.data.fieldsCsv || ''}
+                    onChange={(e) => props.data.onChange(props.id, { fieldsCsv: e.target.value })}
+                    placeholder="Fields: customer_name, customer_email (blank = all collected)"
+                />
+                <input
+                    className="w-full bg-[#f8f9fa] border border-[#eceff1] rounded-xl px-3 py-2 text-[10px] focus:outline-none focus:border-emerald-400"
+                    value={props.data.editPrompt || ''}
+                    onChange={(e) => props.data.onChange(props.id, { editPrompt: e.target.value })}
+                    placeholder="Edit prompt (optional, supports {{field_label}} / {{field_key}})"
+                />
+                <input
+                    className="w-full bg-[#f8f9fa] border border-[#eceff1] rounded-xl px-3 py-2 text-[10px] focus:outline-none focus:border-emerald-400"
+                    value={props.data.fallbackText || ''}
+                    onChange={(e) => props.data.onChange(props.id, { fallbackText: e.target.value })}
+                    placeholder='Fallback (e.g. Reply "yes" or "no field")'
+                />
+                <input
+                    type="number"
+                    min={1}
+                    max={10}
+                    className="w-full bg-[#f8f9fa] border border-[#eceff1] rounded-xl px-3 py-2 text-[10px] focus:outline-none focus:border-emerald-400"
+                    value={props.data.retryLimit ?? 3}
+                    onChange={(e) => props.data.onChange(props.id, { retryLimit: Number(e.target.value || 3) })}
+                    placeholder="Retry limit"
+                />
+            </div>
+            <Handle type="source" position={Position.Bottom} className="w-3 h-3 bg-emerald-600 border-2 border-white" />
+        </div>
+    ),
     QUESTION: (props: any) => (
         <div className="bg-white border border-[#eceff1] p-5 rounded-2xl shadow-[0_8px_30px_rgba(0,0,0,0.06)] w-72 text-[#111b21] group hover:border-purple-500/30 transition-all">
             <Handle type="target" position={Position.Top} className="w-3 h-3 bg-[#aebac1] border-2 border-white" />
@@ -977,7 +1028,10 @@ export default function FlowCanvas({
                 mediaFilename: '',
                 question: type === 'ASK' ? 'What is your answer?' : '',
                 saveAs: type === 'ASK' ? '' : '',
-                retryLimit: type === 'ASK' ? 3 : undefined,
+                retryLimit: type === 'ASK' || type === 'ATTR_CONFIRM' ? 3 : undefined,
+                confirmText: type === 'ATTR_CONFIRM' ? 'Please confirm your details below:' : '',
+                fieldsCsv: type === 'ATTR_CONFIRM' ? '' : '',
+                editPrompt: type === 'ATTR_CONFIRM' ? 'Please type the correct value for {{field_label}}.' : '',
                 tags: type === 'TAG' ? [] : undefined,
                 tagDraft: '',
                 assigneeUserId: '',
@@ -1012,6 +1066,9 @@ export default function FlowCanvas({
                     </button>
                     <button onClick={() => addNode('ASK')} className="w-full px-3 py-2.5 bg-white hover:bg-[#00a884]/5 text-[#111b21] text-xs font-bold border border-[#eceff1] rounded-xl transition-all flex items-center gap-2">
                         <HelpCircle className="w-4 h-4 text-violet-600" /> Ask Question
+                    </button>
+                    <button onClick={() => addNode('ATTR_CONFIRM')} className="w-full px-3 py-2.5 bg-white hover:bg-[#00a884]/5 text-[#111b21] text-xs font-bold border border-[#eceff1] rounded-xl transition-all flex items-center gap-2">
+                        <CheckCircle2 className="w-4 h-4 text-emerald-600" /> Confirm Attributes
                     </button>
                     <button onClick={() => addNode('QUESTION')} className="w-full px-3 py-2.5 bg-white hover:bg-[#00a884]/5 text-[#111b21] text-xs font-bold border border-[#eceff1] rounded-xl transition-all flex items-center gap-2">
                         <HelpCircle className="w-4 h-4 text-purple-500" /> Question
@@ -1074,6 +1131,7 @@ export default function FlowCanvas({
                             if (n.type === 'END') return '#ef4444';
                             if (n.type === 'QUESTION') return '#a855f7';
                             if (n.type === 'ASK') return '#7c3aed';
+                            if (n.type === 'ATTR_CONFIRM') return '#059669';
                             if (n.type === 'CTA_URL') return '#10b981';
                             if (n.type === 'LIST') return '#0ea5e9';
                             if (n.type === 'CONDITION') return '#eab308';

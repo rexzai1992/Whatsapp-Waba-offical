@@ -14,7 +14,7 @@ import { supabase } from './src/supabase'
 import { WabaRegistry } from './src/waba/registry'
 import { parseWabaWebhook, verifyWabaSignature } from './src/waba/webhook'
 import type { WabaInboundMessage, WabaStatus, WabaConfig } from './src/waba/types'
-import { resolveCompanyId, findOrCreateUser, getMessagesForUsers, getUsersForCompany, insertMessage, getUserByPhone, deleteMessagesForUser, normalizePhoneNumber, updateMessageStatusByMessageId, updateUserName, setUserTags, getUsersWithExpiringWindow, updateUserWindowReminder, activateUserCtaFreeWindow, getUserById, assignUserToAgentIfUnassigned, setUserAssignee, hasHumanTakeover, setUserHumanTakeover } from './src/services/wa-store'
+import { resolveCompanyId, findOrCreateUser, getMessagesForUsers, getUsersForCompany, insertMessage, getUserByPhone, deleteMessagesForUser, normalizePhoneNumber, updateMessageStatusByMessageId, updateUserName, setUserTags, getUsersWithExpiringWindow, updateUserWindowReminder, activateUserCtaFreeWindow, getUserById, assignUserToAgentIfUnassigned, setUserAssignee, hasHumanTakeover, setUserHumanTakeover, setUserTemplateAttributes } from './src/services/wa-store'
 import type { MessageRecord, User as WaStoreUser } from './src/services/wa-store'
 import { sendWhatsAppMessage } from './src/services/whatsapp'
 import { WorkflowEngine } from './src/workflow/engine'
@@ -175,6 +175,44 @@ function getCompanyRoom(companyId: string): string {
     return `company:${companyId}`
 }
 
+function normalizeTemplateAttributesForContact(value: any): Array<{
+    templateName: string
+    language: string
+    scope: 'body' | 'header'
+    index: number
+    key: string
+    value: string
+    savedAt: string
+}> {
+    if (!Array.isArray(value)) return []
+
+    return value
+        .map((row: any) => {
+            const templateName = typeof row?.templateName === 'string' ? row.templateName.trim() : ''
+            const key = typeof row?.key === 'string' ? row.key.trim() : ''
+            const itemValue = typeof row?.value === 'string' ? row.value.trim() : ''
+            if (!templateName || !key || !itemValue) return null
+            const language = typeof row?.language === 'string' && row.language.trim() ? row.language.trim() : 'en_US'
+            const parsedIndex = Number.parseInt(String(row?.index ?? ''), 10)
+            const index = Number.isFinite(parsedIndex) && parsedIndex > 0 ? Math.min(parsedIndex, 99) : 1
+            const scope = typeof row?.scope === 'string' && row.scope.toLowerCase() === 'header' ? 'header' : 'body'
+            const savedAtRaw = typeof row?.savedAt === 'string' ? row.savedAt.trim() : ''
+            const parsedSavedAt = savedAtRaw ? new Date(savedAtRaw).getTime() : Number.NaN
+            const savedAt = Number.isNaN(parsedSavedAt) ? '' : new Date(parsedSavedAt).toISOString()
+            return {
+                templateName: templateName.slice(0, 128),
+                language: language.slice(0, 24),
+                scope,
+                index,
+                key: key.slice(0, 120),
+                value: itemValue.slice(0, 400),
+                savedAt
+            }
+        })
+        .filter(Boolean)
+        .slice(0, 80)
+}
+
 function buildContactPayload(user: any) {
     const phone = normalizePhoneNumber(user?.phone_number)
     return {
@@ -188,7 +226,8 @@ function buildContactPayload(user: any) {
         assigneeColor: user?.assigned_to_color || null,
         ctaReferralAt: user?.cta_referral_at || null,
         ctaFreeWindowStartedAt: user?.cta_free_window_started_at || null,
-        ctaFreeWindowExpiresAt: user?.cta_free_window_expires_at || null
+        ctaFreeWindowExpiresAt: user?.cta_free_window_expires_at || null,
+        templateAttributes: normalizeTemplateAttributesForContact(user?.template_attributes)
     }
 }
 
@@ -2858,6 +2897,7 @@ registerWabaRoutes(app, {
     resolveOauthReturnUrl,
     resolveProfileAccess,
     sendWhatsAppMessage,
+    setUserTemplateAttributes,
     subscribeWabaApp,
     supabase,
     unsubscribeWabaApp,
@@ -4215,6 +4255,7 @@ registerSocketHandlers(io, {
     resolvePath,
     assignUserToAgentIfUnassigned,
     buildAgentIdentity,
+    setUserTemplateAttributes,
     sendWhatsAppMessage,
     workflowEngine,
     resolveCompanyId,

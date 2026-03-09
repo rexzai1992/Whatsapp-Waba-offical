@@ -31,6 +31,7 @@ export function registerSocketHandlers(io: Server, ctx: any) {
         resolvePath,
         assignUserToAgentIfUnassigned,
         buildAgentIdentity,
+        setUserTemplateAttributes,
         sendWhatsAppMessage,
         workflowEngine,
         resolveCompanyId,
@@ -693,7 +694,7 @@ io.on('connection', async (socket) => {
     })
 
     socket.on('sendTemplate', async (data) => {
-        let { profileId, jid, name, language, components } = data
+        let { profileId, jid, name, language, components, bodyAttributes } = data
         if (!jid || !name) return
         if (!jid.includes('@')) jid = `${jid}@s.whatsapp.net`
 
@@ -729,6 +730,14 @@ io.on('connection', async (socket) => {
                 },
                 actor
             })
+            if (Array.isArray(bodyAttributes) && bodyAttributes.length > 0) {
+                await setUserTemplateAttributes(
+                    user.id,
+                    typeof name === 'string' ? name : '',
+                    typeof language === 'string' && language.trim() ? language : 'en_US',
+                    bodyAttributes
+                )
+            }
             const assigned = await assignUserToAgentIfUnassigned(user.id, {
                 userId: actor.user_id,
                 name: actor.name,

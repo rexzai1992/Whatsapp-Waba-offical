@@ -144,6 +144,154 @@ function sanitizeQaHistory(raw: any): Array<{ key: string; question: string; ans
         .filter((entry: any) => entry.key && entry.answer)
 }
 
+type AwaitingConfirmationState = {
+    fields: Array<{ key: string; label: string }>
+    question?: string
+    fallback_text?: string
+    retry_limit?: number
+    edit_prompt?: string
+}
+
+function humanizeVariableLabel(key: string): string {
+    const normalized = normalizeVariableKey(key)
+    if (!normalized) return ''
+    return normalized
+        .split('_')
+        .map((chunk) => (chunk ? chunk.charAt(0).toUpperCase() + chunk.slice(1) : ''))
+        .join(' ')
+        .trim()
+}
+
+function sanitizeAwaitingConfirmation(raw: any): AwaitingConfirmationState | undefined {
+    if (!raw || typeof raw !== 'object') return undefined
+    const fieldsRaw = Array.isArray(raw.fields) ? raw.fields : []
+    const fields = fieldsRaw
+        .map((entry: any) => {
+            const key = normalizeVariableKey(entry?.key ?? entry)
+            if (!key) return null
+            const labelRaw = typeof entry?.label === 'string' ? entry.label.trim() : ''
+            return {
+                key,
+                label: labelRaw || humanizeVariableLabel(key) || key
+            }
+        })
+        .filter((entry): entry is { key: string; label: string } => Boolean(entry))
+    if (fields.length === 0) return undefined
+    return {
+        fields,
+        question: typeof raw.question === 'string' ? raw.question : undefined,
+        fallback_text: typeof raw.fallback_text === 'string' ? raw.fallback_text : undefined,
+        retry_limit: normalizeFallbackLimit(raw.retry_limit, DEFAULT_FALLBACK_LIMIT),
+        edit_prompt: typeof raw.edit_prompt === 'string' ? raw.edit_prompt : undefined
+    }
+}
+
+function resolveConfirmationFields(action: any, state: WorkflowState): Array<{ key: string; label: string }> {
+    const actionFields = Array.isArray(action?.fields) ? action.fields : []
+    const normalizedActionFields = actionFields
+        .map((value: any) => normalizeVariableKey(value))
+        .filter((value): value is string => Boolean(value))
+    if (normalizedActionFields.length > 0) {
+        return Array.from(new Set(normalizedActionFields)).map((key) => ({
+            key,
+            label: humanizeVariableLabel(key) || key
+        }))
+    }
+
+    const keys: string[] = []
+    const seen = new Set<string>()
+    sanitizeQaHistory(state.qa_history).forEach((entry) => {
+        if (!entry.key || seen.has(entry.key)) return
+        seen.add(entry.key)
+        keys.push(entry.key)
+    })
+    Object.keys(sanitizeVars(state.vars)).forEach((key) => {
+        if (!key || seen.has(key)) return
+        seen.add(key)
+        keys.push(key)
+    })
+    return keys.map((key) => ({
+        key,
+        label: humanizeVariableLabel(key) || key
+    }))
+}
+
+function buildConfirmationPrompt(
+    confirmation: AwaitingConfirmationState,
+    state: WorkflowState,
+    user: User,
+    ctx: InboundContext
+): string {
+    const introRaw = renderDynamicText(
+        confirmation.question || 'Please confirm your details below:',
+        state,
+        user,
+        ctx
+    ).trim()
+    const intro = introRaw || 'Please confirm your details below:'
+    const vars = sanitizeVars(state.vars)
+    const lines = confirmation.fields.map((field, index) => {
+        const value = (vars[field.key] || '').trim()
+        return `${index + 1}. ${field.label}: ${value || '-'}`
+    })
+    return [
+        intro,
+        ...lines,
+        'Reply "yes" to confirm, or "no <field>" to change one value.'
+    ].join('\n')
+}
+
+function isAffirmativeReply(value: string): boolean {
+    const normalized = normalizeChoiceKey(value)
+    return normalized === 'yes'
+        || normalized === 'y'
+        || normalized === 'ok'
+        || normalized === 'confirm'
+        || normalized === 'confirmed'
+        || normalized === 'correct'
+        || normalized === 'true'
+        || normalized === 'betul'
+}
+
+function isNegativeReply(value: string): boolean {
+    const normalized = normalizeChoiceKey(value)
+    return normalized === 'no'
+        || normalized === 'n'
+        || normalized === 'edit'
+        || normalized === 'change'
+        || normalized === 'update'
+        || normalized === 'false'
+        || normalized === 'tak'
+}
+
+function extractConfirmationFieldHint(answer: string): string {
+    const trimmed = answer.trim()
+    if (!trimmed) return ''
+    const pattern = /^(?:no|edit|change|update)\s+(.+)$/i
+    const match = pattern.exec(trimmed)
+    if (!match?.[1]) return ''
+    return match[1].trim()
+}
+
+function resolveFieldForEdit(
+    hint: string,
+    fields: Array<{ key: string; label: string }>
+): { key: string; label: string } | null {
+    const trimmedHint = hint.trim()
+    if (!trimmedHint) return null
+    const numeric = Number.parseInt(trimmedHint, 10)
+    if (Number.isFinite(numeric) && numeric >= 1 && numeric <= fields.length) {
+        return fields[numeric - 1] || null
+    }
+    const byKey = normalizeVariableKey(trimmedHint)
+    const byLabel = normalizeChoiceKey(trimmedHint)
+    for (const field of fields) {
+        if (byKey && normalizeVariableKey(field.key) === byKey) return field
+        if (byLabel && normalizeChoiceKey(field.label) === byLabel) return field
+    }
+    return null
+}
+
 function getInboundAnswer(ctx: InboundContext): string {
     const text = typeof ctx.text === 'string' ? ctx.text.trim() : ''
     if (text) return text
@@ -344,6 +492,7 @@ export class WorkflowEngine {
             } else {
                 currentState.qa_history = sanitizeQaHistory(memory.qa_history)
             }
+            currentState.awaiting_confirmation = sanitizeAwaitingConfirmation(currentState.awaiting_confirmation)
         }
         const isFirstMessage = !lastMessage
         const matchedIncomingButtonId = resolveAwaitingButtonId(ctx, currentState?.awaiting_buttons)
@@ -392,7 +541,8 @@ export class WorkflowEngine {
             const stepIndex = state?.step_index ?? 0
             const awaiting = Boolean(
                 (state?.awaiting_buttons && state.awaiting_buttons.length > 0) ||
-                state?.awaiting_input?.save_as
+                state?.awaiting_input?.save_as ||
+                (state?.awaiting_confirmation && state.awaiting_confirmation.fields?.length > 0)
             )
             const completed =
                 actions.length === 0 ||
@@ -473,6 +623,175 @@ export class WorkflowEngine {
             state.fallback_count = 0
             if (inboundRecord?.id) {
                 await updateMessageWorkflowState(inboundRecord.id, state)
+            }
+            if (state.awaiting_confirmation?.fields?.length) {
+                const confirmation = sanitizeAwaitingConfirmation(state.awaiting_confirmation)
+                if (confirmation) {
+                    state.awaiting_confirmation = confirmation
+                    const confirmationPrompt = buildConfirmationPrompt(confirmation, state, user, ctx)
+                    let sentConfirmPrompt = false
+                    try {
+                        await sendWhatsAppMessage({
+                            client: ctx.client,
+                            userId: user.id,
+                            to: ctx.phoneNumber,
+                            type: 'text',
+                            content: { text: confirmationPrompt },
+                            workflowState: state
+                        })
+                        sentConfirmPrompt = true
+                    } catch (error: any) {
+                        console.warn('[Workflow] confirm_attributes follow-up failed:', error?.message || error)
+                    }
+                    return { handled: true, replied: sentConfirmPrompt }
+                }
+                state.awaiting_confirmation = undefined
+            }
+        }
+
+        if (state?.awaiting_confirmation?.fields?.length) {
+            const companyFallback = await getCompanyFallbackSettings(ctx.companyId)
+            const confirmation = sanitizeAwaitingConfirmation(state.awaiting_confirmation)
+            if (!confirmation) {
+                state.awaiting_confirmation = undefined
+            } else {
+                state.awaiting_confirmation = confirmation
+                const answer = getInboundAnswer(ctx)
+                const retryLimit = normalizeFallbackLimit(
+                    confirmation.retry_limit,
+                    normalizeFallbackLimit(companyFallback?.fallback_limit, DEFAULT_FALLBACK_LIMIT)
+                )
+                const fallbackMessage =
+                    confirmation.fallback_text ||
+                    companyFallback?.fallback_text ||
+                    'Reply "yes" to confirm, or "no <field>" to change one value.'
+
+                if (!answer) {
+                    const nextFallbackCount = (state.fallback_count || 0) + 1
+                    state.fallback_count = nextFallbackCount
+                    if (retryLimit > 0 && nextFallbackCount > retryLimit) {
+                        if (inboundRecord?.id) {
+                            await updateMessageWorkflowState(inboundRecord.id, state)
+                        }
+                        return { handled: false, replied: false }
+                    }
+                    let sentFallback = false
+                    try {
+                        await sendWhatsAppMessage({
+                            client: ctx.client,
+                            userId: user.id,
+                            to: ctx.phoneNumber,
+                            type: 'text',
+                            content: { text: renderDynamicText(fallbackMessage, state, user, ctx) },
+                            workflowState: state
+                        })
+                        sentFallback = true
+                    } catch (error: any) {
+                        console.warn('[Workflow] confirm_attributes fallback failed:', error?.message || error)
+                    }
+                    return { handled: true, replied: sentFallback }
+                }
+
+                if (isAffirmativeReply(answer)) {
+                    state.awaiting_confirmation = undefined
+                    state.fallback_count = 0
+                    if (inboundRecord?.id) {
+                        await updateMessageWorkflowState(inboundRecord.id, state)
+                    }
+                } else {
+                    const editHint = extractConfirmationFieldHint(answer)
+                    const wantsEdit = isNegativeReply(answer) || Boolean(editHint)
+                    if (!wantsEdit) {
+                        const nextFallbackCount = (state.fallback_count || 0) + 1
+                        state.fallback_count = nextFallbackCount
+                        if (retryLimit > 0 && nextFallbackCount > retryLimit) {
+                            if (inboundRecord?.id) {
+                                await updateMessageWorkflowState(inboundRecord.id, state)
+                            }
+                            return { handled: false, replied: false }
+                        }
+                        const fieldList = confirmation.fields.map((field) => field.key).join(', ')
+                        let sentGuidance = false
+                        try {
+                            await sendWhatsAppMessage({
+                                client: ctx.client,
+                                userId: user.id,
+                                to: ctx.phoneNumber,
+                                type: 'text',
+                                content: {
+                                    text: `Please reply "yes" to confirm, or "no <field>" to edit.\nFields: ${fieldList}`
+                                },
+                                workflowState: state
+                            })
+                            sentGuidance = true
+                        } catch (error: any) {
+                            console.warn('[Workflow] confirm_attributes guidance failed:', error?.message || error)
+                        }
+                        return { handled: true, replied: sentGuidance }
+                    }
+
+                    const selectedField = resolveFieldForEdit(editHint, confirmation.fields)
+                        || (!editHint && confirmation.fields.length === 1 ? confirmation.fields[0] : null)
+                    if (!selectedField) {
+                        state.fallback_count = (state.fallback_count || 0) + 1
+                        const fieldList = confirmation.fields.map((field) => field.key).join(', ')
+                        let sentFieldHint = false
+                        try {
+                            await sendWhatsAppMessage({
+                                client: ctx.client,
+                                userId: user.id,
+                                to: ctx.phoneNumber,
+                                type: 'text',
+                                content: {
+                                    text: `Tell me which field to change.\nReply like: no ${confirmation.fields[0]?.key || 'field_key'}\nFields: ${fieldList}`
+                                },
+                                workflowState: state
+                            })
+                            sentFieldHint = true
+                        } catch (error: any) {
+                            console.warn('[Workflow] confirm_attributes field hint failed:', error?.message || error)
+                        }
+                        return { handled: true, replied: sentFieldHint }
+                    }
+
+                    const editPromptTemplate =
+                        confirmation.edit_prompt ||
+                        'Please type the correct value for {{field_label}}.'
+                    const editPrompt = renderDynamicText(
+                        editPromptTemplate
+                            .replace(/\{\{\s*field_label\s*\}\}/gi, selectedField.label)
+                            .replace(/\{\{\s*field_key\s*\}\}/gi, selectedField.key),
+                        state,
+                        user,
+                        ctx
+                    ).trim() || `Please type the correct value for ${selectedField.label}.`
+
+                    state.awaiting_input = {
+                        save_as: selectedField.key,
+                        question: editPrompt,
+                        fallback_text: 'Please type the updated value.',
+                        retry_limit: retryLimit
+                    }
+                    state.fallback_count = 0
+                    let sentEditPrompt = false
+                    try {
+                        await sendWhatsAppMessage({
+                            client: ctx.client,
+                            userId: user.id,
+                            to: ctx.phoneNumber,
+                            type: 'text',
+                            content: { text: editPrompt },
+                            workflowState: state
+                        })
+                        sentEditPrompt = true
+                    } catch (error: any) {
+                        console.warn('[Workflow] confirm_attributes edit prompt failed:', error?.message || error)
+                    }
+                    if (inboundRecord?.id) {
+                        await updateMessageWorkflowState(inboundRecord.id, state)
+                    }
+                    return { handled: true, replied: sentEditPrompt }
+                }
             }
         }
 
@@ -607,6 +926,7 @@ export class WorkflowEngine {
     ): Promise<{ error?: string; handled: boolean; replied: boolean }> {
         state.vars = sanitizeVars(state.vars)
         state.qa_history = sanitizeQaHistory(state.qa_history)
+        state.awaiting_confirmation = sanitizeAwaitingConfirmation(state.awaiting_confirmation)
         let replied = false
 
         if (state.awaiting_buttons && state.awaiting_buttons.length > 0) {
@@ -623,6 +943,9 @@ export class WorkflowEngine {
             }
         }
         if (state.awaiting_input?.save_as) {
+            return { handled: true, replied: false }
+        }
+        if (state.awaiting_confirmation?.fields?.length) {
             return { handled: true, replied: false }
         }
 
@@ -723,9 +1046,44 @@ export class WorkflowEngine {
                 const chainInteractive =
                     nextAction &&
                     ['send_buttons', 'send_list', 'send_cta_url'].includes(nextAction.type)
-                if (chainInteractive || (nextAction && ['send_text', 'send_template', 'add_tags', 'assign_staff', 'ask_question', 'condition', 'set_tag', 'update_state'].includes(nextAction.type))) {
+                if (chainInteractive || (nextAction && ['send_text', 'send_template', 'add_tags', 'assign_staff', 'ask_question', 'confirm_attributes', 'condition', 'set_tag', 'update_state'].includes(nextAction.type))) {
                     index = nextIndex
                     continue
+                }
+                break
+            }
+
+            if (action.type === 'confirm_attributes') {
+                state.step_index = index + 1
+                const fields = resolveConfirmationFields(action, state)
+                if (fields.length === 0) {
+                    index = state.step_index
+                    continue
+                }
+                const confirmation: AwaitingConfirmationState = {
+                    fields,
+                    question: typeof action.question === 'string' ? action.question : undefined,
+                    fallback_text: typeof action.fallback_text === 'string' ? action.fallback_text : undefined,
+                    retry_limit: normalizeFallbackLimit(action.retry_limit, DEFAULT_FALLBACK_LIMIT),
+                    edit_prompt: typeof action.edit_prompt === 'string' ? action.edit_prompt : undefined
+                }
+                state.awaiting_confirmation = confirmation
+                state.fallback_count = 0
+                const prompt = buildConfirmationPrompt(confirmation, state, user, ctx)
+                try {
+                    await sendWhatsAppMessage({
+                        client: ctx.client,
+                        userId: user.id,
+                        to: ctx.phoneNumber,
+                        type: 'text',
+                        content: { text: prompt },
+                        workflowState: state
+                    })
+                    replied = true
+                } catch (error: any) {
+                    const msg = error?.message || String(error)
+                    console.warn('[Workflow] confirm_attributes failed:', msg)
+                    lastError = `confirm_attributes failed: ${msg}`
                 }
                 break
             }
