@@ -165,6 +165,16 @@ type WorkflowTemplateOption = {
     language: string;
 };
 
+type TemplateComposerOption = {
+    id: string;
+    name: string;
+    language: string;
+    category: string;
+    status: string;
+    parameterFormat: string;
+    components: any[];
+};
+
 type LogEntry = {
     id: string;
     ts: number;
@@ -253,6 +263,30 @@ const renderMessageStatus = (msg: Message) => {
     return <Check className="w-3.5 h-3.5 text-[#7a8a97]" />;
 };
 
+const normalizeTemplateComponentType = (value: unknown): string => {
+    if (typeof value !== 'string') return '';
+    return value.trim().toUpperCase();
+};
+
+const extractTemplateVariableCount = (text: unknown): number => {
+    if (typeof text !== 'string') return 0;
+    const regex = /\{\{\s*(\d+)\s*\}\}/g;
+    let maxIndex = 0;
+    let match: RegExpExecArray | null = regex.exec(text);
+    while (match) {
+        const idx = Number.parseInt(match[1] || '0', 10);
+        if (Number.isFinite(idx)) maxIndex = Math.max(maxIndex, idx);
+        match = regex.exec(text);
+    }
+    return maxIndex;
+};
+
+const findTemplateComponent = (components: any[] | undefined, type: string): any | null => {
+    if (!Array.isArray(components)) return null;
+    const normalized = type.trim().toUpperCase();
+    return components.find((component) => normalizeTemplateComponentType(component?.type) === normalized) || null;
+};
+
 
 export default function App() {
     // Auth State
@@ -280,6 +314,14 @@ export default function App() {
     const [templateName, setTemplateName] = useState('');
     const [templateLanguage, setTemplateLanguage] = useState('en_US');
     const [templateComponents, setTemplateComponents] = useState('');
+    const [templateComposerOptions, setTemplateComposerOptions] = useState<TemplateComposerOption[]>([]);
+    const [templateComposerLoading, setTemplateComposerLoading] = useState(false);
+    const [templateComposerError, setTemplateComposerError] = useState<string | null>(null);
+    const [selectedTemplateOptionId, setSelectedTemplateOptionId] = useState('');
+    const [templateBodyAttributes, setTemplateBodyAttributes] = useState<string[]>([]);
+    const [templateHeaderAttributes, setTemplateHeaderAttributes] = useState<string[]>([]);
+    const [templateHeaderMediaUrl, setTemplateHeaderMediaUrl] = useState('');
+    const [templateHeaderDocumentFilename, setTemplateHeaderDocumentFilename] = useState('');
     const [startWorkflowId, setStartWorkflowId] = useState('');
     const [startingWorkflow, setStartingWorkflow] = useState(false);
     const [showWorkflowStarter, setShowWorkflowStarter] = useState(false);
@@ -868,6 +910,54 @@ export default function App() {
         }
     }, [activeProfileId, session?.access_token]);
 
+    const fetchTemplateComposerOptions = useCallback(async () => {
+        if (!activeProfileId || !session?.access_token) {
+            setTemplateComposerOptions([]);
+            return;
+        }
+        setTemplateComposerLoading(true);
+        setTemplateComposerError(null);
+        try {
+            const params = new URLSearchParams();
+            params.set('profileId', activeProfileId);
+            params.set('limit', '150');
+            params.set('status', 'APPROVED');
+            params.set('fields', 'id,name,status,category,language,parameter_format,components');
+            const res = await fetch(`${SOCKET_URL}/api/waba/templates?${params.toString()}`, {
+                headers: {
+                    Authorization: `Bearer ${session.access_token}`
+                }
+            });
+            const data = await res.json().catch(() => null);
+            if (!res.ok || !data?.success) {
+                throw new Error(data?.error || 'Failed to load approved templates');
+            }
+            const rows = Array.isArray(data?.data?.data) ? data.data.data : [];
+            const mapped: TemplateComposerOption[] = rows
+                .map((row: any) => ({
+                    id: typeof row?.id === 'string' ? row.id : '',
+                    name: typeof row?.name === 'string' ? row.name : '',
+                    language: typeof row?.language === 'string' ? row.language : 'en_US',
+                    category: typeof row?.category === 'string' ? row.category : '',
+                    status: typeof row?.status === 'string' ? row.status : '',
+                    parameterFormat: typeof row?.parameter_format === 'string' ? row.parameter_format : '',
+                    components: Array.isArray(row?.components) ? row.components : []
+                }))
+                .filter((tpl: TemplateComposerOption) => Boolean(tpl.id && tpl.name))
+                .sort((a: TemplateComposerOption, b: TemplateComposerOption) => a.name.localeCompare(b.name));
+            setTemplateComposerOptions(mapped);
+            setSelectedTemplateOptionId((prev) => {
+                if (prev && mapped.some((item) => item.id === prev)) return prev;
+                return mapped[0]?.id || '';
+            });
+        } catch (err: any) {
+            setTemplateComposerError(err?.message || 'Failed to load approved templates');
+            setTemplateComposerOptions([]);
+        } finally {
+            setTemplateComposerLoading(false);
+        }
+    }, [activeProfileId, session?.access_token]);
+
     const handleAssignContact = useCallback(
         async (jid: string, assigneeUserId: string | null) => {
             if (!socket || !activeProfileId || !jid || jid.endsWith('@g.us')) return;
@@ -1207,6 +1297,11 @@ export default function App() {
         }
         fetchWorkflowTemplateOptions();
     }, [activeView, teamUsers.length, teamUsersLoading, fetchTeamUsers, fetchWorkflowTemplateOptions]);
+
+    useEffect(() => {
+        if (!showTemplateComposer) return;
+        fetchTemplateComposerOptions();
+    }, [showTemplateComposer, fetchTemplateComposerOptions]);
 
     useEffect(() => {
         setAssignMenuContactId(null);
@@ -2092,6 +2187,56 @@ export default function App() {
             .slice(0, 8);
     }, [quickReplies, quickReplyQuery, normalizeQuickReplyShortcut]);
 
+    const selectedTemplateOption = useMemo(() => {
+        if (!selectedTemplateOptionId) return null;
+        return templateComposerOptions.find((option) => option.id === selectedTemplateOptionId) || null;
+    }, [selectedTemplateOptionId, templateComposerOptions]);
+
+    const selectedTemplateHeader = useMemo(
+        () => findTemplateComponent(selectedTemplateOption?.components, 'HEADER'),
+        [selectedTemplateOption]
+    );
+    const selectedTemplateBody = useMemo(
+        () => findTemplateComponent(selectedTemplateOption?.components, 'BODY'),
+        [selectedTemplateOption]
+    );
+    const selectedTemplateHeaderFormat = useMemo(
+        () => normalizeTemplateComponentType(selectedTemplateHeader?.format || selectedTemplateHeader?.type),
+        [selectedTemplateHeader]
+    );
+    const requiredTemplateBodyAttributeCount = useMemo(
+        () => extractTemplateVariableCount(selectedTemplateBody?.text),
+        [selectedTemplateBody]
+    );
+    const requiredTemplateHeaderAttributeCount = useMemo(
+        () => selectedTemplateHeaderFormat === 'TEXT' ? extractTemplateVariableCount(selectedTemplateHeader?.text) : 0,
+        [selectedTemplateHeader, selectedTemplateHeaderFormat]
+    );
+
+    useEffect(() => {
+        setTemplateBodyAttributes((prev) =>
+            Array.from({ length: requiredTemplateBodyAttributeCount }, (_, index) => prev[index] || '')
+        );
+    }, [requiredTemplateBodyAttributeCount]);
+
+    useEffect(() => {
+        setTemplateHeaderAttributes((prev) =>
+            Array.from({ length: requiredTemplateHeaderAttributeCount }, (_, index) => prev[index] || '')
+        );
+    }, [requiredTemplateHeaderAttributeCount]);
+
+    useEffect(() => {
+        if (!selectedTemplateOption) return;
+        setTemplateName(selectedTemplateOption.name);
+        setTemplateLanguage(selectedTemplateOption.language || 'en_US');
+        setTemplateComponents('');
+        setTemplateHeaderMediaUrl('');
+        setTemplateHeaderDocumentFilename((prev) => {
+            if (prev.trim()) return prev;
+            return `${selectedTemplateOption.name}.pdf`;
+        });
+    }, [selectedTemplateOption]);
+
     const handleQuickReplyPick = (item: QuickReply) => {
         const text = typeof item.text === 'string' ? item.text.trim() : '';
         if (!text) return;
@@ -2311,6 +2456,71 @@ export default function App() {
                 alert('Invalid JSON in template components.');
                 return;
             }
+        } else if (selectedTemplateOption) {
+            const built: any[] = [];
+            const headerType = selectedTemplateHeaderFormat;
+            const mediaLink = templateHeaderMediaUrl.trim();
+            if (requiredTemplateHeaderAttributeCount > 0) {
+                const missingHeaderParamIndex = templateHeaderAttributes.findIndex((value) => !value.trim());
+                if (missingHeaderParamIndex >= 0) {
+                    alert(`Header attribute {{${missingHeaderParamIndex + 1}}} is required.`);
+                    return;
+                }
+                built.push({
+                    type: 'header',
+                    parameters: templateHeaderAttributes.map((value) => ({
+                        type: 'text',
+                        text: value.trim()
+                    }))
+                });
+            } else if (headerType === 'IMAGE' || headerType === 'VIDEO' || headerType === 'DOCUMENT') {
+                if (!mediaLink) {
+                    alert(`Template header requires ${headerType.toLowerCase()} link.`);
+                    return;
+                }
+                if (headerType === 'DOCUMENT') {
+                    built.push({
+                        type: 'header',
+                        parameters: [
+                            {
+                                type: 'document',
+                                document: {
+                                    link: mediaLink,
+                                    ...(templateHeaderDocumentFilename.trim()
+                                        ? { filename: templateHeaderDocumentFilename.trim() }
+                                        : {})
+                                }
+                            }
+                        ]
+                    });
+                } else if (headerType === 'IMAGE') {
+                    built.push({
+                        type: 'header',
+                        parameters: [{ type: 'image', image: { link: mediaLink } }]
+                    });
+                } else if (headerType === 'VIDEO') {
+                    built.push({
+                        type: 'header',
+                        parameters: [{ type: 'video', video: { link: mediaLink } }]
+                    });
+                }
+            }
+
+            if (requiredTemplateBodyAttributeCount > 0) {
+                const missingBodyParamIndex = templateBodyAttributes.findIndex((value) => !value.trim());
+                if (missingBodyParamIndex >= 0) {
+                    alert(`Body attribute {{${missingBodyParamIndex + 1}}} is required.`);
+                    return;
+                }
+                built.push({
+                    type: 'body',
+                    parameters: templateBodyAttributes.map((value) => ({
+                        type: 'text',
+                        text: value.trim()
+                    }))
+                });
+            }
+            components = built.length > 0 ? built : undefined;
         }
 
         socket.emit('sendTemplate', {
@@ -3271,6 +3481,33 @@ export default function App() {
                                 {showTemplateComposer && (
                                     <div className="absolute bottom-[52px] right-0 w-[460px] max-w-[90vw] bg-white border border-[#eceff1] rounded-2xl shadow-xl z-30 p-3 space-y-2">
                                         <div className="text-[11px] font-bold uppercase tracking-widest text-[#54656f]">Send Template Message</div>
+                                        {templateComposerError && (
+                                            <div className="px-2 py-1.5 rounded-lg bg-rose-50 border border-rose-200 text-[11px] text-rose-700 font-semibold">
+                                                {templateComposerError}
+                                            </div>
+                                        )}
+                                        <div className="flex items-center gap-2">
+                                            <select
+                                                value={selectedTemplateOptionId}
+                                                onChange={(e) => setSelectedTemplateOptionId(e.target.value)}
+                                                className="flex-1 bg-[#f8f9fa] border border-[#eceff1] rounded-xl px-3 py-2 text-xs font-bold focus:outline-none focus:ring-1 focus:ring-[#00a884]/20 text-[#111b21]"
+                                            >
+                                                <option value="">Pick approved template</option>
+                                                {templateComposerOptions.map((option) => (
+                                                    <option key={option.id} value={option.id}>
+                                                        {option.name} ({option.language})
+                                                    </option>
+                                                ))}
+                                            </select>
+                                            <button
+                                                type="button"
+                                                onClick={() => fetchTemplateComposerOptions()}
+                                                disabled={templateComposerLoading}
+                                                className="px-3 py-2 rounded-xl border border-[#e5e7eb] text-[11px] font-bold text-[#334155] hover:bg-[#f8fafc] disabled:opacity-50"
+                                            >
+                                                {templateComposerLoading ? '...' : 'Reload'}
+                                            </button>
+                                        </div>
                                         <input
                                             type="text"
                                             placeholder="Template name"
@@ -3285,9 +3522,96 @@ export default function App() {
                                             onChange={(e) => setTemplateLanguage(e.target.value)}
                                             className="w-full bg-[#f8f9fa] border border-[#eceff1] rounded-xl px-3 py-2 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-[#00a884]/20 text-[#111b21]"
                                         />
+                                        {selectedTemplateOption && (
+                                            <div className="rounded-xl border border-[#eceff1] bg-[#f8fafc] p-2 space-y-2">
+                                                <div className="text-[10px] font-black uppercase tracking-widest text-[#64748b]">
+                                                    Attributes from approved template
+                                                </div>
+                                                {requiredTemplateHeaderAttributeCount > 0 && (
+                                                    <div className="space-y-1">
+                                                        <div className="text-[10px] font-bold text-[#0f172a]">
+                                                            Header text attributes ({requiredTemplateHeaderAttributeCount})
+                                                        </div>
+                                                        {Array.from({ length: requiredTemplateHeaderAttributeCount }).map((_, index) => (
+                                                            <input
+                                                                key={`header-attr-${index}`}
+                                                                type="text"
+                                                                value={templateHeaderAttributes[index] || ''}
+                                                                onChange={(e) => setTemplateHeaderAttributes((prev) => {
+                                                                    const next = Array.from(
+                                                                        { length: requiredTemplateHeaderAttributeCount },
+                                                                        (_, idx) => prev[idx] || ''
+                                                                    );
+                                                                    next[index] = e.target.value;
+                                                                    return next;
+                                                                })}
+                                                                placeholder={`Header {{${index + 1}}}`}
+                                                                className="w-full bg-white border border-[#e2e8f0] rounded-lg px-2.5 py-1.5 text-[11px] text-[#111b21] focus:outline-none focus:ring-1 focus:ring-[#00a884]/20"
+                                                            />
+                                                        ))}
+                                                    </div>
+                                                )}
+                                                {(selectedTemplateHeaderFormat === 'IMAGE' || selectedTemplateHeaderFormat === 'VIDEO' || selectedTemplateHeaderFormat === 'DOCUMENT') && (
+                                                    <div className="space-y-1">
+                                                        <div className="text-[10px] font-bold text-[#0f172a]">
+                                                            Header {selectedTemplateHeaderFormat.toLowerCase()} link
+                                                        </div>
+                                                        <input
+                                                            type="text"
+                                                            value={templateHeaderMediaUrl}
+                                                            onChange={(e) => setTemplateHeaderMediaUrl(e.target.value)}
+                                                            placeholder={`https://.../${selectedTemplateHeaderFormat.toLowerCase()}`}
+                                                            className="w-full bg-white border border-[#e2e8f0] rounded-lg px-2.5 py-1.5 text-[11px] text-[#111b21] focus:outline-none focus:ring-1 focus:ring-[#00a884]/20"
+                                                        />
+                                                        {selectedTemplateHeaderFormat === 'DOCUMENT' && (
+                                                            <input
+                                                                type="text"
+                                                                value={templateHeaderDocumentFilename}
+                                                                onChange={(e) => setTemplateHeaderDocumentFilename(e.target.value)}
+                                                                placeholder="Filename (e.g. invoice.pdf)"
+                                                                className="w-full bg-white border border-[#e2e8f0] rounded-lg px-2.5 py-1.5 text-[11px] text-[#111b21] focus:outline-none focus:ring-1 focus:ring-[#00a884]/20"
+                                                            />
+                                                        )}
+                                                    </div>
+                                                )}
+                                                {requiredTemplateBodyAttributeCount > 0 && (
+                                                    <div className="space-y-1">
+                                                        <div className="text-[10px] font-bold text-[#0f172a]">
+                                                            Body attributes ({requiredTemplateBodyAttributeCount})
+                                                        </div>
+                                                        {Array.from({ length: requiredTemplateBodyAttributeCount }).map((_, index) => (
+                                                            <input
+                                                                key={`body-attr-${index}`}
+                                                                type="text"
+                                                                value={templateBodyAttributes[index] || ''}
+                                                                onChange={(e) => setTemplateBodyAttributes((prev) => {
+                                                                    const next = Array.from(
+                                                                        { length: requiredTemplateBodyAttributeCount },
+                                                                        (_, idx) => prev[idx] || ''
+                                                                    );
+                                                                    next[index] = e.target.value;
+                                                                    return next;
+                                                                })}
+                                                                placeholder={`Body {{${index + 1}}}`}
+                                                                className="w-full bg-white border border-[#e2e8f0] rounded-lg px-2.5 py-1.5 text-[11px] text-[#111b21] focus:outline-none focus:ring-1 focus:ring-[#00a884]/20"
+                                                            />
+                                                        ))}
+                                                    </div>
+                                                )}
+                                                {requiredTemplateBodyAttributeCount === 0
+                                                    && requiredTemplateHeaderAttributeCount === 0
+                                                    && selectedTemplateHeaderFormat !== 'IMAGE'
+                                                    && selectedTemplateHeaderFormat !== 'VIDEO'
+                                                    && selectedTemplateHeaderFormat !== 'DOCUMENT' && (
+                                                        <div className="text-[11px] text-[#64748b]">
+                                                            No attributes required for this template.
+                                                        </div>
+                                                    )}
+                                            </div>
+                                        )}
                                         <input
                                             type="text"
-                                            placeholder='Components JSON (optional)'
+                                            placeholder='Advanced override: components JSON (optional)'
                                             value={templateComponents}
                                             onChange={(e) => setTemplateComponents(e.target.value)}
                                             className="w-full bg-[#f8f9fa] border border-[#eceff1] rounded-xl px-3 py-2 text-[11px] font-mono focus:outline-none focus:ring-1 focus:ring-[#00a884]/20 text-[#111b21]"
